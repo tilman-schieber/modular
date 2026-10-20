@@ -5,6 +5,7 @@ import { CAT, TYPEC, compatible, type Drag, type Knob, type Mod, type Port } fro
 import { KINDS } from './modules';
 import { PATCHES, type PatchData } from './patches';
 import { drawButton, drawCable, drawModule } from './render';
+import { decodePatch, encodePatch, hashCode } from './share';
 
 // The patch field zooms; the UI overlay (toolbar, menu, hints) keeps a fixed pixel scale.
 const canvas = document.getElementById('c') as HTMLCanvasElement;
@@ -23,6 +24,11 @@ let mx = 0, my = 0, ux = 0, uy = 0;
 let spawnCount = 0;
 let everPlayed = false;
 let menuOpen = false;
+let toast = { text: '', until: 0 };
+
+function showToast(text: string) {
+  toast = { text, until: performance.now() + 2500 };
+}
 
 function sizeCanvas(c: HTMLCanvasElement, s: number) {
   const w = Math.ceil(innerWidth / s), h = Math.ceil(innerHeight / s);
@@ -62,6 +68,7 @@ function layoutBar() {
     { label: eng.running ? '  STOP' : '  PLAY', col: eng.running ? C.red : C.green, act: togglePlay },
     { label: 'PATCHES', col: menuOpen ? C.white : C.silver, act: () => (menuOpen = !menuOpen) },
     ...KINDS.map((k) => ({ label: k.label, col: CAT[k.cat].cap, spawn: k.type })),
+    { label: 'SHARE', col: C.white, act: () => void share() },
     { label: 'CLEAR', col: C.silver, act: () => eng.clear() },
   ];
   bar = [];
@@ -71,7 +78,7 @@ function layoutBar() {
     if (x + w > UW - 2 && x > 2) { x = 2; y += 11; }
     bar.push({ ...it, x, y, w });
     x += w + 2;
-    if (it.act && it.label !== 'CLEAR') x += 4;
+    if (it.act === togglePlay || it.label === 'PATCHES') x += 4;
   }
   barH = y + 12;
 }
@@ -404,20 +411,54 @@ function fitView() {
   camY = Math.min(Math.floor((y0 + y1 - H - top) / 2), y0 - top - 6);
 }
 
-function restore() {
-  // ?patch=N opens one of the built-in patches, e.g. for sharing a link.
-  const n = Number(new URLSearchParams(location.search).get('patch'));
-  if (n >= 1 && n <= PATCHES.length) { loadPatch(PATCHES[n - 1].build()); return; }
+async function share() {
+  const url = `${location.origin}${location.pathname}#p=${await encodePatch(serialize())}`;
+  history.replaceState(null, '', url);
   try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    if (raw) { loadPatch(JSON.parse(raw)); return; }
-  } catch { /* fall through to the first patch */ }
-  loadPatch(PATCHES[0].build());
+    await navigator.clipboard.writeText(url);
+    showToast('LINK COPIED TO CLIPBOARD');
+  } catch {
+    showToast('LINK IS IN THE ADDRESS BAR');
+  }
 }
+
+async function loadFromHash() {
+  const code = hashCode();
+  if (!code) return false;
+  try {
+    loadPatch(await decodePatch(code));
+    fitView();
+    showToast('PATCH LOADED FROM LINK');
+    return true;
+  } catch {
+    showToast('THAT PATCH LINK IS BROKEN');
+    return false;
+  }
+}
+
+async function restore() {
+  if (await loadFromHash()) return;
+  // ?patch=N opens one of the built-in patches.
+  const n = Number(new URLSearchParams(location.search).get('patch'));
+  if (n >= 1 && n <= PATCHES.length) loadPatch(PATCHES[n - 1].build());
+  else {
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      loadPatch(raw ? JSON.parse(raw) : PATCHES[0].build());
+    } catch {
+      loadPatch(PATCHES[0].build());
+    }
+  }
+  fitView();
+}
+
+addEventListener('hashchange', () => void loadFromHash());
 
 setInterval(() => {
   if (!eng.dirty) return;
   eng.dirty = false;
+  // Once the patch is edited, a share link in the address bar is out of date.
+  if (location.hash) history.replaceState(null, '', location.pathname + location.search);
   try { localStorage.setItem(SAVE_KEY, JSON.stringify(serialize())); } catch { /* storage unavailable */ }
 }, 1000);
 
@@ -487,6 +528,12 @@ function frame() {
 
   ui.ctx.clearRect(0, 0, UW, UH);
   drawBar();
+  if (t < toast.until) {
+    const w = textWidth(toast.text) + 10, x = Math.floor((UW - w) / 2);
+    ui.rect(x - 1, barH + 5, w + 2, 11, C.black);
+    ui.rect(x, barH + 6, w, 9, C.yellow);
+    ui.text(toast.text, x + 5, barH + 8, C.ink);
+  }
   if (!everPlayed && blink && !menuOpen) ui.textC('PRESS SPACE TO PLAY', Math.floor(UW / 2), UH - 16, C.yellow);
   ui.text('DRAG JACK TO JACK TO PATCH - RIGHT CLICK JACK TO UNPLUG - WHEEL TO ZOOM - DRAG BACKGROUND TO PAN',
     3, UH - 7, C.slate);
@@ -504,6 +551,5 @@ function frame() {
 
 resize();
 layoutBar();
-restore();
-fitView();
 requestAnimationFrame(frame);
+void restore();

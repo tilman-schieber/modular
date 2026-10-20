@@ -31,7 +31,7 @@ function groove() {
   const b = new Builder();
   const clock = b.add('clock', 10, 30);
   const beats = b.beats(82, 30, 'HOUSE');
-  const drums = ['kick', 'snare', 'hihat', 'clap'].map((t, i) => b.add(t, 256 + (i % 2) * 56, 22 + (i >> 1) * 58));
+  const drums = ['kick', 'snare', 'hihat', 'clap'].map((t, i) => b.add(t, 256 + (i % 2) * 56, 14 + (i >> 1) * 66));
   const mixer = b.add('mixer', 378, 40);
   const speaker = b.add('speaker', 458, 60);
   const melody = b.melody(82, 112, 'BASSLINE', { oct: 2 });
@@ -58,8 +58,8 @@ function acid() {
   const b = new Builder();
   const clock = b.add('clock', 10, 30, { bpm: 132 });
   const beats = b.beats(82, 30, 'TECHNO');
-  const kick = b.add('kick', 256, 22, { tune: 45, punch: 0.7, dec: 0.4 });
-  const hat = b.add('hihat', 312, 22, { dec: 0.04, tone: 0.7 });
+  const kick = b.add('kick', 256, 14, { kit: 1, tune: 55, punch: 0.7, dec: 0.35 });
+  const hat = b.add('hihat', 312, 14, { kit: 1, dec: 0.04, tone: 0.7 });
   const clap = b.add('clap', 256, 80);
   const melody = b.melody(82, 112, 'ACID', { oct: 2, gate: 0.6 });
   const synth = b.add('synth', 256, 146, { cut: 0.2, res: 17, env: 0.8, dec: 0.18 });
@@ -143,9 +143,9 @@ function boomBap() {
   const b = new Builder();
   const clock = b.add('clock', 10, 30, { bpm: 88, swing: 0.22 });
   const beats = b.beats(82, 30, 'BOOMBAP');
-  const kick = b.add('kick', 256, 22, { tune: 45, dec: 0.7, punch: 0.3 });
-  const snare = b.add('snare', 312, 22, { tune: 160, dec: 0.25 });
-  const hat = b.add('hihat', 256, 80, { tone: 0.2 });
+  const kick = b.add('kick', 256, 14, { kit: 4, tune: 45, dec: 0.7, punch: 0.3 });
+  const snare = b.add('snare', 312, 14, { kit: 3, tune: 160, dec: 0.25 });
+  const hat = b.add('hihat', 256, 80, { kit: 2, tone: 0.2 });
   const melody = b.melody(82, 112, 'PENTA', { oct: 2, gate: 0.8, root: 9 });
   const synth = b.add('synth', 256, 146, { wave: 2, cut: 0.45, res: 2, env: 0.3, dec: 0.4 });
   const mixer = b.add('mixer', 378, 40, { l2: 0.5 });
@@ -175,9 +175,9 @@ function dubTechno() {
   const b = new Builder();
   const clock = b.add('clock', 10, 30, { bpm: 120 });
   const beats = b.beats(82, 30, 'TECHNO');
-  const kick = b.add('kick', 256, 22, { tune: 42, punch: 0.4, dec: 0.6 });
-  const hat = b.add('hihat', 312, 22, { tone: 0.3, dec: 0.05 });
-  const clap = b.add('clap', 256, 80, { tone: 900, dec: 0.3 });
+  const kick = b.add('kick', 256, 14, { tune: 42, punch: 0.4, dec: 0.6 });
+  const hat = b.add('hihat', 312, 14, { tone: 0.3, dec: 0.05 });
+  const clap = b.add('clap', 256, 80, { kit: 2, tone: 2200, dec: 0.08 });
   const mixer = b.add('mixer', 378, 40, { l1: 0.5, l2: 0.35, l3: 0.7 });
   const speaker = b.add('speaker', 458, 60);
   const melody = b.melody(82, 112, 'STABS', { scale: 1, root: 2, oct: 3, gate: 0.25 });
@@ -185,7 +185,7 @@ function dubTechno() {
   const lfo = b.add('lfo', 192, 215, { rate: 0.12, shape: 1, depth: 0.3 });
   const delay = b.add('delay', 334, 160, { time: 0.375, fb: 0.62, mix: 0.5 });
   const reverb = b.add('reverb', 398, 160, { size: 0.85, mix: 0.45 });
-  const sub = b.add('synth', 256, 228, { wave: 3, oct: -1, cut: 0.5, env: 0, dec: 0.3 });
+  const sub = b.add('synth', 256, 148, { wave: 3, oct: -1, cut: 0.5, env: 0, dec: 0.3 });
   b.wire(clock, 'o16', beats, 'clk');
   b.wire(clock, 'o16', melody, 'clk');
   b.wire(beats, 'o0', kick, 'in');
@@ -209,7 +209,7 @@ function disco() {
   const b = new Builder();
   const clock = b.add('clock', 10, 30, { bpm: 118, swing: 0.08 });
   const beats = b.beats(82, 30, 'DISCO');
-  const drums = ['kick', 'snare', 'hihat', 'cowbell'].map((t, i) => b.add(t, 256 + (i % 2) * 56, 22 + (i >> 1) * 58));
+  const drums = ['kick', 'snare', 'hihat', 'cowbell'].map((t, i) => b.add(t, 256 + (i % 2) * 56, 14 + (i >> 1) * 66, t === 'snare' ? { kit: 1, tune: 200, snap: 0.85, dec: 0.22 } : {}));
   const mixer = b.add('mixer', 378, 40, { l3: 0.4 });
   const speaker = b.add('speaker', 458, 60);
   const melody = b.melody(82, 112, 'OCTAVES', { oct: 2, gate: 0.4, root: 5 });

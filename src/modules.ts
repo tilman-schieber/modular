@@ -25,17 +25,17 @@ function inBtn(lx: number, ly: number, x: number, y: number, w: number) {
   return lx >= x && lx < x + w && ly >= y && ly < y + 9;
 }
 
-// A "< NAME >" preset selector, 66px wide.
-function drawPresetBar(g: Gfx, x: number, y: number, name: string) {
+// A "< NAME >" preset selector, w pixels wide.
+function drawPresetBar(g: Gfx, x: number, y: number, name: string, w = 66) {
   drawButton(g, x, y, 9, '<', C.silver);
-  g.rect(x + 11, y, 44, 9, C.black);
-  g.textC(name, x + 33, y + 2, C.yellow);
-  drawButton(g, x + 57, y, 9, '>', C.silver);
+  g.rect(x + 11, y, w - 22, 9, C.black);
+  g.textC(name, x + Math.floor(w / 2), y + 2, C.yellow);
+  drawButton(g, x + w - 9, y, 9, '>', C.silver);
 }
 
-function presetStep(lx: number, ly: number, x: number, y: number) {
+function presetStep(lx: number, ly: number, x: number, y: number, w = 66) {
   if (inBtn(lx, ly, x, y, 9)) return -1;
-  if (inBtn(lx, ly, x + 57, y, 9)) return 1;
+  if (inBtn(lx, ly, x + w - 9, y, 9)) return 1;
   return 0;
 }
 
@@ -213,15 +213,49 @@ export class Beats extends Mod {
 
 // ---------------------------------------------------------------- DRUMS
 
+// Waveshaper that quantizes to a few levels, then a dull lowpass: instant lo-fi.
+function crusher(dest: AudioNode) {
+  const sh = ac.createWaveShaper(), lp = ac.createBiquadFilter();
+  const n = 1024, curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) curve[i] = Math.round(((i / (n - 1)) * 2 - 1) * 7) / 7;
+  sh.curve = curve;
+  lp.type = 'lowpass';
+  lp.frequency.value = 3500;
+  sh.connect(lp).connect(dest);
+  return sh;
+}
+
+// Soft-clipping overdrive.
+function overdrive(dest: AudioNode, amount: number) {
+  const sh = ac.createWaveShaper(), g = ac.createGain();
+  const n = 1024, curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) curve[i] = Math.tanh(((i / (n - 1)) * 2 - 1) * amount);
+  sh.curve = curve;
+  g.gain.value = 0.7;
+  sh.connect(g).connect(dest);
+  return sh;
+}
+
+// A kit is a named sound recipe plus the knob settings it starts from.
+interface Kit { name: string; set: Record<string, number> }
+
 abstract class Drum extends Mod {
   out = ac.createGain();
+  private lofi = crusher(this.out);
   private flash = 0;
 
-  constructor(e: Engine, type: string, title: string, knobs: KnobDef[]) {
-    super(e, type, title, 'drum', 50, 52);
-    this.knobRow(knobs, 13);
-    io(this, 'trig');
+  constructor(e: Engine, type: string, title: string, knobs: KnobDef[], public kits: Kit[]) {
+    super(e, type, title, 'drum', 50, 63);
+    this.p.kit = 0;
+    this.knobRow(knobs, 24);
+    this.port('in', 'IN', 'trig', 'in', 4, 44);
+    this.port('out', 'OUT', 'audio', 'out', 37, 44);
   }
+
+  get kit() { return (this.kits[Math.round(this.p.kit)] ?? this.kits[0]).name; }
+
+  // Where a hit should be sent: LOFI kits go through the crusher.
+  dest(): AudioNode { return this.kit === 'LOFI' ? this.lofi : this.out; }
 
   abstract hit(t: number): void;
 
@@ -233,28 +267,57 @@ abstract class Drum extends Mod {
   audioOut() { return this.out; }
 
   drawBody(g: Gfx) {
-    led(g, 23, 35, now() - this.flash < 90);
+    drawPresetBar(g, 3, 12, this.kit, 44);
+    led(g, 23, 47, now() - this.flash < 90);
+  }
+
+  press(lx: number, ly: number): Drag | null {
+    const dir = presetStep(lx, ly, 3, 12, 44);
+    if (!dir) return null;
+    const n = this.kits.length;
+    this.set('kit', (Math.round(this.p.kit) + dir + n) % n);
+    for (const [id, v] of Object.entries(this.kits[this.p.kit].set)) this.set(id, v);
+    return noDrag;
   }
 }
 
 export class Kick extends Drum {
+  private drive = overdrive(this.out, 5);
+
   constructor(e: Engine) {
     super(e, 'kick', 'KICK', [
       { id: 'tune', label: 'TUN', min: 30, max: 90, def: 48, fmt: (v) => Math.round(v) + 'HZ' },
       { id: 'punch', label: 'PCH', min: 0, max: 1, def: 0.5, fmt: pct },
       { id: 'dec', label: 'DEC', min: 0.1, max: 1.5, def: 0.5, fmt: ms },
+    ], [
+      { name: '808', set: { tune: 48, punch: 0.5, dec: 0.5 } },
+      { name: '909', set: { tune: 55, punch: 0.7, dec: 0.3 } },
+      { name: 'HARD', set: { tune: 50, punch: 0.9, dec: 0.35 } },
+      { name: 'SUB', set: { tune: 40, punch: 0.1, dec: 1 } },
+      { name: 'LOFI', set: { tune: 52, punch: 0.5, dec: 0.4 } },
     ]);
   }
 
   hit(t: number) {
-    const { tune, punch, dec } = this.p;
+    const { tune, punch, dec } = this.p, kit = this.kit;
+    const dest = kit === 'HARD' ? this.drive : this.dest();
     const o = ac.createOscillator(), g = ac.createGain();
+    if (kit === 'LOFI') o.type = 'triangle';
+    const drop = kit === '909' ? 0.035 : kit === 'HARD' ? 0.05 : 0.07;
     o.frequency.setValueAtTime(tune * (1 + punch * 7), t);
-    o.frequency.exponentialRampToValueAtTime(tune, t + 0.07);
+    o.frequency.exponentialRampToValueAtTime(tune, t + drop);
     decay(g.gain, t, 1, dec);
-    o.connect(g).connect(this.out);
+    o.connect(g).connect(dest);
     o.start(t);
     o.stop(t + dec + 0.02);
+    if (kit === '909' || kit === 'HARD') {
+      // beater click
+      const n = noiseSrc(t, 0.02), hp = ac.createBiquadFilter(), ng = ac.createGain();
+      hp.type = 'highpass';
+      hp.frequency.value = 2500;
+      decay(ng.gain, t, 0.2 + punch * 0.4, 0.012);
+      n.connect(hp).connect(ng).connect(dest);
+    }
   }
 }
 
@@ -264,25 +327,60 @@ export class Snare extends Drum {
       { id: 'tune', label: 'TUN', min: 100, max: 320, def: 180, fmt: (v) => Math.round(v) + 'HZ' },
       { id: 'snap', label: 'SNP', min: 0, max: 1, def: 0.7, fmt: pct },
       { id: 'dec', label: 'DEC', min: 0.05, max: 0.5, def: 0.18, fmt: ms },
+    ], [
+      { name: '808', set: { tune: 180, snap: 0.7, dec: 0.18 } },
+      { name: '909', set: { tune: 200, snap: 0.85, dec: 0.22 } },
+      { name: 'RIM', set: { tune: 180, snap: 0.2, dec: 0.06 } },
+      { name: 'LOFI', set: { tune: 170, snap: 0.7, dec: 0.2 } },
     ]);
+  }
+
+  private tone(t: number, f: number, type: OscillatorType, level: number, len: number) {
+    const o = ac.createOscillator(), og = ac.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f * 1.6, t);
+    o.frequency.exponentialRampToValueAtTime(f, t + 0.03);
+    decay(og.gain, t, level, len);
+    o.connect(og).connect(this.dest());
+    o.start(t);
+    o.stop(t + len + 0.03);
+  }
+
+  private noise(t: number, cut: number, level: number, len: number) {
+    const n = noiseSrc(t, len + 0.05), hp = ac.createBiquadFilter(), ng = ac.createGain();
+    hp.type = 'highpass';
+    hp.frequency.value = cut;
+    decay(ng.gain, t, level, len);
+    n.connect(hp).connect(ng).connect(this.dest());
   }
 
   hit(t: number) {
     const { tune, snap, dec } = this.p;
-    const o = ac.createOscillator(), og = ac.createGain();
-    o.type = 'triangle';
-    o.frequency.setValueAtTime(tune * 1.6, t);
-    o.frequency.exponentialRampToValueAtTime(tune, t + 0.03);
-    decay(og.gain, t, 0.7, 0.12);
-    o.connect(og).connect(this.out);
-    o.start(t);
-    o.stop(t + 0.15);
-
-    const n = noiseSrc(t, dec + 0.05), hp = ac.createBiquadFilter(), ng = ac.createGain();
-    hp.type = 'highpass';
-    hp.frequency.value = 1200;
-    decay(ng.gain, t, 0.05 + snap * 0.8, dec);
-    n.connect(hp).connect(ng).connect(this.out);
+    switch (this.kit) {
+      case '909':
+        this.tone(t, tune, 'triangle', 0.6, 0.1);
+        this.tone(t, tune * 1.8, 'triangle', 0.3, 0.07);
+        this.noise(t, 2000, 0.1 + snap * 0.9, dec);
+        break;
+      case 'RIM': {
+        // a short, hollow square "tock" through a resonant bandpass
+        const o = ac.createOscillator(), bp = ac.createBiquadFilter(), g = ac.createGain();
+        o.type = 'square';
+        o.frequency.value = tune * 9;
+        bp.type = 'bandpass';
+        bp.frequency.value = tune * 9;
+        bp.Q.value = 4;
+        decay(g.gain, t, 1, dec);
+        o.connect(bp).connect(g).connect(this.out);
+        o.start(t);
+        o.stop(t + dec + 0.02);
+        this.noise(t, 4000, snap * 0.5, 0.01);
+        break;
+      }
+      default:
+        this.tone(t, tune, 'triangle', 0.7, 0.12);
+        this.noise(t, 1200, 0.05 + snap * 0.8, dec);
+    }
   }
 }
 
@@ -294,6 +392,10 @@ export class HiHat extends Drum {
     super(e, 'hihat', 'HIHAT', [
       { id: 'tone', label: 'TON', min: 0, max: 1, def: 0.5, fmt: pct },
       { id: 'dec', label: 'DEC', min: 0.02, max: 0.8, def: 0.06, fmt: ms },
+    ], [
+      { name: '808', set: { tone: 0.5, dec: 0.06 } },
+      { name: '909', set: { tone: 0.6, dec: 0.05 } },
+      { name: 'LOFI', set: { tone: 0.4, dec: 0.06 } },
     ]);
   }
 
@@ -304,8 +406,15 @@ export class HiHat extends Drum {
     bp.frequency.value = 10000;
     hp.type = 'highpass';
     hp.frequency.value = 5000 + tone * 4000;
+    bp.connect(hp).connect(g).connect(this.dest());
+    if (this.kit === '909') {
+      // brighter and noisier
+      bp.Q.value = 0.7;
+      decay(g.gain, t, 0.5, dec);
+      noiseSrc(t, dec + 0.02).connect(bp);
+      return;
+    }
     decay(g.gain, t, 0.35, dec);
-    bp.connect(hp).connect(g).connect(this.out);
     for (const f of METAL) {
       const o = ac.createOscillator();
       o.type = 'square';
@@ -322,23 +431,42 @@ export class Clap extends Drum {
     super(e, 'clap', 'CLAP', [
       { id: 'tone', label: 'TON', min: 600, max: 2400, def: 1200, fmt: (v) => Math.round(v) + 'HZ' },
       { id: 'dec', label: 'DEC', min: 0.05, max: 0.6, def: 0.2, fmt: ms },
+    ], [
+      { name: '808', set: { tone: 1200, dec: 0.2 } },
+      { name: '909', set: { tone: 1500, dec: 0.25 } },
+      { name: 'SNAP', set: { tone: 2200, dec: 0.08 } },
+      { name: 'LOFI', set: { tone: 1100, dec: 0.2 } },
     ]);
   }
 
   hit(t: number) {
-    const { tone, dec } = this.p;
+    const { tone, dec } = this.p, kit = this.kit;
     const n = noiseSrc(t, 0.05 + dec), bp = ac.createBiquadFilter(), g = ac.createGain();
     bp.type = 'bandpass';
     bp.frequency.value = tone;
-    bp.Q.value = 1.5;
-    g.gain.setValueAtTime(0, t);
-    for (let i = 0; i < 3; i++) {
-      const tt = t + i * 0.01;
-      g.gain.setValueAtTime(1, tt);
-      g.gain.exponentialRampToValueAtTime(0.08, tt + 0.009);
+    n.connect(bp).connect(g).connect(this.dest());
+    if (kit === 'SNAP') {
+      // finger snap: a tight resonant burst plus a tiny sine blip
+      bp.Q.value = 4;
+      decay(g.gain, t, 1.2, dec);
+      const o = ac.createOscillator(), og = ac.createGain();
+      o.frequency.value = 1800;
+      decay(og.gain, t, 0.4, 0.015);
+      o.connect(og).connect(this.out);
+      o.start(t);
+      o.stop(t + 0.03);
+      return;
     }
-    decay(g.gain, t + 0.03, 0.9, dec);
-    n.connect(bp).connect(g).connect(this.out);
+    // several quick bursts make the "many hands" smear
+    const bursts = kit === '909' ? 4 : 3, gap = kit === '909' ? 0.008 : 0.01;
+    bp.Q.value = kit === '909' ? 1 : 1.5;
+    g.gain.setValueAtTime(0, t);
+    for (let i = 0; i < bursts; i++) {
+      const tt = t + i * gap;
+      g.gain.setValueAtTime(1, tt);
+      g.gain.exponentialRampToValueAtTime(0.08, tt + gap * 0.9);
+    }
+    decay(g.gain, t + bursts * gap, 0.9, dec);
   }
 }
 
@@ -347,11 +475,26 @@ export class Cowbell extends Drum {
     super(e, 'cowbell', 'COWBELL', [
       { id: 'tune', label: 'TUN', min: 0.5, max: 2, def: 1, fmt: (v) => 'X' + v.toFixed(2) },
       { id: 'dec', label: 'DEC', min: 0.05, max: 1, def: 0.3, fmt: ms },
+    ], [
+      { name: '808', set: { tune: 1, dec: 0.3 } },
+      { name: 'CLAVE', set: { tune: 1, dec: 0.08 } },
+      { name: 'BLOCK', set: { tune: 1, dec: 0.12 } },
     ]);
   }
 
   hit(t: number) {
-    const { tune, dec } = this.p;
+    const { tune, dec } = this.p, kit = this.kit;
+    if (kit !== '808') {
+      // clave: pure high sine; wood block: lower, hollow triangle
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.type = kit === 'CLAVE' ? 'sine' : 'triangle';
+      o.frequency.value = (kit === 'CLAVE' ? 2500 : 950) * tune;
+      decay(g.gain, t, 0.6, dec);
+      o.connect(g).connect(this.out);
+      o.start(t);
+      o.stop(t + dec + 0.02);
+      return;
+    }
     const bp = ac.createBiquadFilter(), g = ac.createGain();
     bp.type = 'bandpass';
     bp.frequency.value = 800 * tune;

@@ -22,8 +22,15 @@ export function compatible(out: SigType, inp: SigType) {
   return out === inp || (out === 'note' && inp === 'trig');
 }
 
-// An event on a trig/note cable: when it happens, how long one step lasts, and an optional MIDI note.
-export interface Ev { t: number; dur: number; note?: number }
+// An event on a trig/note cable: when it happens, how long it lasts, and optionally
+// a MIDI note, an accent, a slide (glide from the previous note without retriggering)
+// and how many notes sound together (for chords).
+// Live playing adds `hold` (sustain until a matching note-off) and `off` (the note-off itself).
+export interface Ev {
+  t: number; dur: number; note?: number;
+  acc?: boolean; slide?: boolean; voices?: number;
+  hold?: boolean; off?: boolean;
+}
 
 export interface Port { id: string; label: string; type: SigType; dir: 'in' | 'out'; x: number; y: number }
 

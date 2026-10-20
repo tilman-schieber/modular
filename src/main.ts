@@ -2,9 +2,10 @@ import { ac } from './audio';
 import { Engine } from './engine';
 import { C, Gfx, textWidth } from './gfx';
 import { CAT, TYPEC, compatible, type Cat, type Drag, type Knob, type Mod, type Port } from './mod';
-import { KINDS } from './modules';
+import { KINDS, Keys } from './modules';
 import { PATCHES, type PatchData } from './patches';
 import { drawButton, drawCable, drawModule } from './render';
+import { Recorder } from './rec';
 import { decodePatch, encodePatch, hashCode } from './share';
 
 // The patch field zooms; the UI overlay (toolbar, menu, hints) keeps a fixed pixel scale.
@@ -69,12 +70,36 @@ function togglePlay() {
   else { eng.start(); everPlayed = true; }
 }
 
+// ---------------------------------------------------------------- recording
+
+const recorder = new Recorder(eng.output);
+
+function toggleRec() {
+  void ac.resume();
+  if (!recorder.recording) {
+    void recorder.start().then(() => showToast('RECORDING - CLICK AGAIN TO SAVE'));
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(recorder.stop()!);
+  a.download = `pixel-modular-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.wav`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  showToast('RECORDING SAVED');
+}
+
+function recLabel() {
+  const s = Math.floor(recorder.seconds);
+  return recorder.recording ? `  ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` : '  REC';
+}
+
 function layoutBar() {
   const cats = Object.keys(CAT) as Cat[];
   const items: Omit<Btn, 'x' | 'y' | 'w'>[] = [
     eng.running
       ? { label: '  STOP', col: C.red, text: C.ink, hi: C.white, act: togglePlay }
       : { label: '  PLAY', col: C.green, text: C.ink, hi: C.white, act: togglePlay },
+    { label: recLabel(), col: recorder.recording ? C.red : C.silver, text: C.ink, hi: C.white, act: toggleRec },
     {
       label: 'PATCHES', col: C.silver, text: C.ink, hi: C.white,
       menu: PATCHES.map((p) => ({
@@ -86,6 +111,8 @@ function layoutBar() {
       label: CAT[cat].name, col: CAT[cat].bar, text: C.white, hi: CAT[cat].cap,
       menu: KINDS.filter((k) => k.cat === cat).map((k) => ({ label: k.label, col: CAT[cat].bar, text: C.white, spawn: k.type })),
     })),
+    { label: 'UNDO', col: C.silver, text: C.ink, hi: C.white, act: undo },
+    { label: 'REDO', col: C.silver, text: C.ink, hi: C.white, act: redo },
     { label: 'SHARE', col: C.silver, text: C.ink, hi: C.white, act: () => void share() },
     { label: 'CLEAR', col: C.silver, text: C.ink, hi: C.white, act: () => eng.clear() },
   ];
@@ -97,7 +124,7 @@ function layoutBar() {
     bar.push({ ...it, x, y, w });
     x += w + 2;
     // Small gaps separate transport, patches, modules and the rest.
-    if (it.act === togglePlay || it.label === 'PATCHES' || it.label === CAT.util.name) x += 6;
+    if (it.act === toggleRec || it.label === 'PATCHES' || it.label === CAT.util.name) x += 6;
   }
   barH = y + 12;
 }
@@ -129,6 +156,11 @@ function drawBar() {
     if (b.menu) {
       const ax = b.x + b.w - 8, ac = active ? C.ink : b.text;
       for (let i = 0; i < 3; i++) ui.rect(ax + i, b.y + 3 + i, 5 - i * 2, 1, ac);
+    }
+    if (b.act === toggleRec) {
+      const on = !recorder.recording || Math.floor(performance.now() / 400) % 2 === 0;
+      ui.disc(b.x + 6, b.y + 4, 2, on ? C.red : C.ink);
+      if (recorder.recording && on) ui.disc(b.x + 6, b.y + 4, 2, C.white);
     }
     if (b.act === togglePlay) {
       if (eng.running) ui.rect(b.x + 4, b.y + 2, 5, 5, C.ink);
@@ -353,12 +385,13 @@ function endPointer() {
   if (mode.k === 'move' && mode.spawned && (!mode.moved || uy < barH)) placeInView(mode.m);
   if (mode.k === 'drag') mode.d.up?.();
   mode = { k: 'none' };
+  checkpoint();
 }
 
 canvas.addEventListener('pointerup', (e) => { setPointer(e); endPointer(); });
 canvas.addEventListener('pointercancel', endPointer);
 
-let wheelAcc = 0;
+let wheelAcc = 0, wheelTimer = 0;
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
   setPointer(e);
@@ -368,6 +401,8 @@ canvas.addEventListener('wheel', (e) => {
     const k = h.kn;
     const step = k.step ?? (k.max - k.min) / 50;
     h.m.setKnob(k, h.m.p[k.id] - Math.sign(e.deltaY) * step);
+    clearTimeout(wheelTimer);
+    wheelTimer = window.setTimeout(checkpoint, 500);
     return;
   }
   wheelAcc += e.deltaY;
@@ -384,7 +419,25 @@ canvas.addEventListener('wheel', (e) => {
   camY = wy - my;
 }, { passive: false });
 
+const keysMods = () => eng.mods.filter((m): m is Keys => m instanceof Keys);
+
 addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'z' || e.key.toLowerCase() === 'y')) {
+    e.preventDefault();
+    if (e.key.toLowerCase() === 'y' || e.shiftKey) redo();
+    else undo();
+    return;
+  }
+  if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.repeat) {
+    let used = false;
+    for (const k of keysMods()) used = k.key(e.code, true) || used;
+    if (used) {
+      void ac.resume();
+      e.preventDefault();
+      checkpoint();
+      return;
+    }
+  }
   if (e.code === 'Space') {
     e.preventDefault();
     void ac.resume();
@@ -394,7 +447,17 @@ addEventListener('keydown', (e) => {
   if (e.code === 'Delete' || e.code === 'Backspace') {
     const h = hitTest();
     if (h.k === 'close' || h.k === 'port' || h.k === 'knob' || h.k === 'body') eng.remove(h.m);
+    checkpoint();
   }
+});
+
+addEventListener('keyup', (e) => {
+  for (const k of keysMods()) k.key(e.code, false);
+});
+
+// Don't leave notes hanging when the window loses focus mid-press.
+addEventListener('blur', () => {
+  for (const k of keysMods()) k.allOff();
 });
 
 addEventListener('resize', resize);
@@ -443,6 +506,48 @@ function fitView() {
   camY = Math.min(Math.floor((y0 + y1 - H - top) / 2), y0 - top - 6);
 }
 
+// ---------------------------------------------------------------- undo
+
+// Snapshots of the patch with modules in id order, so merely raising a module isn't a step.
+let undoStack: string[] = [];
+let redoStack: string[] = [];
+let current = '';
+
+function snap() {
+  const d = serialize();
+  d.mods.sort((a, b) => a.id - b.id);
+  return JSON.stringify(d);
+}
+
+function checkpoint() {
+  const s = snap();
+  if (s === current) return;
+  if (current) undoStack.push(current);
+  if (undoStack.length > 100) undoStack.shift();
+  current = s;
+  redoStack = [];
+}
+
+function restoreSnap(s: string) {
+  loadPatch(JSON.parse(s));
+  current = snap();
+}
+
+function undo() {
+  checkpoint();
+  const prev = undoStack.pop();
+  if (!prev) { showToast('NOTHING TO UNDO'); return; }
+  redoStack.push(current);
+  restoreSnap(prev);
+}
+
+function redo() {
+  const next = redoStack.pop();
+  if (!next) { showToast('NOTHING TO REDO'); return; }
+  undoStack.push(current);
+  restoreSnap(next);
+}
+
 async function share() {
   const url = `${location.origin}${location.pathname}#p=${await encodePatch(serialize())}`;
   history.replaceState(null, '', url);
@@ -469,6 +574,11 @@ async function loadFromHash() {
 }
 
 async function restore() {
+  await restoreInitial();
+  checkpoint();
+}
+
+async function restoreInitial() {
   if (await loadFromHash()) return;
   // ?patch=N opens one of the built-in patches.
   const n = Number(new URLSearchParams(location.search).get('patch'));
@@ -484,7 +594,7 @@ async function restore() {
   fitView();
 }
 
-addEventListener('hashchange', () => void loadFromHash());
+addEventListener('hashchange', () => void loadFromHash().then(checkpoint));
 
 setInterval(() => {
   if (!eng.dirty) return;

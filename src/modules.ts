@@ -105,29 +105,33 @@ export const BEAT_PRESETS: { name: string; rows: number[][] }[] = [
   { name: 'HALFTIME', rows: [[0, 3, 10], [8], [0, 4, 8, 12, 14], [8]] },
 ];
 
+// Five step strings: the four drum rows plus an (empty) accent row.
 export function beatSteps(name: string) {
   const pre = BEAT_PRESETS.find((b) => b.name === name)!;
-  return pre.rows.map((on) => Array.from({ length: 16 }, (_, i) => (on.includes(i) ? '1' : '0')).join(''));
+  return [0, 1, 2, 3, 4].map((r) => Array.from({ length: 16 }, (_, i) => (pre.rows[r]?.includes(i) ? '1' : '0')).join(''));
 }
+
 const ROW_COLS = [C.red, C.orange, C.yellow, C.lime];
+const ACC = 4; // index of the accent row
 
 export class Beats extends Mod {
-  steps: boolean[][] = ROW_NAMES.map(() => Array(16).fill(false));
+  steps: boolean[][] = [0, 1, 2, 3, 4].map(() => Array(16).fill(false));
   private pos = -1;
   private shown = -1;
   private preset = -1;
 
   constructor(e: Engine) {
-    super(e, 'beats', 'BEATS', 'seq', 160, 72);
+    super(e, 'beats', 'BEATS', 'seq', 160, 80);
     this.port('clk', 'CLK', 'trig', 'in', 4, 12);
     ROW_NAMES.forEach((_, r) => this.port('o' + r, '', 'trig', 'out', 147, 16 + r * 10));
+    this.knob({ id: 'len', label: 'LEN', x: 4, y: 31, min: 1, max: 16, def: 16, step: 1 });
   }
 
   static cellX(c: number) { return 26 + c * 7 + (c >> 2) * 2; }
 
   private cellAt(lx: number, ly: number) {
     const r = Math.floor((ly - 16) / 10);
-    if (r < 0 || r > 3 || ly - 16 - r * 10 > 8) return null;
+    if (r < 0 || r > ACC || ly - 16 - r * 10 > 8) return null;
     for (let c = 0; c < 16; c++) {
       const x = Beats.cellX(c);
       if (lx >= x && lx < x + 7) return { r, c };
@@ -138,23 +142,28 @@ export class Beats extends Mod {
   reset() { this.pos = -1; this.shown = -1; }
 
   onEvent(port: string, ev: Ev) {
-    if (port !== 'clk') return;
-    const s = (this.pos = (this.pos + 1) % 16);
+    if (port !== 'clk' || ev.off) return;
+    const s = (this.pos = (this.pos + 1) % this.p.len);
     this.eng.at(ev.t, () => (this.shown = s));
-    this.steps.forEach((row, r) => row[s] && this.emit('o' + r, ev));
+    const out = { ...ev, acc: this.steps[ACC][s] };
+    for (let r = 0; r < ACC; r++) if (this.steps[r][s]) this.emit('o' + r, out);
   }
 
   drawBody(g: Gfx) {
-    for (let c = 0; c < 16; c++) {
+    const len = this.p.len;
+    for (let c = 0; c < len; c++) {
       g.rect(Beats.cellX(c), 13, 6, 2, c === this.shown ? C.lime : C.black);
     }
     this.steps.forEach((row, r) => {
-      const y = 16 + r * 10;
-      g.text(ROW_NAMES[r], 16, y + 2, ROW_COLS[r]);
+      const y = 16 + r * 10, col = r === ACC ? C.white : ROW_COLS[r];
+      g.text(r === ACC ? 'AC' : ROW_NAMES[r], 16, y + 2, col);
       row.forEach((on, c) => {
         const x = Beats.cellX(c), cur = c === this.shown;
-        if (on) {
-          g.rect(x, y, 6, 8, cur ? C.white : ROW_COLS[r]);
+        if (c >= len) {
+          // steps past the pattern length are inactive
+          g.rect(x, y, 6, 8, on ? C.slate : C.black);
+        } else if (on) {
+          g.rect(x, y, 6, 8, cur ? C.white : col);
           g.rect(x, y, 6, 1, C.white);
           g.rect(x, y + 7, 6, 1, C.black);
         } else {
@@ -163,13 +172,13 @@ export class Beats extends Mod {
         }
       });
     });
-    drawPresetBar(g, 26, 60, this.preset < 0 ? 'PRESET' : BEAT_PRESETS[this.preset].name);
-    drawButton(g, 100, 60, 22, 'RND', C.yellow);
-    drawButton(g, 124, 60, 22, 'CLR', C.silver);
+    drawPresetBar(g, 26, 68, this.preset < 0 ? 'PRESET' : BEAT_PRESETS[this.preset].name);
+    drawButton(g, 100, 68, 22, 'RND', C.yellow);
+    drawButton(g, 124, 68, 22, 'CLR', C.silver);
   }
 
   press(lx: number, ly: number): Drag | null {
-    const dir = presetStep(lx, ly, 26, 60);
+    const dir = presetStep(lx, ly, 26, 68);
     if (dir) {
       const n = BEAT_PRESETS.length;
       this.preset = (((this.preset < 0 && dir < 0 ? 0 : this.preset) + dir) % n + n) % n;
@@ -177,14 +186,14 @@ export class Beats extends Mod {
       this.eng.dirty = true;
       return noDrag;
     }
-    if (inBtn(lx, ly, 100, 60, 22)) {
-      const density = [0.3, 0.15, 0.6, 0.12];
+    if (inBtn(lx, ly, 100, 68, 22)) {
+      const density = [0.3, 0.15, 0.6, 0.12, 0.15];
       this.steps = this.steps.map((_, r) => Array.from({ length: 16 }, (_, c) =>
         r === 0 && c % 4 === 0 ? Math.random() < 0.8 : Math.random() < density[r]));
       this.eng.dirty = true;
       return noDrag;
     }
-    if (inBtn(lx, ly, 124, 60, 22)) {
+    if (inBtn(lx, ly, 124, 68, 22)) {
       this.steps = this.steps.map(() => Array(16).fill(false));
       this.eng.dirty = true;
       return noDrag;
@@ -254,13 +263,22 @@ abstract class Drum extends Mod {
 
   get kit() { return (this.kits[Math.round(this.p.kit)] ?? this.kits[0]).name; }
 
-  // Where a hit should be sent: LOFI kits go through the crusher.
-  dest(): AudioNode { return this.kit === 'LOFI' ? this.lofi : this.out; }
+  // Where the kit's sound goes: LOFI kits pass through the crusher.
+  protected route(): AudioNode { return this.kit === 'LOFI' ? this.lofi : this.out; }
+
+  // Each hit plays into its own gain so accents can make it louder.
+  private bus: AudioNode = this.out;
+  dest() { return this.bus; }
 
   abstract hit(t: number): void;
 
   onEvent(_port: string, ev: Ev) {
+    if (ev.off) return;
     this.eng.at(ev.t, () => (this.flash = now()));
+    const bus = ac.createGain();
+    bus.gain.value = ev.acc ? 1.6 : 1;
+    bus.connect(this.route());
+    this.bus = bus;
     this.hit(ev.t);
   }
 
@@ -284,6 +302,8 @@ abstract class Drum extends Mod {
 export class Kick extends Drum {
   private drive = overdrive(this.out, 5);
 
+  protected route() { return this.kit === 'HARD' ? this.drive : super.route(); }
+
   constructor(e: Engine) {
     super(e, 'kick', 'KICK', [
       { id: 'tune', label: 'TUN', min: 30, max: 90, def: 48, fmt: (v) => Math.round(v) + 'HZ' },
@@ -300,7 +320,7 @@ export class Kick extends Drum {
 
   hit(t: number) {
     const { tune, punch, dec } = this.p, kit = this.kit;
-    const dest = kit === 'HARD' ? this.drive : this.dest();
+    const dest = this.dest();
     const o = ac.createOscillator(), g = ac.createGain();
     if (kit === 'LOFI') o.type = 'triangle';
     const drop = kit === '909' ? 0.035 : kit === 'HARD' ? 0.05 : 0.07;
@@ -371,7 +391,7 @@ export class Snare extends Drum {
         bp.frequency.value = tune * 9;
         bp.Q.value = 4;
         decay(g.gain, t, 1, dec);
-        o.connect(bp).connect(g).connect(this.out);
+        o.connect(bp).connect(g).connect(this.dest());
         o.start(t);
         o.stop(t + dec + 0.02);
         this.noise(t, 4000, snap * 0.5, 0.01);
@@ -452,7 +472,7 @@ export class Clap extends Drum {
       const o = ac.createOscillator(), og = ac.createGain();
       o.frequency.value = 1800;
       decay(og.gain, t, 0.4, 0.015);
-      o.connect(og).connect(this.out);
+      o.connect(og).connect(this.dest());
       o.start(t);
       o.stop(t + 0.03);
       return;
@@ -490,7 +510,7 @@ export class Cowbell extends Drum {
       o.type = kit === 'CLAVE' ? 'sine' : 'triangle';
       o.frequency.value = (kit === 'CLAVE' ? 2500 : 950) * tune;
       decay(g.gain, t, 0.6, dec);
-      o.connect(g).connect(this.out);
+      o.connect(g).connect(this.dest());
       o.start(t);
       o.stop(t + dec + 0.02);
       return;
@@ -502,7 +522,7 @@ export class Cowbell extends Drum {
     g.gain.setValueAtTime(0.5, t);
     g.gain.exponentialRampToValueAtTime(0.15, t + 0.02);
     g.gain.exponentialRampToValueAtTime(0.001, t + dec);
-    bp.connect(g).connect(this.out);
+    bp.connect(g).connect(this.dest());
     for (const f of [540, 800]) {
       const o = ac.createOscillator();
       o.type = 'square';
@@ -521,31 +541,45 @@ const SCALES = [[0, 2, 4, 5, 7, 9, 11], [0, 2, 3, 5, 7, 8, 10], [0, 3, 5, 7, 10]
 
 const _ = -1;
 // Rows are scale degrees (0 = root, 7 = top row); scale indexes SCALE_NAMES.
-export const MELODY_PRESETS: { name: string; scale: number; notes: number[] }[] = [
-  { name: 'BASSLINE', scale: 1, notes: [0, _, 0, 2, _, 0, 3, _, 0, _, 4, 3, 2, _, 0, 7] },
-  { name: 'ACID', scale: 1, notes: [0, 0, 7, _, 0, 3, _, 0, 4, _, 0, 7, 0, 2, _, 3] },
-  { name: 'ARP', scale: 0, notes: [0, 2, 4, 7, 4, 2, 0, 2, 4, 7, 4, 2, 0, 2, 4, 7] },
-  { name: 'BLUES', scale: 3, notes: [0, _, 1, 2, 3, 4, _, 5, 6, _, 5, 4, 3, 2, 1, _] },
+// acc and slide list the accented / sliding steps.
+export const MELODY_PRESETS: { name: string; scale: number; notes: number[]; acc?: number[]; slide?: number[] }[] = [
+  { name: 'BASSLINE', scale: 1, notes: [0, _, 0, 2, _, 0, 3, _, 0, _, 4, 3, 2, _, 0, 7], acc: [0, 8] },
+  { name: 'ACID', scale: 1, notes: [0, 0, 7, _, 0, 3, _, 0, 4, _, 0, 7, 0, 2, _, 3], acc: [0, 4, 8, 12], slide: [2, 7, 11, 15] },
+  { name: 'ARP', scale: 0, notes: [0, 2, 4, 7, 4, 2, 0, 2, 4, 7, 4, 2, 0, 2, 4, 7], acc: [0, 6, 12] },
+  { name: 'BLUES', scale: 3, notes: [0, _, 1, 2, 3, 4, _, 5, 6, _, 5, 4, 3, 2, 1, _], slide: [2, 3, 12, 13] },
   { name: 'PENTA', scale: 2, notes: [5, _, 4, 3, _, 3, 2, _, 0, _, 2, 3, 4, _, 3, _] },
-  { name: 'OCTAVES', scale: 1, notes: [0, 7, 0, 7, 0, 7, 0, 7, 5, 5, 5, 5, 6, 6, 4, 4] },
-  { name: 'DRONE', scale: 1, notes: [0, _, _, _, _, _, _, _, 4, _, _, _, 2, _, _, _] },
-  { name: 'STABS', scale: 0, notes: [_, _, 4, _, _, _, 4, _, _, _, 4, _, _, 5, _, 4] },
+  { name: 'OCTAVES', scale: 1, notes: [0, 7, 0, 7, 0, 7, 0, 7, 5, 5, 5, 5, 6, 6, 4, 4], acc: [1, 5, 9, 13] },
+  { name: 'DRONE', scale: 1, notes: [0, _, _, _, _, _, _, _, 4, _, _, _, 2, _, _, _], slide: [8, 12] },
+  { name: 'STABS', scale: 0, notes: [_, _, 4, _, _, _, 4, _, _, _, 4, _, _, 5, _, 4], acc: [13] },
 ];
+
+export function melodyState(name: string) {
+  const pre = MELODY_PRESETS.find((m) => m.name === name)!;
+  const bits = (on?: number[]) => Array.from({ length: 16 }, (_, i) => (on?.includes(i) ? '1' : '0')).join('');
+  return { n: pre.notes, a: bits(pre.acc), s: bits(pre.slide) };
+}
+
+// Chord shapes as stacked scale degrees.
+const CHORDS = [[0], [0, 4], [0, 2, 4], [0, 2, 4, 6]];
 
 export class Melody extends Mod {
   notes: number[] = Array(16).fill(-1);
+  acc: boolean[] = Array(16).fill(false);
+  slide: boolean[] = Array(16).fill(false);
   private pos = -1;
   private shown = -1;
   private preset = -1;
 
   constructor(e: Engine) {
-    super(e, 'melody', 'MELODY', 'seq', 160, 93);
+    super(e, 'melody', 'MELODY', 'seq', 160, 102);
     this.port('clk', 'CLK', 'trig', 'in', 4, 12);
     this.port('note', 'OUT', 'note', 'out', 147, 12);
-    this.knob({ id: 'root', label: 'KEY', x: 26, y: 69, min: 0, max: 11, def: 0, names: NOTE_NAMES });
-    this.knob({ id: 'scale', label: 'SCL', x: 42, y: 69, min: 0, max: 3, def: 1, names: SCALE_NAMES });
-    this.knob({ id: 'oct', label: 'OCT', x: 58, y: 69, min: 1, max: 5, def: 2, step: 1 });
-    this.knob({ id: 'gate', label: 'LEN', x: 74, y: 69, min: 0.1, max: 1, def: 0.5, fmt: pct });
+    this.knob({ id: 'len', label: 'LEN', x: 4, y: 31, min: 1, max: 16, def: 16, step: 1 });
+    this.knob({ id: 'root', label: 'KEY', x: 26, y: 80, min: 0, max: 11, def: 0, names: NOTE_NAMES });
+    this.knob({ id: 'scale', label: 'SCL', x: 42, y: 80, min: 0, max: 3, def: 1, names: SCALE_NAMES });
+    this.knob({ id: 'oct', label: 'OCT', x: 58, y: 80, min: 1, max: 5, def: 2, step: 1 });
+    this.knob({ id: 'gate', label: 'GAT', x: 74, y: 80, min: 0.1, max: 1, def: 0.5, fmt: pct });
+    this.knob({ id: 'chord', label: 'CHD', x: 90, y: 80, min: 0, max: 3, def: 0, names: ['ONE', 'PWR', 'TRI', '7TH'] });
   }
 
   private semi(r: number) {
@@ -555,76 +589,114 @@ export class Melody extends Mod {
 
   private rowY(r: number) { return 16 + (7 - r) * 6; }
 
-  private cellAt(lx: number, ly: number) {
-    const r = 7 - Math.floor((ly - 16) / 6);
-    if (r < 0 || r > 7 || ly < 16) return null;
+  private colAt(lx: number) {
     for (let c = 0; c < 16; c++) {
       const x = Beats.cellX(c);
-      if (lx >= x && lx < x + 7) return { r, c };
+      if (lx >= x && lx < x + 7) return c;
     }
-    return null;
+    return -1;
+  }
+
+  // A note cell, or a cell in the accent ('a') / slide ('s') rows.
+  private cellAt(lx: number, ly: number): { r: number | 'a' | 's'; c: number } | null {
+    const c = this.colAt(lx);
+    if (c < 0) return null;
+    if (ly >= 66 && ly < 70) return { r: 'a', c };
+    if (ly >= 71 && ly < 75) return { r: 's', c };
+    const r = 7 - Math.floor((ly - 16) / 6);
+    if (r < 0 || r > 7 || ly < 16) return null;
+    return { r, c };
   }
 
   reset() { this.pos = -1; this.shown = -1; }
 
   onEvent(port: string, ev: Ev) {
-    if (port !== 'clk') return;
-    const s = (this.pos = (this.pos + 1) % 16);
+    if (port !== 'clk' || ev.off) return;
+    const len = this.p.len;
+    const s = (this.pos = (this.pos + 1) % len);
     this.eng.at(ev.t, () => (this.shown = s));
     const r = this.notes[s];
     if (r < 0) return;
-    const note = 12 * (this.p.oct + 1) + this.p.root + this.semi(r);
-    this.emit('note', { t: ev.t, dur: ev.dur * this.p.gate, note });
+    // A slide on the next step keeps this note held so the synth can glide into it.
+    const next = (s + 1) % len;
+    const tie = this.slide[next] && this.notes[next] >= 0;
+    const dur = tie ? ev.dur * 1.05 : ev.dur * this.p.gate;
+    const shape = CHORDS[this.p.chord];
+    for (const o of shape) {
+      const note = 12 * (this.p.oct + 1) + this.p.root + this.semi(r + o);
+      this.emit('note', { t: ev.t, dur, note, acc: this.acc[s], slide: this.slide[s], voices: shape.length });
+    }
   }
 
   drawBody(g: Gfx) {
-    for (let c = 0; c < 16; c++) {
+    const len = this.p.len;
+    for (let c = 0; c < len; c++) {
       g.rect(Beats.cellX(c), 13, 6, 2, c === this.shown ? C.lime : C.black);
     }
-    const len = SCALES[this.p.scale].length;
+    const sl = SCALES[this.p.scale].length;
     for (let r = 0; r < 8; r++) {
       const y = this.rowY(r);
-      g.text(NOTE_NAMES[(this.p.root + this.semi(r)) % 12], 16, y, r % len === 0 ? C.yellow : C.slate);
+      g.text(NOTE_NAMES[(this.p.root + this.semi(r)) % 12], 16, y, r % sl === 0 ? C.yellow : C.slate);
       for (let c = 0; c < 16; c++) {
         const x = Beats.cellX(c), cur = c === this.shown;
-        if (this.notes[c] === r) {
+        if (c >= len) g.rect(x, y, 6, 5, this.notes[c] === r ? C.slate : C.black);
+        else if (this.notes[c] === r) {
           g.rect(x, y, 6, 5, cur ? C.white : C.yellow);
           g.rect(x, y, 6, 1, C.white);
         } else {
-          g.rect(x, y, 6, 5, cur ? C.slate : r % len === 0 ? C.navy : C.ink);
+          g.rect(x, y, 6, 5, cur ? C.slate : r % sl === 0 ? C.navy : C.ink);
         }
       }
     }
-    drawPresetBar(g, 90, 68, this.preset < 0 ? 'PRESET' : MELODY_PRESETS[this.preset].name);
-    drawButton(g, 101, 80, 22, 'RND', C.yellow);
-    drawButton(g, 125, 80, 22, 'CLR', C.silver);
+    // accent and slide rows
+    g.text('AC', 16, 65, C.white);
+    g.text('SL', 16, 70, C.sky);
+    for (let c = 0; c < 16; c++) {
+      const x = Beats.cellX(c), off = c >= len ? C.black : C.ink;
+      g.rect(x, 66, 6, 4, this.acc[c] ? C.white : off);
+      g.rect(x, 71, 6, 4, this.slide[c] ? C.sky : off);
+    }
+    drawPresetBar(g, 104, 79, this.preset < 0 ? 'PRESET' : MELODY_PRESETS[this.preset].name, 54);
+    drawButton(g, 104, 90, 25, 'RND', C.yellow);
+    drawButton(g, 131, 90, 25, 'CLR', C.silver);
   }
 
   press(lx: number, ly: number): Drag | null {
-    const dir = presetStep(lx, ly, 90, 68);
+    const dir = presetStep(lx, ly, 104, 79, 54);
     if (dir) {
       const n = MELODY_PRESETS.length;
       this.preset = (((this.preset < 0 && dir < 0 ? 0 : this.preset) + dir) % n + n) % n;
       const pre = MELODY_PRESETS[this.preset];
-      this.notes = [...pre.notes];
+      this.load(melodyState(pre.name));
       this.set('scale', pre.scale);
       return noDrag;
     }
-    if (inBtn(lx, ly, 101, 80, 22)) {
+    if (inBtn(lx, ly, 104, 90, 25)) {
       this.notes = this.notes.map(() => (Math.random() < 0.7 ? Math.floor(Math.random() ** 1.6 * 8) : -1));
+      this.acc = this.acc.map(() => Math.random() < 0.2);
+      this.slide = this.slide.map(() => Math.random() < 0.15);
       this.eng.dirty = true;
       return noDrag;
     }
-    if (inBtn(lx, ly, 125, 80, 22)) {
+    if (inBtn(lx, ly, 131, 90, 25)) {
       this.notes.fill(-1);
+      this.acc.fill(false);
+      this.slide.fill(false);
       this.eng.dirty = true;
       return noDrag;
     }
     const first = this.cellAt(lx, ly);
     if (!first) return null;
+    if (first.r === 'a' || first.r === 's') {
+      const row = first.r === 'a' ? this.acc : this.slide;
+      const val = !row[first.c];
+      const apply = (c: number) => { if (c >= 0) { row[c] = val; this.eng.dirty = true; } };
+      apply(first.c);
+      return { move: (x) => apply(this.colAt(x)) };
+    }
     const erase = this.notes[first.c] === first.r;
-    const apply = (cell: { r: number; c: number } | null) => {
-      if (!cell) return;
+    const apply = (cell: { r: number | 'a' | 's'; c: number } | null) => {
+      if (!cell || typeof cell.r !== 'number') return;
       this.notes[cell.c] = erase ? -1 : cell.r;
       this.eng.dirty = true;
     };
@@ -632,10 +704,157 @@ export class Melody extends Mod {
     return { move: (x, y) => apply(this.cellAt(x, y)) };
   }
 
-  save() { return this.notes; }
+  save() {
+    const bits = (b: boolean[]) => b.map((x) => (x ? '1' : '0')).join('');
+    return { n: this.notes, a: bits(this.acc), s: bits(this.slide) };
+  }
 
   load(s: unknown) {
-    if (Array.isArray(s)) this.notes = Array.from({ length: 16 }, (_, i) => (typeof s[i] === 'number' ? s[i] : -1));
+    // Older patches stored just the notes array.
+    const st = (Array.isArray(s) ? { n: s } : s) as { n?: unknown[]; a?: string; s?: string } | null;
+    if (!st) return;
+    const n = Array.isArray(st.n) ? st.n : [];
+    this.notes = Array.from({ length: 16 }, (_, i) => (typeof n[i] === 'number' ? (n[i] as number) : -1));
+    const bits = (x?: string) => Array.from({ length: 16 }, (_, i) => x?.[i] === '1');
+    this.acc = bits(st.a);
+    this.slide = bits(st.s);
+  }
+}
+
+// ---------------------------------------------------------------- KEYS
+
+// The computer keyboard as a piano (by physical key position): A S D F... are white
+// keys, W E T Y U... the black ones; Z and X shift the octave.
+const KEYMAP: Record<string, number> = {
+  KeyA: 0, KeyW: 1, KeyS: 2, KeyE: 3, KeyD: 4, KeyF: 5, KeyT: 6, KeyG: 7, KeyY: 8,
+  KeyH: 9, KeyU: 10, KeyJ: 11, KeyK: 12, KeyO: 13, KeyL: 14, KeyP: 15, Semicolon: 16,
+};
+const WHITE = [0, 2, 4, 5, 7, 9, 11];
+const BLACK = [[1, 0], [3, 1], [6, 3], [8, 4], [10, 5]]; // semitone, white key it sits after
+
+export class Keys extends Mod {
+  private held = new Set<number>();
+  private byCode = new Map<string, number>();
+  private midi: MIDIAccess | null = null;
+  private flash = 0;
+
+  constructor(e: Engine) {
+    super(e, 'keys', 'KEYS', 'seq', 122, 60);
+    this.port('note', 'OUT', 'note', 'out', 107, 12);
+    this.knob({ id: 'oct', label: 'OCT', x: 4, y: 38, min: 0, max: 6, def: 3, step: 1 });
+  }
+
+  private base() { return 12 * (this.p.oct + 1); }
+
+  noteOn(n: number) {
+    if (this.held.has(n)) return;
+    this.held.add(n);
+    this.flash = now();
+    this.emit('note', { t: ac.currentTime + 0.005, dur: 0, note: n, hold: true });
+  }
+
+  noteOff(n: number) {
+    if (!this.held.delete(n)) return;
+    this.emit('note', { t: ac.currentTime + 0.005, dur: 0, note: n, off: true });
+  }
+
+  allOff() {
+    for (const n of [...this.held]) this.noteOff(n);
+    this.byCode.clear();
+  }
+
+  // Computer keyboard; returns whether the key was used.
+  key(code: string, down: boolean) {
+    if (down && (code === 'KeyZ' || code === 'KeyX')) {
+      this.set('oct', Math.min(6, Math.max(0, this.p.oct + (code === 'KeyZ' ? -1 : 1))));
+      return true;
+    }
+    if (!(code in KEYMAP)) return false;
+    if (down) {
+      const n = this.base() + KEYMAP[code];
+      this.byCode.set(code, n);
+      this.noteOn(n);
+    } else {
+      const n = this.byCode.get(code);
+      this.byCode.delete(code);
+      if (n !== undefined) this.noteOff(n);
+    }
+    return true;
+  }
+
+  private enableMidi() {
+    if (this.midi || !navigator.requestMIDIAccess) return;
+    navigator.requestMIDIAccess().then((access) => {
+      this.midi = access;
+      const listen = () => {
+        for (const input of access.inputs.values()) {
+          input.onmidimessage = (msg) => {
+            const [st, d1, d2] = msg.data ?? [];
+            const cmd = st & 0xf0;
+            if (cmd === 0x90 && d2 > 0) this.noteOn(d1);
+            else if (cmd === 0x80 || cmd === 0x90) this.noteOff(d1);
+          };
+        }
+      };
+      listen();
+      access.onstatechange = listen;
+    }).catch(() => { /* permission denied or no MIDI */ });
+  }
+
+  private keyAt(lx: number, ly: number) {
+    if (ly < 12 || ly >= 34 || lx < 4 || lx >= 102) return -1;
+    const oct = Math.floor((lx - 4) / 49), ox = 4 + oct * 49;
+    if (ly < 25) {
+      for (const [semi, after] of BLACK) {
+        const x = ox + after * 7 + 5;
+        if (lx >= x && lx < x + 5) return this.base() + oct * 12 + semi;
+      }
+    }
+    return this.base() + oct * 12 + WHITE[Math.floor((lx - ox) / 7)];
+  }
+
+  drawBody(g: Gfx) {
+    const base = this.base();
+    for (let oct = 0; oct < 2; oct++) {
+      const ox = 4 + oct * 49;
+      WHITE.forEach((semi, i) => {
+        const down = this.held.has(base + oct * 12 + semi);
+        g.rect(ox + i * 7, 12, 6, 22, down ? C.yellow : C.white);
+        g.rect(ox + i * 7, 33, 6, 1, C.silver);
+        if (semi === 0) g.textC(String(this.p.oct + oct), ox + i * 7 + 3, 27, C.silver);
+      });
+      for (const [semi, after] of BLACK) {
+        const down = this.held.has(base + oct * 12 + semi);
+        g.rect(ox + after * 7 + 5, 12, 5, 13, down ? C.yellow : C.black);
+      }
+    }
+    drawButton(g, 20, 40, 22, 'MIDI', this.midi ? C.lime : C.silver);
+    led(g, 47, 42, now() - this.flash < 90, C.yellow);
+    g.text('PLAY: A-K', 56, 40, C.slate);
+    g.text('OCT: Z X', 56, 47, C.slate);
+  }
+
+  press(lx: number, ly: number): Drag | null {
+    if (inBtn(lx, ly, 20, 40, 22)) { this.enableMidi(); return noDrag; }
+    let n = this.keyAt(lx, ly);
+    if (n < 0) return null;
+    this.noteOn(n);
+    // Sliding across the keys plays each one, like a glissando.
+    return {
+      move: (x, y) => {
+        const m = this.keyAt(x, y);
+        if (m === n) return;
+        this.noteOff(n);
+        if (m >= 0) this.noteOn(m);
+        n = m;
+      },
+      up: () => { if (n >= 0) this.noteOff(n); },
+    };
+  }
+
+  destroy() {
+    this.allOff();
+    if (this.midi) for (const input of this.midi.inputs.values()) input.onmidimessage = null;
   }
 }
 
@@ -668,28 +887,76 @@ export class Synth extends Mod {
   audioIn() { return this.cv; }
   audioOut() { return this.out; }
 
+  // Voices of the chord that started most recently, and the one before it (for slides).
+  private chord: Voice[] = [];
+  private chordT = -1;
+  private prev: Voice[] = [];
+  // Live notes held until their note-off.
+  private live = new Map<number, Voice>();
+
   onEvent(_port: string, ev: Ev) {
+    const note = ev.note ?? 48;
+    if (ev.off) {
+      const v = this.live.get(note);
+      if (v) { release(v, ev.t); this.live.delete(note); }
+      return;
+    }
     const { wave, oct, cut, res, env, dec } = this.p;
-    const t = ev.t, dur = Math.max(0.02, ev.dur);
-    const f = 440 * 2 ** (((ev.note ?? 48) - 69) / 12 + oct);
+    const t = ev.t, dur = ev.hold ? HOLD : Math.max(0.02, ev.dur);
+    if (t !== this.chordT) { this.prev = this.chord; this.chord = []; this.chordT = t; }
+    const f = 440 * 2 ** ((note - 69) / 12 + oct);
+    const peak = (0.35 * (ev.acc ? 1.4 : 1)) / Math.sqrt(ev.voices ?? 1);
+
+    // Slide: bend the still-sounding voice to the new pitch without a new attack.
+    const old = this.prev[this.chord.length];
+    if (ev.slide && old && old.end > t) {
+      old.o.frequency.setTargetAtTime(f, t, 0.025);
+      old.g.gain.cancelScheduledValues(t);
+      old.g.gain.setValueAtTime(peak, t);
+      hold(old, t + dur, peak);
+      this.chord.push(old);
+      return;
+    }
+
     const o = ac.createOscillator(), fl = ac.createBiquadFilter(), g = ac.createGain();
     o.type = WAVES[wave];
     o.frequency.value = f;
     fl.type = 'lowpass';
     fl.Q.value = res;
-    const base = cutHz(cut);
-    fl.frequency.setValueAtTime(Math.min(18000, base * (1 + env * 16)), t);
+    const base = cutHz(cut), amt = Math.min(1, env + (ev.acc ? 0.35 : 0));
+    fl.frequency.setValueAtTime(Math.min(18000, base * (1 + amt * 16)), t);
     fl.frequency.exponentialRampToValueAtTime(base, t + dec);
     g.gain.setValueAtTime(0, t);
-    g.gain.linearRampToValueAtTime(0.35, t + 0.004);
-    g.gain.setValueAtTime(0.35, t + dur);
-    g.gain.exponentialRampToValueAtTime(0.001, t + dur + 0.08);
+    g.gain.linearRampToValueAtTime(peak, t + 0.004);
     o.connect(fl).connect(g).connect(this.out);
     this.cv.connect(fl.detune);
     o.onended = () => this.cv.disconnect(fl.detune);
     o.start(t);
-    o.stop(t + dur + 0.1);
+    const v: Voice = { o, g, end: 0 };
+    hold(v, t + dur, peak);
+    this.chord.push(v);
+    if (ev.hold) this.live.set(note, v);
   }
+}
+
+interface Voice { o: OscillatorNode; g: GainNode; end: number }
+
+// How long a live (held) note may ring before it stops by itself.
+const HOLD = 60;
+
+// Keep a voice at peak until `end`, then fade it out.
+function hold(v: Voice, end: number, peak: number) {
+  v.g.gain.setValueAtTime(peak, end);
+  v.g.gain.exponentialRampToValueAtTime(0.001, end + 0.08);
+  v.o.stop(end + 0.1);
+  v.end = end;
+}
+
+function release(v: Voice, t: number) {
+  v.g.gain.cancelScheduledValues(t);
+  v.g.gain.setTargetAtTime(0.0001, t, 0.03);
+  v.o.stop(t + 0.3);
+  v.end = t;
 }
 
 // ---------------------------------------------------------------- MIXER
@@ -933,9 +1200,9 @@ export class Osc extends Mod {
   }
 
   onEvent(_port: string, ev: Ev) {
-    if (ev.note === undefined) return;
+    if (ev.note === undefined || ev.off) return;
     this.note = ev.note;
-    const glide = this.p.glide;
+    const glide = ev.slide ? Math.max(this.p.glide, 0.06) : this.p.glide;
     if (glide > 0) this.o.frequency.setTargetAtTime(this.freq(), ev.t, glide / 3);
     else this.o.frequency.setValueAtTime(this.freq(), ev.t);
   }
@@ -1045,12 +1312,17 @@ export class Envelope extends Mod {
 
   onEvent(_port: string, ev: Ev) {
     const a = envSec(this.p.a), d = envSec(this.p.d), r = envSec(this.p.r), s = this.p.s;
-    const t = ev.t, off = this.src.offset;
-    off.cancelScheduledValues(t);
-    off.setTargetAtTime(1, t, a / 4);
-    off.setTargetAtTime(s, t + a, d / 4);
-    off.setTargetAtTime(0, t + Math.max(a, ev.dur), r / 4);
-    this.eng.at(t, () => (this.flash = now()));
+    const t = ev.t, lvl = this.src.offset;
+    lvl.cancelScheduledValues(t);
+    if (ev.off) { lvl.setTargetAtTime(0, t, r / 4); return; }
+    const dur = ev.hold ? HOLD : ev.dur;
+    // A slide keeps the gate open: no new attack, just a later release.
+    if (!ev.slide) {
+      lvl.setTargetAtTime(ev.acc ? 1.3 : 1, t, a / 4);
+      lvl.setTargetAtTime(s, t + a, d / 4);
+    }
+    lvl.setTargetAtTime(0, t + Math.max(a, dur), r / 4);
+    if (!ev.slide) this.eng.at(t, () => (this.flash = now()));
   }
 
   drawBody(g: Gfx) {
@@ -1103,6 +1375,7 @@ export const KINDS: Kind[] = [
   { type: 'clock', label: 'CLOCK', cat: 'seq', make: (e) => new Clock(e) },
   { type: 'beats', label: 'BEATS', cat: 'seq', make: (e) => new Beats(e) },
   { type: 'melody', label: 'MELODY', cat: 'seq', make: (e) => new Melody(e) },
+  { type: 'keys', label: 'KEYS', cat: 'seq', make: (e) => new Keys(e) },
   { type: 'kick', label: 'KICK', cat: 'drum', make: (e) => new Kick(e) },
   { type: 'snare', label: 'SNARE', cat: 'drum', make: (e) => new Snare(e) },
   { type: 'hihat', label: 'HIHAT', cat: 'drum', make: (e) => new HiHat(e) },

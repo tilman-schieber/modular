@@ -1,4 +1,4 @@
-import { beatSteps, MELODY_PRESETS } from './modules';
+import { beatSteps, MELODY_PRESETS, melodyState } from './modules';
 
 export interface PatchData {
   mods: { id: number; type: string; x: number; y: number; p: Record<string, number>; s?: unknown }[];
@@ -23,7 +23,7 @@ class Builder {
 
   melody(x: number, y: number, preset: string, p: Record<string, number> = {}) {
     const pre = MELODY_PRESETS.find((m) => m.name === preset)!;
-    return this.add('melody', x, y, { scale: pre.scale, ...p }, pre.notes);
+    return this.add('melody', x, y, { scale: pre.scale, ...p }, melodyState(preset));
   }
 }
 
@@ -34,11 +34,11 @@ function groove() {
   const drums = ['kick', 'snare', 'hihat', 'clap'].map((t, i) => b.add(t, 256 + (i % 2) * 56, 14 + (i >> 1) * 66));
   const mixer = b.add('mixer', 378, 40);
   const speaker = b.add('speaker', 458, 60);
-  const melody = b.melody(82, 112, 'BASSLINE', { oct: 2 });
+  const melody = b.melody(82, 116, 'BASSLINE', { oct: 2 });
   const synth = b.add('synth', 256, 146);
   const delay = b.add('delay', 334, 160);
   const reverb = b.add('reverb', 398, 160);
-  const lfo = b.add('lfo', 192, 215, { rate: 0.25, depth: 0.35 });
+  const lfo = b.add('lfo', 192, 226, { rate: 0.25, depth: 0.35 });
   b.wire(clock, 'o16', beats, 'clk');
   b.wire(clock, 'o16', melody, 'clk');
   drums.forEach((d, i) => {
@@ -61,9 +61,9 @@ function acid() {
   const kick = b.add('kick', 256, 14, { kit: 1, tune: 55, punch: 0.7, dec: 0.35 });
   const hat = b.add('hihat', 312, 14, { kit: 1, dec: 0.04, tone: 0.7 });
   const clap = b.add('clap', 256, 80);
-  const melody = b.melody(82, 112, 'ACID', { oct: 2, gate: 0.6 });
+  const melody = b.melody(82, 116, 'ACID', { oct: 2, gate: 0.6 });
   const synth = b.add('synth', 256, 146, { cut: 0.2, res: 17, env: 0.8, dec: 0.18 });
-  const lfo = b.add('lfo', 192, 215, { rate: 0.2, depth: 0.5, shape: 1 });
+  const lfo = b.add('lfo', 192, 226, { rate: 0.2, depth: 0.5, shape: 1 });
   const delay = b.add('delay', 334, 160, { time: 0.34, fb: 0.45, mix: 0.3 });
   const mixer = b.add('mixer', 378, 40);
   const speaker = b.add('speaker', 458, 60);
@@ -96,9 +96,13 @@ function voice() {
   const env = b.add('env', 256, 100, { a: 0.05, d: 0.55, s: 0.2, r: 0.5 });
   const lfo = b.add('lfo', 336, 100, { rate: 0.55, depth: 0.02 });
   const speaker = b.add('speaker', 436, 100);
+  // Play the same voice live from the computer keyboard.
+  const keys = b.add('keys', 82, 142);
   b.wire(clock, 'o16', melody, 'clk');
   b.wire(melody, 'note', osc, 'in');
   b.wire(melody, 'note', env, 'in');
+  b.wire(keys, 'note', osc, 'in');
+  b.wire(keys, 'note', env, 'in');
   b.wire(lfo, 'out', osc, 'cv');
   b.wire(osc, 'out', filter, 'in');
   b.wire(env, 'out', filter, 'cv');
@@ -146,7 +150,7 @@ function boomBap() {
   const kick = b.add('kick', 256, 14, { kit: 4, tune: 45, dec: 0.7, punch: 0.3 });
   const snare = b.add('snare', 312, 14, { kit: 3, tune: 160, dec: 0.25 });
   const hat = b.add('hihat', 256, 80, { kit: 2, tone: 0.2 });
-  const melody = b.melody(82, 112, 'PENTA', { oct: 2, gate: 0.8, root: 9 });
+  const melody = b.melody(82, 116, 'PENTA', { oct: 2, gate: 0.8, root: 9 });
   const synth = b.add('synth', 256, 146, { wave: 2, cut: 0.45, res: 2, env: 0.3, dec: 0.4 });
   const mixer = b.add('mixer', 378, 40, { l2: 0.5 });
   const filter = b.add('filter', 458, 40, { cut: 0.72, res: 1 });
@@ -180,9 +184,9 @@ function dubTechno() {
   const clap = b.add('clap', 256, 80, { kit: 2, tone: 2200, dec: 0.08 });
   const mixer = b.add('mixer', 378, 40, { l1: 0.5, l2: 0.35, l3: 0.7 });
   const speaker = b.add('speaker', 458, 60);
-  const melody = b.melody(82, 112, 'STABS', { scale: 1, root: 2, oct: 3, gate: 0.25 });
+  const melody = b.melody(82, 116, 'STABS', { scale: 1, root: 2, oct: 3, gate: 0.25, chord: 2 });
   const stab = b.add('synth', 256, 146, { wave: 0, cut: 0.38, res: 7, env: 0.45, dec: 0.12 });
-  const lfo = b.add('lfo', 192, 215, { rate: 0.12, shape: 1, depth: 0.3 });
+  const lfo = b.add('lfo', 192, 226, { rate: 0.12, shape: 1, depth: 0.3 });
   const delay = b.add('delay', 334, 160, { time: 0.375, fb: 0.62, mix: 0.5 });
   const reverb = b.add('reverb', 398, 160, { size: 0.85, mix: 0.45 });
   const sub = b.add('synth', 256, 148, { wave: 3, oct: -1, cut: 0.5, env: 0, dec: 0.3 });
@@ -212,7 +216,7 @@ function disco() {
   const drums = ['kick', 'snare', 'hihat', 'cowbell'].map((t, i) => b.add(t, 256 + (i % 2) * 56, 14 + (i >> 1) * 66, t === 'snare' ? { kit: 1, tune: 200, snap: 0.85, dec: 0.22 } : {}));
   const mixer = b.add('mixer', 378, 40, { l3: 0.4 });
   const speaker = b.add('speaker', 458, 60);
-  const melody = b.melody(82, 112, 'OCTAVES', { oct: 2, gate: 0.4, root: 5 });
+  const melody = b.melody(82, 116, 'OCTAVES', { oct: 2, gate: 0.4, root: 5 });
   const synth = b.add('synth', 256, 146, { wave: 0, cut: 0.42, res: 5, env: 0.5, dec: 0.15 });
   const delay = b.add('delay', 334, 160, { time: 0.25, fb: 0.3, mix: 0.2 });
   b.wire(clock, 'o16', beats, 'clk');

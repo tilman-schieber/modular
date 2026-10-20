@@ -11,6 +11,8 @@ export class Engine {
   running = false;
   dirty = false;
   master: GainNode;
+  // The final mix after the compressor, for recording.
+  output: AudioNode;
   private nextId = 0;
   private queue: { t: number; fn: () => void }[] = [];
   private depth = 0;
@@ -22,6 +24,7 @@ export class Engine {
     comp.threshold.value = -12;
     comp.ratio.value = 4;
     this.master.connect(comp).connect(ac.destination);
+    this.output = comp;
     setInterval(() => this.tick(), 25);
   }
 
@@ -68,7 +71,7 @@ export class Engine {
     try {
       for (const c of this.cables) {
         if (c.a !== m || c.ap !== port) continue;
-        this.at(ev.t, () => (c.lit = performance.now()));
+        if (!ev.off) this.at(ev.t, () => (c.lit = performance.now()));
         c.b.onEvent(c.bp, ev);
       }
     } finally {

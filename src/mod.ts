@@ -4,13 +4,14 @@ import type { Engine } from './engine';
 export type SigType = 'trig' | 'note' | 'audio' | 'cv';
 export type Cat = 'util' | 'drum' | 'seq' | 'synth' | 'mod' | 'fx';
 
-export const CAT: Record<Cat, { bar: string; cap: string }> = {
-  util: { bar: C.slate, cap: C.silver },
-  drum: { bar: C.red, cap: C.orange },
-  seq: { bar: C.plum, cap: C.yellow },
-  synth: { bar: C.blue, cap: C.sky },
-  mod: { bar: C.green, cap: C.lime },
-  fx: { bar: C.teal, cap: C.cyan },
+// Category colours: `bar` is used for title bars and the matching toolbar menu.
+export const CAT: Record<Cat, { name: string; bar: string; cap: string }> = {
+  seq: { name: 'SEQUENCE', bar: C.plum, cap: C.yellow },
+  drum: { name: 'DRUMS', bar: C.red, cap: C.orange },
+  synth: { name: 'SOUND', bar: C.blue, cap: C.sky },
+  mod: { name: 'MODULATE', bar: C.green, cap: C.lime },
+  fx: { name: 'EFFECTS', bar: C.teal, cap: C.cyan },
+  util: { name: 'OUTPUT', bar: C.slate, cap: C.silver },
 };
 
 export const TYPEC: Record<SigType, string> = { trig: C.yellow, note: C.sky, audio: C.red, cv: C.green };

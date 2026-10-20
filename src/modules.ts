@@ -55,7 +55,7 @@ export class Clock extends Mod {
   private beat = -1;
 
   constructor(e: Engine) {
-    super(e, 'clock', 'CLOCK', 'util', 60, 54);
+    super(e, 'clock', 'CLOCK', 'seq', 60, 54);
     this.knob({ id: 'bpm', label: 'BPM', x: 4, y: 32, min: 60, max: 200, def: 120, step: 1 });
     this.knob({ id: 'swing', label: 'SWG', x: 20, y: 32, min: 0, max: 0.5, def: 0, fmt: pct });
     this.port('o16', '16TH', 'trig', 'out', 47, 12);
@@ -922,7 +922,7 @@ export class Vca extends Mod {
 export interface Kind { type: string; label: string; cat: Cat; make: (e: Engine) => Mod }
 
 export const KINDS: Kind[] = [
-  { type: 'clock', label: 'CLOCK', cat: 'util', make: (e) => new Clock(e) },
+  { type: 'clock', label: 'CLOCK', cat: 'seq', make: (e) => new Clock(e) },
   { type: 'beats', label: 'BEATS', cat: 'seq', make: (e) => new Beats(e) },
   { type: 'melody', label: 'MELODY', cat: 'seq', make: (e) => new Melody(e) },
   { type: 'kick', label: 'KICK', cat: 'drum', make: (e) => new Kick(e) },

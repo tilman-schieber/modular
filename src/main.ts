@@ -1,7 +1,7 @@
 import { ac } from './audio';
 import { Engine } from './engine';
 import { C, Gfx, textWidth } from './gfx';
-import { CAT, TYPEC, compatible, type Drag, type Knob, type Mod, type Port } from './mod';
+import { CAT, TYPEC, compatible, type Cat, type Drag, type Knob, type Mod, type Port } from './mod';
 import { KINDS } from './modules';
 import { PATCHES, type PatchData } from './patches';
 import { drawButton, drawCable, drawModule } from './render';
@@ -23,7 +23,6 @@ let clientX = -1000, clientY = -1000;
 let mx = 0, my = 0, ux = 0, uy = 0;
 let spawnCount = 0;
 let everPlayed = false;
-let menuOpen = false;
 let toast = { text: '', until: 0 };
 
 function showToast(text: string) {
@@ -52,9 +51,16 @@ function updatePointer() {
 
 // ---------------------------------------------------------------- toolbar
 
-interface Btn { label: string; x: number; y: number; w: number; col: string; act?: () => void; spawn?: string }
+interface MenuItem { label: string; col: string; text: string; act?: () => void; spawn?: string }
+interface Btn {
+  label: string; x: number; y: number; w: number;
+  col: string; text: string; hi: string;
+  act?: () => void;
+  menu?: MenuItem[];
+}
 let bar: Btn[] = [];
 let barH = 13;
+let openMenu: string | null = null;
 // Bar height in field pixels, for keeping modules out from under it.
 const barWorld = () => Math.ceil((barH * uiScale) / scale);
 
@@ -64,38 +70,52 @@ function togglePlay() {
 }
 
 function layoutBar() {
+  const cats = Object.keys(CAT) as Cat[];
   const items: Omit<Btn, 'x' | 'y' | 'w'>[] = [
-    { label: eng.running ? '  STOP' : '  PLAY', col: eng.running ? C.red : C.green, act: togglePlay },
-    { label: 'PATCHES', col: menuOpen ? C.white : C.silver, act: () => (menuOpen = !menuOpen) },
-    ...KINDS.map((k) => ({ label: k.label, col: CAT[k.cat].cap, spawn: k.type })),
-    { label: 'SHARE', col: C.white, act: () => void share() },
-    { label: 'CLEAR', col: C.silver, act: () => eng.clear() },
+    eng.running
+      ? { label: '  STOP', col: C.red, text: C.ink, hi: C.white, act: togglePlay }
+      : { label: '  PLAY', col: C.green, text: C.ink, hi: C.white, act: togglePlay },
+    {
+      label: 'PATCHES', col: C.silver, text: C.ink, hi: C.white,
+      menu: PATCHES.map((p) => ({
+        label: p.name, col: C.yellow, text: C.ink,
+        act: () => { loadPatch(p.build()); fitView(); },
+      })),
+    },
+    ...cats.map((cat) => ({
+      label: CAT[cat].name, col: CAT[cat].bar, text: C.white, hi: CAT[cat].cap,
+      menu: KINDS.filter((k) => k.cat === cat).map((k) => ({ label: k.label, col: CAT[cat].bar, text: C.white, spawn: k.type })),
+    })),
+    { label: 'SHARE', col: C.silver, text: C.ink, hi: C.white, act: () => void share() },
+    { label: 'CLEAR', col: C.silver, text: C.ink, hi: C.white, act: () => eng.clear() },
   ];
   bar = [];
   let x = 2, y = 2;
   for (const it of items) {
-    const w = textWidth(it.label) + 8;
+    const w = textWidth(it.label) + (it.menu ? 14 : 8);
     if (x + w > UW - 2 && x > 2) { x = 2; y += 11; }
     bar.push({ ...it, x, y, w });
     x += w + 2;
-    if (it.act === togglePlay || it.label === 'PATCHES') x += 4;
+    // Small gaps separate transport, patches, modules and the rest.
+    if (it.act === togglePlay || it.label === 'PATCHES' || it.label === CAT.util.name) x += 6;
   }
   barH = y + 12;
 }
 
-const menuBtn = () => bar[1];
 const MENU_ROW = 10;
+const openBtn = () => bar.find((b) => b.label === openMenu && b.menu);
 
-function menuRect() {
-  const b = menuBtn();
-  const w = Math.max(...PATCHES.map((p) => textWidth(p.name))) + 10;
-  return { x: b.x, y: b.y + 10, w, h: PATCHES.length * MENU_ROW + 2 };
+function menuRect(b: Btn) {
+  const w = Math.max(b.w, ...b.menu!.map((m) => textWidth(m.label) + 12));
+  return { x: b.x, y: b.y + 10, w, h: b.menu!.length * MENU_ROW + 2 };
 }
 
 function menuItemAt(x: number, y: number) {
-  const r = menuRect();
-  if (x < r.x || x >= r.x + r.w || y < r.y + 1 || y >= r.y + r.h - 1) return -1;
-  return Math.floor((y - r.y - 1) / MENU_ROW);
+  const b = openBtn();
+  if (!b) return null;
+  const r = menuRect(b);
+  if (x < r.x || x >= r.x + r.w || y < r.y + 1 || y >= r.y + r.h - 1) return null;
+  return b.menu![Math.floor((y - r.y - 1) / MENU_ROW)] ?? null;
 }
 
 function drawBar() {
@@ -103,21 +123,29 @@ function drawBar() {
   ui.rect(0, barH - 1, UW, 1, C.dark);
   for (const b of bar) {
     const hover = ux >= b.x && ux < b.x + b.w && uy >= b.y && uy < b.y + 9;
-    drawButton(ui, b.x, b.y, b.w, b.label, hover ? C.white : b.col);
+    const active = hover || openMenu === b.label;
+    drawButton(ui, b.x, b.y, b.w, '', active ? b.hi : b.col);
+    ui.text(b.label, b.x + 4, b.y + 2, active ? C.ink : b.text);
+    if (b.menu) {
+      const ax = b.x + b.w - 8, ac = active ? C.ink : b.text;
+      for (let i = 0; i < 3; i++) ui.rect(ax + i, b.y + 3 + i, 5 - i * 2, 1, ac);
+    }
     if (b.act === togglePlay) {
       if (eng.running) ui.rect(b.x + 4, b.y + 2, 5, 5, C.ink);
       else for (let i = 0; i < 3; i++) ui.rect(b.x + 4 + i, b.y + 2 + i, 1, 5 - i * 2, C.ink);
     }
   }
-  if (menuOpen) {
-    const r = menuRect(), hi = menuItemAt(ux, uy);
+  const b = openBtn();
+  if (b) {
+    const r = menuRect(b), hi = menuItemAt(ux, uy);
     ui.rect(r.x + 2, r.y + 2, r.w, r.h, C.black);
     ui.rect(r.x, r.y, r.w, r.h, C.black);
     ui.rect(r.x + 1, r.y + 1, r.w - 2, r.h - 2, C.dark);
-    PATCHES.forEach((p, i) => {
+    b.menu!.forEach((m, i) => {
       const y = r.y + 1 + i * MENU_ROW;
-      if (i === hi) ui.rect(r.x + 1, y, r.w - 2, MENU_ROW, C.yellow);
-      ui.text(p.name, r.x + 5, y + 3, i === hi ? C.ink : C.white);
+      if (m === hi) ui.rect(r.x + 1, y, r.w - 2, MENU_ROW, m.col);
+      else ui.rect(r.x + 1, y, 2, MENU_ROW, m.col);
+      ui.text(m.label, r.x + 6, y + 3, m === hi ? m.text : C.white);
     });
   }
 }
@@ -126,7 +154,7 @@ function drawBar() {
 
 type Hit =
   | { k: 'bar'; b: Btn }
-  | { k: 'menu'; i: number }
+  | { k: 'menu'; item: MenuItem }
   | { k: 'close'; m: Mod }
   | { k: 'port'; m: Mod; p: Port }
   | { k: 'knob'; m: Mod; kn: Knob }
@@ -142,10 +170,8 @@ function modAt(wx: number, wy: number) {
 }
 
 function hitTest(): Hit {
-  if (menuOpen) {
-    const i = menuItemAt(ux, uy);
-    if (i >= 0) return { k: 'menu', i };
-  }
+  const item = menuItemAt(ux, uy);
+  if (item) return { k: 'menu', item };
   if (uy < barH) {
     const b = bar.find((b) => ux >= b.x && ux < b.x + b.w && uy >= b.y && uy < b.y + 9);
     return b ? { k: 'bar', b } : { k: 'none' };
@@ -188,7 +214,7 @@ function dropTarget(from: { m: Mod; p: Port }, wx: number, wy: number) {
 type Mode =
   | { k: 'none' }
   | { k: 'pan'; sx: number; sy: number; cx: number; cy: number }
-  | { k: 'move'; m: Mod; dx: number; dy: number; spawned: boolean; moved: boolean }
+  | { k: 'move'; m: Mod; dx: number; dy: number; sx: number; sy: number; spawned: boolean; moved: boolean }
   | { k: 'cable'; m: Mod; p: Port }
   | { k: 'knob'; m: Mod; kn: Knob; sy: number; sv: number }
   | { k: 'drag'; m: Mod; d: Drag };
@@ -208,6 +234,15 @@ function placeInView(m: Mod) {
   m.y = camY + top + Math.floor((H - top - m.h) / 2) + j - 25;
 }
 
+// New modules hang off the cursor; a plain click drops them in the middle of the view.
+function spawn(type: string) {
+  const m = KINDS.find((k) => k.type === type)!.make(eng);
+  m.x = mx + camX - 12;
+  m.y = my + camY - 4;
+  eng.add(m);
+  mode = { k: 'move', m, dx: 12, dy: 4, sx: mx, sy: my, spawned: true, moved: false };
+}
+
 function setPointer(e: MouseEvent) {
   clientX = e.clientX;
   clientY = e.clientY;
@@ -223,11 +258,14 @@ canvas.addEventListener('pointerdown', (e) => {
   if (e.button === 1) { mode = { k: 'pan', sx: mx, sy: my, cx: camX, cy: camY }; return; }
   const h = hitTest();
 
-  if (menuOpen && !(h.k === 'bar' && h.b === menuBtn())) {
-    menuOpen = false;
+  if (openMenu || (h.k === 'bar' && h.b.menu)) {
+    const was = openMenu;
+    openMenu = null;
     if (h.k === 'menu') {
-      loadPatch(PATCHES[h.i].build());
-      fitView();
+      if (h.item.spawn) spawn(h.item.spawn);
+      else h.item.act?.();
+    } else if (h.k === 'bar' && h.b.menu && h.b.label !== was) {
+      openMenu = h.b.label;
     }
     return;
   }
@@ -239,13 +277,7 @@ canvas.addEventListener('pointerdown', (e) => {
 
   switch (h.k) {
     case 'bar': {
-      if (h.b.act) { h.b.act(); return; }
-      const kind = KINDS.find((k) => k.type === h.b.spawn)!;
-      const m = kind.make(eng);
-      m.x = mx + camX - 12;
-      m.y = Math.max(my, barWorld() + 2) + camY - 4;
-      eng.add(m);
-      mode = { k: 'move', m, dx: 12, dy: 4, spawned: true, moved: false };
+      h.b.act?.();
       return;
     }
     case 'close':
@@ -276,7 +308,7 @@ canvas.addEventListener('pointerdown', (e) => {
       toFront(h.m);
       const d = h.m.press(h.lx, h.ly);
       if (d) mode = { k: 'drag', m: h.m, d };
-      else mode = { k: 'move', m: h.m, dx: h.lx, dy: h.ly, spawned: false, moved: false };
+      else mode = { k: 'move', m: h.m, dx: h.lx, dy: h.ly, sx: mx, sy: my, spawned: false, moved: false };
       return;
     }
     case 'none':
@@ -295,7 +327,7 @@ canvas.addEventListener('pointermove', (e) => {
     case 'move':
       mode.m.x = wx - mode.dx;
       mode.m.y = wy - mode.dy;
-      mode.moved = true;
+      mode.moved ||= Math.abs(mx - mode.sx) + Math.abs(my - mode.sy) > 3;
       eng.dirty = true;
       break;
     case 'knob': {
@@ -358,7 +390,7 @@ addEventListener('keydown', (e) => {
     void ac.resume();
     togglePlay();
   }
-  if (e.code === 'Escape') menuOpen = false;
+  if (e.code === 'Escape') openMenu = null;
   if (e.code === 'Delete' || e.code === 'Backspace') {
     const h = hitTest();
     if (h.k === 'close' || h.k === 'port' || h.k === 'knob' || h.k === 'body') eng.remove(h.m);
@@ -484,6 +516,8 @@ function frame() {
   eng.flush();
   layoutBar();
   const h = mode.k === 'none' ? hitTest() : { k: 'none' as const };
+  // Like a menu bar: with one menu open, hovering another group opens that one.
+  if (openMenu && h.k === 'bar' && h.b.menu) openMenu = h.b.label;
   const t = performance.now();
   const blink = Math.floor(t / 250) % 2 === 0;
 
@@ -534,7 +568,7 @@ function frame() {
     ui.rect(x, barH + 6, w, 9, C.yellow);
     ui.text(toast.text, x + 5, barH + 8, C.ink);
   }
-  if (!everPlayed && blink && !menuOpen) ui.textC('PRESS SPACE TO PLAY', Math.floor(UW / 2), UH - 16, C.yellow);
+  if (!everPlayed && blink && !openMenu) ui.textC('PRESS SPACE TO PLAY', Math.floor(UW / 2), UH - 16, C.yellow);
   ui.text('DRAG JACK TO JACK TO PATCH - RIGHT CLICK JACK TO UNPLUG - WHEEL TO ZOOM - DRAG BACKGROUND TO PAN',
     3, UH - 7, C.slate);
 

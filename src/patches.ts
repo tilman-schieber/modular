@@ -170,42 +170,38 @@ function boomBap() {
   return b.data;
 }
 
-// Breakbeat with a noise riser that swells on every beat.
-function rave() {
+// Minimal 4/4 with filtered stabs drowning in delay and reverb, plus a sine sub doubling them.
+function dubTechno() {
   const b = new Builder();
-  const clock = b.add('clock', 10, 30, { bpm: 140 });
-  const beats = b.beats(82, 30, 'BREAK');
-  const kick = b.add('kick', 256, 22, { punch: 0.8, dec: 0.35 });
-  const snare = b.add('snare', 312, 22, { snap: 0.9 });
-  const hat = b.add('hihat', 256, 80);
-  const mixer = b.add('mixer', 378, 40);
+  const clock = b.add('clock', 10, 30, { bpm: 120 });
+  const beats = b.beats(82, 30, 'TECHNO');
+  const kick = b.add('kick', 256, 22, { tune: 42, punch: 0.4, dec: 0.6 });
+  const hat = b.add('hihat', 312, 22, { tone: 0.3, dec: 0.05 });
+  const clap = b.add('clap', 256, 80, { tone: 900, dec: 0.3 });
+  const mixer = b.add('mixer', 378, 40, { l1: 0.5, l2: 0.35, l3: 0.7 });
   const speaker = b.add('speaker', 458, 60);
-  const melody = b.melody(82, 112, 'STABS', { oct: 3, gate: 0.3 });
-  const synth = b.add('synth', 256, 146, { wave: 1, cut: 0.5, res: 4, env: 0.7, dec: 0.15 });
-  const delay = b.add('delay', 334, 160, { time: 0.32, fb: 0.5, mix: 0.4 });
-  const sweep = b.add('lfo', 10, 230, { rate: 0.35, shape: 2, depth: 0.8 });
-  const noise = b.add('noise', 82, 230, { tone: 1, lvl: 0.6 });
-  const filter = b.add('filter', 142, 230, { type: 2, cut: 0.6, res: 10 });
-  const env = b.add('env', 202, 230, { a: 0.75, d: 0.5, s: 0, r: 0.4 });
-  const vca = b.add('vca', 276, 230);
+  const melody = b.melody(82, 112, 'STABS', { scale: 1, root: 2, oct: 3, gate: 0.25 });
+  const stab = b.add('synth', 256, 146, { wave: 0, cut: 0.38, res: 7, env: 0.45, dec: 0.12 });
+  const lfo = b.add('lfo', 192, 215, { rate: 0.12, shape: 1, depth: 0.3 });
+  const delay = b.add('delay', 334, 160, { time: 0.375, fb: 0.62, mix: 0.5 });
+  const reverb = b.add('reverb', 398, 160, { size: 0.85, mix: 0.45 });
+  const sub = b.add('synth', 256, 228, { wave: 3, oct: -1, cut: 0.5, env: 0, dec: 0.3 });
   b.wire(clock, 'o16', beats, 'clk');
   b.wire(clock, 'o16', melody, 'clk');
-  b.wire(clock, 'o4', env, 'in');
   b.wire(beats, 'o0', kick, 'in');
-  b.wire(beats, 'o1', snare, 'in');
   b.wire(beats, 'o2', hat, 'in');
+  b.wire(beats, 'o3', clap, 'in');
   b.wire(kick, 'out', mixer, 'i0');
-  b.wire(snare, 'out', mixer, 'i1');
-  b.wire(hat, 'out', mixer, 'i2');
-  b.wire(noise, 'out', filter, 'in');
-  b.wire(sweep, 'out', filter, 'cv');
-  b.wire(filter, 'out', vca, 'in');
-  b.wire(env, 'out', vca, 'cv');
-  b.wire(vca, 'out', mixer, 'i3');
+  b.wire(hat, 'out', mixer, 'i1');
+  b.wire(clap, 'out', mixer, 'i2');
+  b.wire(melody, 'note', stab, 'in');
+  b.wire(melody, 'note', sub, 'in');
+  b.wire(sub, 'out', mixer, 'i3');
+  b.wire(lfo, 'out', stab, 'cv');
+  b.wire(stab, 'out', delay, 'in');
+  b.wire(delay, 'out', reverb, 'in');
+  b.wire(reverb, 'out', speaker, 'in');
   b.wire(mixer, 'out', speaker, 'in');
-  b.wire(melody, 'note', synth, 'in');
-  b.wire(synth, 'out', delay, 'in');
-  b.wire(delay, 'out', speaker, 'in');
   return b.data;
 }
 
@@ -238,7 +234,7 @@ export const PATCHES: { name: string; build: () => PatchData }[] = [
   { name: 'BUILD A VOICE', build: voice },
   { name: 'AMBIENT DRIFT', build: ambient },
   { name: 'BOOM BAP', build: boomBap },
-  { name: 'RAVE RISER', build: rave },
+  { name: 'DUB TECHNO', build: dubTechno },
   { name: 'DISCO BELL', build: disco },
   { name: 'EMPTY', build: () => ({ mods: [], cables: [] }) },
 ];

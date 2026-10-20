@@ -1,7 +1,7 @@
 import { ac, cutHz, decay, noiseBuffer, noiseSrc } from './audio';
 import type { Engine } from './engine';
 import { C, type Gfx } from './gfx';
-import { Mod, type Cat, type Drag, type Ev, type KnobDef, type SigType } from './mod';
+import { CvTap, Mod, type Cat, type Drag, type Ev, type KnobDef, type SigType } from './mod';
 import { drawButton } from './render';
 
 const now = () => performance.now();
@@ -55,12 +55,19 @@ export class Clock extends Mod {
   private beat = -1;
 
   constructor(e: Engine) {
-    super(e, 'clock', 'CLOCK', 'seq', 60, 54);
+    super(e, 'clock', 'CLOCK', 'seq', 60, 68);
     this.knob({ id: 'bpm', label: 'BPM', x: 4, y: 32, min: 60, max: 200, def: 120, step: 1 });
     this.knob({ id: 'swing', label: 'SWG', x: 20, y: 32, min: 0, max: 0.5, def: 0, fmt: pct });
     this.port('o16', '16TH', 'trig', 'out', 47, 12);
     this.port('o4', 'BEAT', 'trig', 'out', 47, 32);
+    this.port('cv', 'BPM', 'cv', 'in', 4, 51);
   }
+
+  private tap = new CvTap();
+  audioIn() { return this.tap.in; }
+
+  // A CV of 1 adds 70 BPM.
+  private bpm() { return Math.min(300, Math.max(30, this.p.bpm + this.tap.read() * 70)); }
 
   reset(t0: number) { this.next = t0; this.n = 0; this.beat = -1; }
 
@@ -68,20 +75,20 @@ export class Clock extends Mod {
     // Resync if we fell far behind (e.g. a backgrounded tab).
     if (this.next < ac.currentTime - 0.2) this.next = ac.currentTime + 0.02;
     while (this.next < until) {
-      const dur = 15 / this.p.bpm;
+      const dur = 15 / this.bpm();
       const t = this.next + (this.n % 2 ? this.p.swing * dur : 0);
       const n = this.n;
       this.emit('o16', { t, dur });
       if (n % 4 === 0) this.emit('o4', { t, dur: dur * 4 });
       this.eng.at(t, () => (this.beat = n));
       this.n++;
-      this.next += 15 / this.p.bpm;
+      this.next += dur;
     }
   }
 
   drawBody(g: Gfx) {
     g.rect(3, 12, 39, 16, C.black);
-    g.text(String(Math.round(this.p.bpm)).padStart(3, ' '), 5, 15, C.lime, 2);
+    g.text(String(Math.round(this.eng.running ? this.bpm() : this.p.bpm)).padStart(3, ' '), 5, 15, C.lime, 2);
     const q = this.beat < 0 ? -1 : (this.beat >> 2) % 4;
     for (let i = 0; i < 4; i++) g.rect(30 + i * 3, 15, 2, 2, q === i ? C.lime : C.dark);
     led(g, 34, 21, this.beat >= 0 && this.beat % 4 === 0 && this.eng.running, C.lime);
@@ -252,14 +259,25 @@ abstract class Drum extends Mod {
   out = ac.createGain();
   private lofi = crusher(this.out);
   private flash = 0;
+  private tap = new CvTap();
 
   constructor(e: Engine, type: string, title: string, knobs: KnobDef[], public kits: Kit[]) {
     super(e, type, title, 'drum', 50, 63);
     this.p.kit = 0;
     this.knobRow(knobs, 24);
     this.port('in', 'IN', 'trig', 'in', 4, 44);
+    this.port('cv', knobs[0].label, 'cv', 'in', 20, 44);
     this.port('out', 'OUT', 'audio', 'out', 37, 44);
   }
+
+  // Knob values for this hit; CV moves the first knob (tune or tone) by up to half its range.
+  protected q() {
+    const k = this.knobs[0];
+    const v = this.p[k.id] + (this.tap.read() * (k.max - k.min)) / 2;
+    return { ...this.p, [k.id]: Math.min(k.max, Math.max(k.min, v)) };
+  }
+
+  audioIn() { return this.tap.in; }
 
   get kit() { return (this.kits[Math.round(this.p.kit)] ?? this.kits[0]).name; }
 
@@ -286,7 +304,7 @@ abstract class Drum extends Mod {
 
   drawBody(g: Gfx) {
     drawPresetBar(g, 3, 12, this.kit, 44);
-    led(g, 23, 47, now() - this.flash < 90);
+    led(g, 35, 3, now() - this.flash < 90);
   }
 
   press(lx: number, ly: number): Drag | null {
@@ -319,7 +337,7 @@ export class Kick extends Drum {
   }
 
   hit(t: number) {
-    const { tune, punch, dec } = this.p, kit = this.kit;
+    const { tune, punch, dec } = this.q(), kit = this.kit;
     const dest = this.dest();
     const o = ac.createOscillator(), g = ac.createGain();
     if (kit === 'LOFI') o.type = 'triangle';
@@ -375,7 +393,7 @@ export class Snare extends Drum {
   }
 
   hit(t: number) {
-    const { tune, snap, dec } = this.p;
+    const { tune, snap, dec } = this.q();
     switch (this.kit) {
       case '909':
         this.tone(t, tune, 'triangle', 0.6, 0.1);
@@ -420,7 +438,7 @@ export class HiHat extends Drum {
   }
 
   hit(t: number) {
-    const { tone, dec } = this.p;
+    const { tone, dec } = this.q();
     const bp = ac.createBiquadFilter(), hp = ac.createBiquadFilter(), g = ac.createGain();
     bp.type = 'bandpass';
     bp.frequency.value = 10000;
@@ -460,7 +478,7 @@ export class Clap extends Drum {
   }
 
   hit(t: number) {
-    const { tone, dec } = this.p, kit = this.kit;
+    const { tone, dec } = this.q(), kit = this.kit;
     const n = noiseSrc(t, 0.05 + dec), bp = ac.createBiquadFilter(), g = ac.createGain();
     bp.type = 'bandpass';
     bp.frequency.value = tone;
@@ -503,7 +521,7 @@ export class Cowbell extends Drum {
   }
 
   hit(t: number) {
-    const { tune, dec } = this.p, kit = this.kit;
+    const { tune, dec } = this.q(), kit = this.kit;
     if (kit !== '808') {
       // clave: pure high sine; wood block: lower, hollow triangle
       const o = ac.createOscillator(), g = ac.createGain();
@@ -1055,6 +1073,7 @@ export class Delay extends Mod {
   d = ac.createDelay(2);
   fb = ac.createGain();
   wet = ac.createGain();
+  cv = ac.createGain();
 
   constructor(e: Engine) {
     super(e, 'delay', 'DELAY', 'fx', 50, 52);
@@ -1062,12 +1081,16 @@ export class Delay extends Mod {
     this.in.connect(this.d);
     this.d.connect(this.fb).connect(this.d);
     this.d.connect(this.wet).connect(this.out);
+    // A CV of 1 adds a quarter second.
+    this.cv.gain.value = 0.25;
+    this.cv.connect(this.d.delayTime);
     this.knobRow([
       { id: 'time', label: 'TIM', min: 0.05, max: 1, def: 0.375, fmt: ms },
       { id: 'fb', label: 'FBK', min: 0, max: 0.9, def: 0.4, fmt: pct },
       { id: 'mix', label: 'MIX', min: 0, max: 1, def: 0.35, fmt: pct },
     ], 13);
     io(this, 'audio');
+    this.port('cv', 'TIM', 'cv', 'in', 20, 32);
   }
 
   onParam(id: string, v: number) {
@@ -1077,7 +1100,7 @@ export class Delay extends Mod {
     if (id === 'mix') this.wet.gain.setTargetAtTime(v, t, 0.02);
   }
 
-  audioIn() { return this.in; }
+  audioIn(port: string) { return port === 'cv' ? this.cv : this.in; }
   audioOut() { return this.out; }
 }
 
@@ -1086,6 +1109,7 @@ export class Reverb extends Mod {
   out = ac.createGain();
   conv = ac.createConvolver();
   wet = ac.createGain();
+  cv = ac.createGain();
   private timer = 0;
 
   constructor(e: Engine) {
@@ -1093,11 +1117,14 @@ export class Reverb extends Mod {
     this.in.connect(this.out);
     this.in.connect(this.conv);
     this.conv.connect(this.wet).connect(this.out);
+    this.cv.gain.value = 0.5;
+    this.cv.connect(this.wet.gain);
     this.knobRow([
       { id: 'size', label: 'SIZ', min: 0, max: 1, def: 0.5, fmt: pct },
       { id: 'mix', label: 'MIX', min: 0, max: 1, def: 0.3, fmt: pct },
     ], 13);
     io(this, 'audio');
+    this.port('cv', 'MIX', 'cv', 'in', 20, 32);
   }
 
   private build() {
@@ -1118,7 +1145,7 @@ export class Reverb extends Mod {
     }
   }
 
-  audioIn() { return this.in; }
+  audioIn(port: string) { return port === 'cv' ? this.cv : this.in; }
   audioOut() { return this.out; }
   destroy() { clearTimeout(this.timer); }
 }
@@ -1250,6 +1277,7 @@ const lfoHz = (v: number) => 0.05 * 2 ** (v * 9);
 
 export class Lfo extends Mod {
   o = ac.createOscillator();
+  cv = ac.createGain();
   out = ac.createGain();
   an = ac.createAnalyser();
   private buf = new Float32Array(32);
@@ -1260,6 +1288,10 @@ export class Lfo extends Mod {
     this.o.connect(this.out);
     this.out.connect(this.an);
     this.o.start();
+    // A CV of 1 adds 5 Hz.
+    this.cv.gain.value = 5;
+    this.cv.connect(this.o.frequency);
+    this.port('cv', 'RAT', 'cv', 'in', 4, 32);
     this.knobRow([
       { id: 'rate', label: 'RAT', min: 0, max: 1, def: 0.4, fmt: (v) => lfoHz(v).toFixed(2) + 'HZ' },
       { id: 'shape', label: 'SHP', min: 0, max: 3, def: 0, names: ['SIN', 'TRI', 'SAW', 'SQR'] },
@@ -1279,12 +1311,13 @@ export class Lfo extends Mod {
     // A centre-zero meter showing where the LFO is right now.
     this.an.getFloatTimeDomainData(this.buf);
     const v = Math.max(-1, Math.min(1, this.buf[this.buf.length - 1]));
-    g.rect(4, 34, 29, 7, C.black);
-    g.rect(18, 33, 1, 9, C.slate);
-    const n = Math.round(v * 13);
-    g.rect(n < 0 ? 18 + n : 19, 36, Math.abs(n), 3, C.lime);
+    g.rect(16, 34, 18, 7, C.black);
+    g.rect(25, 33, 1, 9, C.slate);
+    const n = Math.round(v * 8);
+    g.rect(n < 0 ? 25 + n : 26, 36, Math.abs(n), 3, C.lime);
   }
 
+  audioIn() { return this.cv; }
   audioOut() { return this.out; }
   destroy() { this.o.stop(); }
 }
@@ -1367,6 +1400,309 @@ export class Vca extends Mod {
   audioOut() { return this.g; }
 }
 
+// ---------------------------------------------------------------- RHYTHM TOOLS
+
+// Clock divider / multiplier: X2 doubles the incoming pulses, /2 /4 /8 thin them out.
+export class Divider extends Mod {
+  private n = 0;
+
+  constructor(e: Engine) {
+    super(e, 'divider', 'DIVIDER', 'seq', 50, 56);
+    this.port('in', 'IN', 'trig', 'in', 4, 14);
+    this.port('x2', 'X2', 'trig', 'out', 22, 14);
+    this.port('d2', '/2', 'trig', 'out', 37, 14);
+    this.port('d4', '/4', 'trig', 'out', 22, 34);
+    this.port('d8', '/8', 'trig', 'out', 37, 34);
+  }
+
+  reset() { this.n = 0; }
+
+  onEvent(_port: string, ev: Ev) {
+    if (ev.off) return;
+    const half = ev.dur / 2, n = this.n++;
+    this.emit('x2', { t: ev.t, dur: half });
+    this.emit('x2', { t: ev.t + half, dur: half });
+    if (n % 2 === 0) this.emit('d2', { ...ev, dur: ev.dur * 2 });
+    if (n % 4 === 0) this.emit('d4', { ...ev, dur: ev.dur * 4 });
+    if (n % 8 === 0) this.emit('d8', { ...ev, dur: ev.dur * 8 });
+  }
+}
+
+// Spreads HITS as evenly as possible over STEPS, the way many world rhythms are built.
+export class Euclid extends Mod {
+  private pos = -1;
+  private shown = -1;
+
+  constructor(e: Engine) {
+    super(e, 'euclid', 'EUCLID', 'seq', 64, 58);
+    this.port('clk', 'CLK', 'trig', 'in', 4, 14);
+    this.port('out', 'OUT', 'trig', 'out', 51, 14);
+    this.knobRow([
+      { id: 'steps', label: 'STP', min: 1, max: 16, def: 8, step: 1 },
+      { id: 'hits', label: 'HIT', min: 0, max: 16, def: 3, step: 1 },
+      { id: 'rot', label: 'ROT', min: 0, max: 15, def: 0, step: 1 },
+    ], 38, 18);
+  }
+
+  private hit(i: number) {
+    const n = this.p.steps, k = Math.min(this.p.hits, n);
+    const j = (((i - this.p.rot) % n) + n) % n;
+    return (j * k) % n < k;
+  }
+
+  reset() { this.pos = -1; this.shown = -1; }
+
+  onEvent(_port: string, ev: Ev) {
+    if (ev.off) return;
+    const s = (this.pos = (this.pos + 1) % this.p.steps);
+    this.eng.at(ev.t, () => (this.shown = s));
+    if (this.hit(s)) this.emit('out', ev);
+  }
+
+  drawBody(g: Gfx) {
+    const n = this.p.steps;
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      const x = 32 + Math.round(Math.sin(a) * 10), y = 25 - Math.round(Math.cos(a) * 10);
+      const col = i === this.shown ? C.white : this.hit(i) ? C.yellow : C.slate;
+      g.rect(x - 1, y - 1, 3, 3, C.black);
+      g.px(x, y, col);
+      if (this.hit(i) || i === this.shown) g.rect(x - 1, y - 1, 3, 3, col);
+    }
+  }
+}
+
+// Passes each trigger to A with the given probability, otherwise to B.
+export class Chance extends Mod {
+  private flash = 0;
+  private lastA = false;
+
+  constructor(e: Engine) {
+    super(e, 'chance', 'CHANCE', 'seq', 50, 52);
+    this.knob({ id: 'prob', label: 'PRB', x: 4, y: 13, min: 0, max: 1, def: 0.5, fmt: pct });
+    this.port('in', 'IN', 'trig', 'in', 4, 32);
+    this.port('a', 'A', 'trig', 'out', 22, 32);
+    this.port('b', 'B', 'trig', 'out', 37, 32);
+  }
+
+  onEvent(_port: string, ev: Ev) {
+    if (ev.off) return;
+    const a = Math.random() < this.p.prob;
+    this.emit(a ? 'a' : 'b', ev);
+    this.eng.at(ev.t, () => { this.flash = now(); this.lastA = a; });
+  }
+
+  drawBody(g: Gfx) {
+    const on = now() - this.flash < 90;
+    led(g, 24, 16, on && this.lastA, C.yellow);
+    led(g, 39, 16, on && !this.lastA, C.yellow);
+    g.text('A', 30, 16, C.silver);
+    g.text('B', 45, 16, C.silver);
+  }
+}
+
+// ---------------------------------------------------------------- CV TOOLS
+
+// Sample & hold: on each trigger, grab the CV input (or a random value if nothing
+// is plugged in) and hold it until the next one.
+export class SampleHold extends Mod {
+  src = ac.createConstantSource();
+  private tap = new CvTap();
+  private value = 0;
+
+  constructor(e: Engine) {
+    super(e, 'snh', 'S&H', 'mod', 50, 52);
+    this.src.offset.value = 0;
+    this.src.start();
+    this.knobRow([
+      { id: 'depth', label: 'DEP', min: 0, max: 1, def: 0.5, fmt: pct },
+      { id: 'slew', label: 'SLW', min: 0, max: 0.5, def: 0, fmt: ms },
+    ], 13);
+    this.port('trg', 'TRG', 'trig', 'in', 4, 32);
+    this.port('in', 'IN', 'cv', 'in', 20, 32);
+    this.port('out', 'OUT', 'cv', 'out', 37, 32);
+  }
+
+  onEvent(_port: string, ev: Ev) {
+    if (ev.off) return;
+    const sampled = this.eng.cablesAt(this, 'in').length > 0;
+    const v = (sampled ? this.tap.read() : Math.random() * 2 - 1) * this.p.depth;
+    const off = this.src.offset;
+    if (this.p.slew > 0) off.setTargetAtTime(v, ev.t, this.p.slew / 3);
+    else off.setValueAtTime(v, ev.t);
+    this.eng.at(ev.t, () => (this.value = v));
+  }
+
+  drawBody(g: Gfx) {
+    // vertical meter of the held value
+    const n = Math.round(Math.max(-1, Math.min(1, this.value)) * 5);
+    g.rect(31, 33, 3, 11, C.black);
+    g.rect(31, 38, 3, 1, C.slate);
+    g.rect(32, n > 0 ? 38 - n : 39, 1, Math.abs(n), C.lime);
+  }
+
+  audioIn() { return this.tap.in; }
+  audioOut() { return this.src; }
+  destroy() { this.src.stop(); }
+}
+
+// Attenuverter: scale (and flip) a CV, then shift it. Also sums everything plugged in.
+export class Atten extends Mod {
+  in = ac.createGain();
+  out = ac.createGain();
+  ofs = ac.createConstantSource();
+
+  constructor(e: Engine) {
+    super(e, 'atten', 'ATTEN', 'mod', 50, 52);
+    this.in.connect(this.out);
+    this.ofs.connect(this.out);
+    this.ofs.start();
+    this.knobRow([
+      { id: 'amt', label: 'AMT', min: -4, max: 4, def: 1, fmt: (v) => 'X' + v.toFixed(2) },
+      { id: 'ofs', label: 'OFS', min: -1, max: 1, def: 0, fmt: (v) => (v > 0 ? '+' : '') + v.toFixed(2) },
+    ], 13);
+    this.port('in', 'IN', 'cv', 'in', 4, 32);
+    this.port('out', 'OUT', 'cv', 'out', 37, 32);
+  }
+
+  onParam(id: string, v: number) {
+    if (id === 'amt') this.in.gain.setTargetAtTime(v, ac.currentTime, 0.01);
+    if (id === 'ofs') this.ofs.offset.setTargetAtTime(v, ac.currentTime, 0.01);
+  }
+
+  audioIn() { return this.in; }
+  audioOut() { return this.out; }
+  destroy() { this.ofs.stop(); }
+}
+
+// ---------------------------------------------------------------- DIRT
+
+export class Drive extends Mod {
+  pre = ac.createGain();
+  sh = ac.createWaveShaper();
+  lp = ac.createBiquadFilter();
+  out = ac.createGain();
+
+  constructor(e: Engine) {
+    super(e, 'drive', 'DRIVE', 'fx', 50, 52);
+    const n = 1024, curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) curve[i] = Math.tanh(((i / (n - 1)) * 2 - 1) * 3);
+    this.sh.curve = curve;
+    this.sh.oversample = '2x';
+    this.lp.type = 'lowpass';
+    this.pre.connect(this.sh).connect(this.lp).connect(this.out);
+    this.knobRow([
+      { id: 'drive', label: 'DRV', min: 0, max: 1, def: 0.5, fmt: pct },
+      { id: 'tone', label: 'TON', min: 0, max: 1, def: 0.75, fmt: hz },
+      { id: 'lvl', label: 'LVL', min: 0, max: 1, def: 0.5, fmt: pct },
+    ], 13);
+    io(this, 'audio');
+  }
+
+  onParam(id: string, v: number) {
+    const t = ac.currentTime;
+    if (id === 'drive') this.pre.gain.setTargetAtTime(0.5 + v * v * 30, t, 0.02);
+    if (id === 'tone') this.lp.frequency.setTargetAtTime(cutHz(v), t, 0.02);
+    if (id === 'lvl') this.out.gain.setTargetAtTime(v, t, 0.02);
+  }
+
+  audioIn() { return this.pre; }
+  audioOut() { return this.out; }
+}
+
+// Wavefolder: loud parts fold back on themselves instead of clipping, adding harmonics.
+export class Fold extends Mod {
+  pre = ac.createGain();
+  sh = ac.createWaveShaper();
+  out = ac.createGain();
+
+  constructor(e: Engine) {
+    super(e, 'fold', 'FOLD', 'fx', 50, 52);
+    this.pre.connect(this.sh).connect(this.out);
+    this.knobRow([
+      { id: 'fold', label: 'FLD', min: 0, max: 1, def: 0.4, fmt: pct },
+      { id: 'lvl', label: 'LVL', min: 0, max: 1, def: 0.6, fmt: pct },
+    ], 13);
+    io(this, 'audio');
+  }
+
+  onParam(id: string, v: number) {
+    if (id === 'lvl') this.out.gain.setTargetAtTime(v, ac.currentTime, 0.02);
+    if (id === 'fold') {
+      const k = 1 + v * 9, n = 2048, curve = new Float32Array(n);
+      for (let i = 0; i < n; i++) curve[i] = Math.sin(((i / (n - 1)) * 2 - 1) * k * (Math.PI / 2));
+      this.sh.curve = curve;
+    }
+  }
+
+  audioIn() { return this.pre; }
+  audioOut() { return this.out; }
+}
+
+// Bitcrusher: fewer bits and a lower sample rate, via a tiny AudioWorklet.
+const CRUSH_PROCESSOR = `
+class Crush extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.bits = 8; this.rate = 4; this.n = 0; this.held = [0, 0];
+    this.port.onmessage = (e) => { this.bits = e.data.bits; this.rate = e.data.rate; };
+  }
+  process(inputs, outputs) {
+    const inp = inputs[0], out = outputs[0];
+    const steps = 2 ** (this.bits - 1);
+    for (let ch = 0; ch < out.length; ch++) {
+      const i = inp[ch] || inp[0], o = out[ch];
+      if (!i) { o.fill(0); continue; }
+      let n = this.n;
+      for (let s = 0; s < o.length; s++) {
+        if (n++ % this.rate === 0) this.held[ch] = Math.round(i[s] * steps) / steps;
+        o[s] = this.held[ch];
+      }
+      if (ch === out.length - 1) this.n = n;
+    }
+    return true;
+  }
+}
+registerProcessor('crush', Crush);
+`;
+let crushReady: Promise<void> | null = null;
+
+export class Crush extends Mod {
+  in = ac.createGain();
+  out = ac.createGain();
+  private node: AudioWorkletNode | null = null;
+
+  constructor(e: Engine) {
+    super(e, 'crush', 'CRUSH', 'fx', 50, 52);
+    // Pass audio straight through until the worklet has loaded.
+    this.in.connect(this.out);
+    this.knobRow([
+      { id: 'bits', label: 'BIT', min: 1, max: 16, def: 6, step: 1 },
+      { id: 'rate', label: 'RAT', min: 1, max: 32, def: 6, step: 1, fmt: (v) => '/' + Math.round(v) },
+      { id: 'lvl', label: 'LVL', min: 0, max: 1, def: 0.7, fmt: pct },
+    ], 13);
+    io(this, 'audio');
+    crushReady ??= ac.audioWorklet.addModule(URL.createObjectURL(new Blob([CRUSH_PROCESSOR], { type: 'text/javascript' })));
+    void crushReady.then(() => {
+      this.node = new AudioWorkletNode(ac, 'crush', { outputChannelCount: [2] });
+      this.in.disconnect(this.out);
+      this.in.connect(this.node).connect(this.out);
+      this.send();
+    });
+  }
+
+  private send() { this.node?.port.postMessage({ bits: this.p.bits, rate: this.p.rate }); }
+
+  onParam(id: string, v: number) {
+    if (id === 'lvl') this.out.gain.setTargetAtTime(v, ac.currentTime, 0.02);
+    else this.send();
+  }
+
+  audioIn() { return this.in; }
+  audioOut() { return this.out; }
+  destroy() { this.node?.disconnect(); }
+}
+
 // ---------------------------------------------------------------- registry
 
 export interface Kind { type: string; label: string; cat: Cat; make: (e: Engine) => Mod }
@@ -1376,6 +1712,9 @@ export const KINDS: Kind[] = [
   { type: 'beats', label: 'BEATS', cat: 'seq', make: (e) => new Beats(e) },
   { type: 'melody', label: 'MELODY', cat: 'seq', make: (e) => new Melody(e) },
   { type: 'keys', label: 'KEYS', cat: 'seq', make: (e) => new Keys(e) },
+  { type: 'divider', label: 'DIVIDER', cat: 'seq', make: (e) => new Divider(e) },
+  { type: 'euclid', label: 'EUCLID', cat: 'seq', make: (e) => new Euclid(e) },
+  { type: 'chance', label: 'CHANCE', cat: 'seq', make: (e) => new Chance(e) },
   { type: 'kick', label: 'KICK', cat: 'drum', make: (e) => new Kick(e) },
   { type: 'snare', label: 'SNARE', cat: 'drum', make: (e) => new Snare(e) },
   { type: 'hihat', label: 'HIHAT', cat: 'drum', make: (e) => new HiHat(e) },
@@ -1387,9 +1726,14 @@ export const KINDS: Kind[] = [
   { type: 'lfo', label: 'LFO', cat: 'mod', make: (e) => new Lfo(e) },
   { type: 'env', label: 'ENV', cat: 'mod', make: (e) => new Envelope(e) },
   { type: 'vca', label: 'VCA', cat: 'mod', make: (e) => new Vca(e) },
+  { type: 'snh', label: 'S&H', cat: 'mod', make: (e) => new SampleHold(e) },
+  { type: 'atten', label: 'ATTEN', cat: 'mod', make: (e) => new Atten(e) },
   { type: 'filter', label: 'FILTER', cat: 'fx', make: (e) => new Filter(e) },
   { type: 'delay', label: 'DELAY', cat: 'fx', make: (e) => new Delay(e) },
   { type: 'reverb', label: 'REVERB', cat: 'fx', make: (e) => new Reverb(e) },
+  { type: 'drive', label: 'DRIVE', cat: 'fx', make: (e) => new Drive(e) },
+  { type: 'fold', label: 'FOLD', cat: 'fx', make: (e) => new Fold(e) },
+  { type: 'crush', label: 'CRUSH', cat: 'fx', make: (e) => new Crush(e) },
   { type: 'mixer', label: 'MIXER', cat: 'util', make: (e) => new Mixer(e) },
   { type: 'mixer8', label: 'BIG MIXER', cat: 'util', make: (e) => new BigMixer(e) },
   { type: 'speaker', label: 'SPEAKER', cat: 'util', make: (e) => new Speaker(e) },

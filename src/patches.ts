@@ -25,6 +25,11 @@ class Builder {
     const pre = MELODY_PRESETS.find((m) => m.name === preset)!;
     return this.add('melody', x, y, { scale: pre.scale, ...p }, melodyState(preset));
   }
+
+  // A melody from scratch: rows per step (-1 = rest).
+  notes(x: number, y: number, notes: number[], p: Record<string, number> = {}) {
+    return this.add('melody', x, y, p, { n: notes });
+  }
 }
 
 function groove() {
@@ -232,6 +237,163 @@ function disco() {
   return b.data;
 }
 
+// Four Euclidean rhythms of different lengths drifting against each other.
+function euclidJam() {
+  const b = new Builder();
+  const clock = b.add('clock', 10, 30, { bpm: 112 });
+  const divider = b.add('divider', 10, 110);
+  const rhythms = [
+    { e: { steps: 16, hits: 5 }, d: ['kick', { kit: 1 }] },
+    { e: { steps: 8, hits: 3, rot: 2 }, d: ['snare', { kit: 2, tune: 190, dec: 0.06 }] },
+    { e: { steps: 16, hits: 9 }, d: ['hihat', { kit: 1, dec: 0.04 }] },
+    { e: { steps: 7, hits: 2 }, d: ['cowbell', { kit: 1, dec: 0.08 }] },
+  ] as const;
+  const mixer = b.add('mixer8', 400, 14, { l1: 0.6, l2: 0.45, l3: 0.5, p1: -0.3, p2: 0.4, p3: 0.6, l4: 0.7 });
+  rhythms.forEach((r, i) => {
+    const e = b.add('euclid', 82, 14 + i * 62, { ...r.e });
+    const d = b.add(r.d[0], 160, 14 + i * 66, { ...r.d[1] });
+    b.wire(clock, 'o16', e, 'clk');
+    b.wire(e, 'out', d, 'in');
+    b.wire(d, 'out', mixer, 'i' + i);
+  });
+  const melody = b.melody(226, 110, 'PENTA', { oct: 2, gate: 0.7, len: 12 });
+  const synth = b.add('synth', 226, 218, { wave: 1, cut: 0.3, res: 9, env: 0.6, dec: 0.25 });
+  const reverb = b.add('reverb', 300, 230, { size: 0.4, mix: 0.25 });
+  const speaker = b.add('speaker', 400, 110);
+  b.wire(clock, 'o16', divider, 'in');
+  b.wire(divider, 'd2', melody, 'clk');
+  b.wire(melody, 'note', synth, 'in');
+  b.wire(synth, 'out', mixer, 'i4');
+  b.wire(mixer, 'out', reverb, 'in');
+  b.wire(reverb, 'out', speaker, 'in');
+  return b.data;
+}
+
+// Never quite the same twice: random filter moves, hats that may or may not play.
+function generative() {
+  const b = new Builder();
+  const clock = b.add('clock', 10, 30, { bpm: 96, swing: 0.15 });
+  const melody = b.melody(82, 30, 'PENTA', { oct: 3, gate: 0.7, len: 13 });
+  const synth = b.add('synth', 256, 30, { wave: 2, cut: 0.4, res: 8, env: 0.4, dec: 0.5 });
+  const snh = b.add('snh', 256, 112, { depth: 0.6, slew: 0.1 });
+  const wobble = b.add('lfo', 316, 112, { rate: 0.1, depth: 0.08 });
+  const delay = b.add('delay', 330, 30, { time: 0.5, fb: 0.55, mix: 0.45 });
+  const reverb = b.add('reverb', 390, 30, { size: 0.9, mix: 0.5 });
+  const speaker = b.add('speaker', 450, 30);
+  const chance = b.add('chance', 82, 140, { prob: 0.35 });
+  const hat = b.add('hihat', 142, 140, { kit: 1, dec: 0.03, tone: 0.8 });
+  const kick = b.add('kick', 196, 140, { kit: 3, dec: 0.8 });
+  const euclid = b.add('euclid', 376, 112, { steps: 16, hits: 3 });
+  b.wire(clock, 'o16', melody, 'clk');
+  b.wire(clock, 'o4', snh, 'trg');
+  b.wire(clock, 'o16', chance, 'in');
+  b.wire(clock, 'o16', euclid, 'clk');
+  b.wire(chance, 'a', hat, 'in');
+  b.wire(euclid, 'out', kick, 'in');
+  b.wire(melody, 'note', synth, 'in');
+  b.wire(snh, 'out', synth, 'cv');
+  b.wire(wobble, 'out', delay, 'cv');
+  b.wire(synth, 'out', delay, 'in');
+  b.wire(delay, 'out', reverb, 'in');
+  b.wire(reverb, 'out', speaker, 'in');
+  b.wire(hat, 'out', speaker, 'in');
+  b.wire(kick, 'out', speaker, 'in');
+  return b.data;
+}
+
+// FM synthesis: one oscillator's audio bends another's pitch. Play it on KEYS too.
+function fmPiano() {
+  const b = new Builder();
+  const clock = b.add('clock', 10, 30, { bpm: 84 });
+  const melody = b.melody(82, 30, 'ARP', { oct: 4, gate: 0.3, len: 12 });
+  const keys = b.add('keys', 82, 142, { oct: 4 });
+  const mod = b.add('osc', 256, 30, { wave: 3, oct: 1 });
+  const atten = b.add('atten', 316, 30, { amt: 2.5 });
+  const carrier = b.add('osc', 376, 30, { wave: 3 });
+  const vca = b.add('vca', 436, 30);
+  const env = b.add('env', 376, 92, { a: 0.05, d: 0.75, s: 0, r: 0.6 });
+  const delay = b.add('delay', 496, 30, { time: 0.36, fb: 0.35, mix: 0.25 });
+  const reverb = b.add('reverb', 556, 30, { size: 0.7, mix: 0.35 });
+  const speaker = b.add('speaker', 496, 100);
+  b.wire(clock, 'o16', melody, 'clk');
+  for (const src of [melody, keys]) {
+    b.wire(src, 'note', mod, 'in');
+    b.wire(src, 'note', carrier, 'in');
+    b.wire(src, 'note', env, 'in');
+  }
+  b.wire(mod, 'out', atten, 'in');
+  b.wire(atten, 'out', carrier, 'cv');
+  b.wire(carrier, 'out', vca, 'in');
+  b.wire(env, 'out', vca, 'cv');
+  b.wire(vca, 'out', delay, 'in');
+  b.wire(delay, 'out', reverb, 'in');
+  b.wire(reverb, 'out', speaker, 'in');
+  return b.data;
+}
+
+function industrial() {
+  const b = new Builder();
+  const clock = b.add('clock', 10, 30, { bpm: 128 });
+  const beats = b.beats(82, 30, 'TECHNO');
+  const kick = b.add('kick', 256, 14, { kit: 2, tune: 50, punch: 0.9, dec: 0.35 });
+  const snare = b.add('snare', 312, 14, { kit: 1, tune: 200, snap: 0.85, dec: 0.22 });
+  const hat = b.add('hihat', 256, 80, { kit: 1 });
+  const crush = b.add('crush', 312, 80, { bits: 5, rate: 8 });
+  const mixer = b.add('mixer', 372, 20);
+  const speaker = b.add('speaker', 450, 40);
+  const melody = b.melody(82, 116, 'ACID', { oct: 2, gate: 0.5 });
+  const synth = b.add('synth', 256, 150, { wave: 1, cut: 0.3, res: 10, env: 0.7, dec: 0.2 });
+  const fold = b.add('fold', 330, 150, { fold: 0.5 });
+  const drive = b.add('drive', 390, 150, { drive: 0.4, tone: 0.6 });
+  b.wire(clock, 'o16', beats, 'clk');
+  b.wire(clock, 'o16', melody, 'clk');
+  b.wire(beats, 'o0', kick, 'in');
+  b.wire(beats, 'o3', snare, 'in');
+  b.wire(beats, 'o2', hat, 'in');
+  b.wire(kick, 'out', mixer, 'i0');
+  b.wire(snare, 'out', crush, 'in');
+  b.wire(crush, 'out', mixer, 'i1');
+  b.wire(hat, 'out', mixer, 'i2');
+  b.wire(melody, 'note', synth, 'in');
+  b.wire(synth, 'out', fold, 'in');
+  b.wire(fold, 'out', drive, 'in');
+  b.wire(drive, 'out', mixer, 'i3');
+  b.wire(mixer, 'out', speaker, 'in');
+  return b.data;
+}
+
+// A I-vi-IV-V progression of 7th chords, gently crushed, over a lazy beat.
+function lofiChords() {
+  const b = new Builder();
+  const clock = b.add('clock', 10, 30, { bpm: 78, swing: 0.3 });
+  const beats = b.beats(82, 30, 'BOOMBAP');
+  const kick = b.add('kick', 256, 14, { kit: 4, tune: 45, dec: 0.6 });
+  const snare = b.add('snare', 312, 14, { kit: 3, dec: 0.25 });
+  const hat = b.add('hihat', 256, 80, { kit: 2, tone: 0.2 });
+  const mixer = b.add('mixer', 378, 40, { l2: 0.4, l3: 0.7 });
+  const speaker = b.add('speaker', 458, 60);
+  const _ = -1;
+  const melody = b.notes(82, 116, [0, _, _, _, 5, _, _, _, 3, _, _, _, 4, _, _, _],
+    { scale: 0, root: 5, oct: 3, gate: 1, chord: 3 });
+  const synth = b.add('synth', 256, 150, { wave: 2, cut: 0.38, res: 2, env: 0.2, dec: 0.8 });
+  const crush = b.add('crush', 334, 160, { bits: 8, rate: 3, lvl: 0.8 });
+  const reverb = b.add('reverb', 398, 160, { size: 0.6, mix: 0.35 });
+  const wow = b.add('lfo', 192, 226, { rate: 0.15, depth: 0.15 });
+  b.wire(clock, 'o16', beats, 'clk');
+  b.wire(clock, 'o16', melody, 'clk');
+  [kick, snare, hat].forEach((d, i) => {
+    b.wire(beats, 'o' + i, d, 'in');
+    b.wire(d, 'out', mixer, 'i' + i);
+  });
+  b.wire(melody, 'note', synth, 'in');
+  b.wire(wow, 'out', synth, 'cv');
+  b.wire(synth, 'out', crush, 'in');
+  b.wire(crush, 'out', reverb, 'in');
+  b.wire(reverb, 'out', mixer, 'i3');
+  b.wire(mixer, 'out', speaker, 'in');
+  return b.data;
+}
+
 export const PATCHES: { name: string; build: () => PatchData }[] = [
   { name: '808 GROOVE', build: groove },
   { name: 'ACID TECHNO', build: acid },
@@ -240,5 +402,10 @@ export const PATCHES: { name: string; build: () => PatchData }[] = [
   { name: 'BOOM BAP', build: boomBap },
   { name: 'DUB TECHNO', build: dubTechno },
   { name: 'DISCO BELL', build: disco },
+  { name: 'EUCLID JAM', build: euclidJam },
+  { name: 'GENERATIVE', build: generative },
+  { name: 'FM PIANO', build: fmPiano },
+  { name: 'INDUSTRIAL', build: industrial },
+  { name: 'LOFI CHORDS', build: lofiChords },
   { name: 'EMPTY', build: () => ({ mods: [], cables: [] }) },
 ];

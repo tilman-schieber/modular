@@ -1,3 +1,4 @@
+import { ac } from './audio';
 import { C, type Gfx } from './gfx';
 import type { Engine } from './engine';
 
@@ -16,10 +17,29 @@ export const CAT: Record<Cat, { name: string; bar: string; cap: string }> = {
 
 export const TYPEC: Record<SigType, string> = { trig: C.yellow, note: C.sky, audio: C.red, cv: C.green };
 
-// Notes can also fire trigger inputs; everything else must match exactly.
+// Notes can also fire trigger inputs, and audio can drive CV inputs (for FM and
+// ring-mod sounds); everything else must match exactly.
 // CV cables are continuous control signals (roughly -1..1) that modulate knobs.
 export function compatible(out: SigType, inp: SigType) {
-  return out === inp || (out === 'note' && inp === 'trig');
+  return out === inp || (out === 'note' && inp === 'trig') || (out === 'audio' && inp === 'cv');
+}
+
+// A CV input read from JS, for knobs that are used when scheduling rather than
+// being Web Audio params (e.g. a drum's tune, the clock's tempo).
+export class CvTap {
+  in = ac.createGain();
+  private an = ac.createAnalyser();
+  private buf = new Float32Array(32);
+
+  constructor() {
+    this.an.fftSize = 32;
+    this.in.connect(this.an);
+  }
+
+  read() {
+    this.an.getFloatTimeDomainData(this.buf);
+    return this.buf[this.buf.length - 1] || 0;
+  }
 }
 
 // An event on a trig/note cable: when it happens, how long it lasts, and optionally

@@ -77,7 +77,7 @@ export function cablePoints(x0: number, y0: number, x1: number, y1: number) {
   return pts;
 }
 
-function plug(g: Gfx, x: number, y: number, col: string) {
+export function plug(g: Gfx, x: number, y: number, col: string) {
   g.rect(x - 3, y - 3, 7, 7, C.black);
   g.rect(x - 2, y - 2, 5, 5, col);
   g.px(x - 2, y - 2, C.white);

@@ -2,7 +2,7 @@ export const ac = new AudioContext();
 
 let noise: AudioBuffer | null = null;
 
-function noiseBuffer() {
+export function noiseBuffer() {
   if (!noise) {
     noise = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
     const d = noise.getChannelData(0);

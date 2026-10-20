@@ -1,10 +1,12 @@
-import { ac, cutHz, decay, noiseSrc } from './audio';
+import { ac, cutHz, decay, noiseBuffer, noiseSrc } from './audio';
 import type { Engine } from './engine';
 import { C, type Gfx } from './gfx';
 import { Mod, type Cat, type Drag, type Ev, type KnobDef, type SigType } from './mod';
 import { drawButton } from './render';
 
 const now = () => performance.now();
+// A CV of 1 moves a filter cutoff by three octaves.
+const CV_CENTS = 3600;
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 const ms = (v: number) => Math.round(v * 1000) + 'MS';
 const pct = (v: number) => Math.round(v * 100) + '%';
@@ -18,6 +20,26 @@ function led(g: Gfx, x: number, y: number, on: boolean, col = C.red) {
   g.rect(x, y, 4, 4, on ? col : C.ink);
   if (on) g.px(x, y, C.white);
 }
+
+function inBtn(lx: number, ly: number, x: number, y: number, w: number) {
+  return lx >= x && lx < x + w && ly >= y && ly < y + 9;
+}
+
+// A "< NAME >" preset selector, 66px wide.
+function drawPresetBar(g: Gfx, x: number, y: number, name: string) {
+  drawButton(g, x, y, 9, '<', C.silver);
+  g.rect(x + 11, y, 44, 9, C.black);
+  g.textC(name, x + 33, y + 2, C.yellow);
+  drawButton(g, x + 57, y, 9, '>', C.silver);
+}
+
+function presetStep(lx: number, ly: number, x: number, y: number) {
+  if (inBtn(lx, ly, x, y, 9)) return -1;
+  if (inBtn(lx, ly, x + 57, y, 9)) return 1;
+  return 0;
+}
+
+const noDrag: Drag = { move() {} };
 
 // Standard small box: one input bottom-left, one output bottom-right.
 function io(m: Mod, inType: SigType, inLabel = 'IN') {
@@ -69,15 +91,34 @@ export class Clock extends Mod {
 // ---------------------------------------------------------------- BEATS
 
 const ROW_NAMES = ['BD', 'SD', 'HH', 'CP'];
+
+// Drum patterns as step lists per row: BD, SD, HH, CP.
+export const BEAT_PRESETS: { name: string; rows: number[][] }[] = [
+  { name: 'HOUSE', rows: [[0, 4, 8, 12], [], [2, 6, 10, 14], [4, 12]] },
+  { name: 'TECHNO', rows: [[0, 4, 8, 12], [], [2, 3, 6, 7, 10, 11, 14, 15], [4, 12]] },
+  { name: 'BOOMBAP', rows: [[0, 7, 10], [4, 12], [0, 2, 4, 6, 8, 10, 12, 14], []] },
+  { name: 'BREAK', rows: [[0, 2, 10, 11], [4, 7, 9, 12, 15], [0, 2, 4, 6, 8, 10, 12, 14], []] },
+  { name: 'ELECTRO', rows: [[0, 6, 10, 13], [4, 12], [0, 2, 4, 6, 8, 10, 12, 14], [4, 12]] },
+  { name: 'DISCO', rows: [[0, 4, 8, 12], [4, 12], [2, 6, 10, 14], [12, 15]] },
+  { name: 'TRAP', rows: [[0, 7, 10], [8], [0, 2, 4, 6, 8, 10, 11, 12, 13, 14, 15], [8]] },
+  { name: 'DEMBOW', rows: [[0, 4, 8, 12], [3, 6, 11, 14], [0, 2, 4, 6, 8, 10, 12, 14], []] },
+  { name: 'HALFTIME', rows: [[0, 3, 10], [8], [0, 4, 8, 12, 14], [8]] },
+];
+
+export function beatSteps(name: string) {
+  const pre = BEAT_PRESETS.find((b) => b.name === name)!;
+  return pre.rows.map((on) => Array.from({ length: 16 }, (_, i) => (on.includes(i) ? '1' : '0')).join(''));
+}
 const ROW_COLS = [C.red, C.orange, C.yellow, C.lime];
 
 export class Beats extends Mod {
   steps: boolean[][] = ROW_NAMES.map(() => Array(16).fill(false));
   private pos = -1;
   private shown = -1;
+  private preset = -1;
 
   constructor(e: Engine) {
-    super(e, 'beats', 'BEATS', 'seq', 160, 60);
+    super(e, 'beats', 'BEATS', 'seq', 160, 72);
     this.port('clk', 'CLK', 'trig', 'in', 4, 12);
     ROW_NAMES.forEach((_, r) => this.port('o' + r, '', 'trig', 'out', 147, 16 + r * 10));
   }
@@ -122,9 +163,32 @@ export class Beats extends Mod {
         }
       });
     });
+    drawPresetBar(g, 26, 60, this.preset < 0 ? 'PRESET' : BEAT_PRESETS[this.preset].name);
+    drawButton(g, 100, 60, 22, 'RND', C.yellow);
+    drawButton(g, 124, 60, 22, 'CLR', C.silver);
   }
 
   press(lx: number, ly: number): Drag | null {
+    const dir = presetStep(lx, ly, 26, 60);
+    if (dir) {
+      const n = BEAT_PRESETS.length;
+      this.preset = (((this.preset < 0 && dir < 0 ? 0 : this.preset) + dir) % n + n) % n;
+      this.load(beatSteps(BEAT_PRESETS[this.preset].name));
+      this.eng.dirty = true;
+      return noDrag;
+    }
+    if (inBtn(lx, ly, 100, 60, 22)) {
+      const density = [0.3, 0.15, 0.6, 0.12];
+      this.steps = this.steps.map((_, r) => Array.from({ length: 16 }, (_, c) =>
+        r === 0 && c % 4 === 0 ? Math.random() < 0.8 : Math.random() < density[r]));
+      this.eng.dirty = true;
+      return noDrag;
+    }
+    if (inBtn(lx, ly, 124, 60, 22)) {
+      this.steps = this.steps.map(() => Array(16).fill(false));
+      this.eng.dirty = true;
+      return noDrag;
+    }
     const first = this.cellAt(lx, ly);
     if (!first) return null;
     const val = !this.steps[first.r][first.c];
@@ -312,13 +376,27 @@ export class Cowbell extends Drum {
 const SCALE_NAMES = ['MAJ', 'MIN', 'PEN', 'BLU'];
 const SCALES = [[0, 2, 4, 5, 7, 9, 11], [0, 2, 3, 5, 7, 8, 10], [0, 3, 5, 7, 10], [0, 3, 5, 6, 7, 10]];
 
+const _ = -1;
+// Rows are scale degrees (0 = root, 7 = top row); scale indexes SCALE_NAMES.
+export const MELODY_PRESETS: { name: string; scale: number; notes: number[] }[] = [
+  { name: 'BASSLINE', scale: 1, notes: [0, _, 0, 2, _, 0, 3, _, 0, _, 4, 3, 2, _, 0, 7] },
+  { name: 'ACID', scale: 1, notes: [0, 0, 7, _, 0, 3, _, 0, 4, _, 0, 7, 0, 2, _, 3] },
+  { name: 'ARP', scale: 0, notes: [0, 2, 4, 7, 4, 2, 0, 2, 4, 7, 4, 2, 0, 2, 4, 7] },
+  { name: 'BLUES', scale: 3, notes: [0, _, 1, 2, 3, 4, _, 5, 6, _, 5, 4, 3, 2, 1, _] },
+  { name: 'PENTA', scale: 2, notes: [5, _, 4, 3, _, 3, 2, _, 0, _, 2, 3, 4, _, 3, _] },
+  { name: 'OCTAVES', scale: 1, notes: [0, 7, 0, 7, 0, 7, 0, 7, 5, 5, 5, 5, 6, 6, 4, 4] },
+  { name: 'DRONE', scale: 1, notes: [0, _, _, _, _, _, _, _, 4, _, _, _, 2, _, _, _] },
+  { name: 'STABS', scale: 0, notes: [_, _, 4, _, _, _, 4, _, _, _, 4, _, _, 5, _, 4] },
+];
+
 export class Melody extends Mod {
   notes: number[] = Array(16).fill(-1);
   private pos = -1;
   private shown = -1;
+  private preset = -1;
 
   constructor(e: Engine) {
-    super(e, 'melody', 'MELODY', 'seq', 160, 90);
+    super(e, 'melody', 'MELODY', 'seq', 160, 93);
     this.port('clk', 'CLK', 'trig', 'in', 4, 12);
     this.port('note', 'OUT', 'note', 'out', 147, 12);
     this.knob({ id: 'root', label: 'KEY', x: 26, y: 69, min: 0, max: 11, def: 0, names: NOTE_NAMES });
@@ -374,22 +452,30 @@ export class Melody extends Mod {
         }
       }
     }
-    drawButton(g, 104, 70, 22, 'RND', C.yellow);
-    drawButton(g, 130, 70, 22, 'CLR', C.silver);
+    drawPresetBar(g, 90, 68, this.preset < 0 ? 'PRESET' : MELODY_PRESETS[this.preset].name);
+    drawButton(g, 101, 80, 22, 'RND', C.yellow);
+    drawButton(g, 125, 80, 22, 'CLR', C.silver);
   }
 
   press(lx: number, ly: number): Drag | null {
-    if (ly >= 70 && ly < 79) {
-      if (lx >= 104 && lx < 126) {
-        this.notes = this.notes.map(() => (Math.random() < 0.7 ? Math.floor(Math.random() ** 1.6 * 8) : -1));
-        this.eng.dirty = true;
-        return { move() {} };
-      }
-      if (lx >= 130 && lx < 152) {
-        this.notes.fill(-1);
-        this.eng.dirty = true;
-        return { move() {} };
-      }
+    const dir = presetStep(lx, ly, 90, 68);
+    if (dir) {
+      const n = MELODY_PRESETS.length;
+      this.preset = (((this.preset < 0 && dir < 0 ? 0 : this.preset) + dir) % n + n) % n;
+      const pre = MELODY_PRESETS[this.preset];
+      this.notes = [...pre.notes];
+      this.set('scale', pre.scale);
+      return noDrag;
+    }
+    if (inBtn(lx, ly, 101, 80, 22)) {
+      this.notes = this.notes.map(() => (Math.random() < 0.7 ? Math.floor(Math.random() ** 1.6 * 8) : -1));
+      this.eng.dirty = true;
+      return noDrag;
+    }
+    if (inBtn(lx, ly, 125, 80, 22)) {
+      this.notes.fill(-1);
+      this.eng.dirty = true;
+      return noDrag;
     }
     const first = this.cellAt(lx, ly);
     if (!first) return null;
@@ -416,6 +502,7 @@ const WAVES: OscillatorType[] = ['sawtooth', 'square', 'triangle', 'sine'];
 
 export class Synth extends Mod {
   out = ac.createGain();
+  cv = ac.createGain();
 
   constructor(e: Engine) {
     super(e, 'synth', 'SYNTH', 'synth', 64, 74);
@@ -429,10 +516,13 @@ export class Synth extends Mod {
       { id: 'env', label: 'ENV', min: 0, max: 1, def: 0.6, fmt: pct },
       { id: 'dec', label: 'DEC', min: 0.05, max: 1.5, def: 0.3, fmt: ms },
     ], 33, 18);
+    this.cv.gain.value = CV_CENTS;
     this.port('in', 'NOTE', 'note', 'in', 4, 53);
+    this.port('cv', 'CUT', 'cv', 'in', 27, 53);
     this.port('out', 'OUT', 'audio', 'out', 51, 53);
   }
 
+  audioIn() { return this.cv; }
   audioOut() { return this.out; }
 
   onEvent(_port: string, ev: Ev) {
@@ -452,6 +542,8 @@ export class Synth extends Mod {
     g.gain.setValueAtTime(0.35, t + dur);
     g.gain.exponentialRampToValueAtTime(0.001, t + dur + 0.08);
     o.connect(fl).connect(g).connect(this.out);
+    this.cv.connect(fl.detune);
+    o.onended = () => this.cv.disconnect(fl.detune);
     o.start(t);
     o.stop(t + dur + 0.1);
   }
@@ -487,6 +579,7 @@ export class Mixer extends Mod {
 
 export class Filter extends Mod {
   f = ac.createBiquadFilter();
+  cv = ac.createGain();
 
   constructor(e: Engine) {
     super(e, 'filter', 'FILTER', 'fx', 50, 52);
@@ -496,6 +589,9 @@ export class Filter extends Mod {
       { id: 'res', label: 'RES', min: 0, max: 20, def: 2, fmt: (v) => v.toFixed(1) },
     ], 13);
     io(this, 'audio');
+    this.cv.gain.value = CV_CENTS;
+    this.cv.connect(this.f.detune);
+    this.port('cv', 'CUT', 'cv', 'in', 20, 32);
   }
 
   onParam(id: string, v: number) {
@@ -504,7 +600,7 @@ export class Filter extends Mod {
     if (id === 'res') this.f.Q.setTargetAtTime(v, ac.currentTime, 0.02);
   }
 
-  audioIn() { return this.f; }
+  audioIn(port: string) { return port === 'cv' ? this.cv : this.f; }
   audioOut() { return this.f; }
 }
 
@@ -625,6 +721,202 @@ export class Speaker extends Mod {
   destroy() { this.vol.disconnect(); }
 }
 
+// ---------------------------------------------------------------- VOICE PARTS
+
+export class Osc extends Mod {
+  o = ac.createOscillator();
+  out = ac.createGain();
+  cv = ac.createGain();
+  private note = 48;
+
+  constructor(e: Engine) {
+    super(e, 'osc', 'OSC', 'synth', 50, 52);
+    this.o.connect(this.out);
+    this.out.gain.value = 0.3;
+    // A CV of 1 bends the pitch by one octave, like 1V/oct.
+    this.cv.gain.value = 1200;
+    this.cv.connect(this.o.detune);
+    this.o.start();
+    this.knobRow([
+      { id: 'wave', label: 'WAV', min: 0, max: 3, def: 0, names: ['SAW', 'SQR', 'TRI', 'SIN'] },
+      { id: 'oct', label: 'OCT', min: -2, max: 2, def: 0, step: 1, fmt: (v) => (v > 0 ? '+' : '') + v },
+      { id: 'glide', label: 'GLD', min: 0, max: 0.5, def: 0, fmt: ms },
+    ], 13);
+    this.port('in', 'NOTE', 'note', 'in', 5, 32);
+    this.port('cv', 'PIT', 'cv', 'in', 20, 32);
+    this.port('out', 'OUT', 'audio', 'out', 37, 32);
+  }
+
+  private freq() { return 440 * 2 ** ((this.note - 69) / 12 + this.p.oct); }
+
+  onParam(id: string, v: number) {
+    if (id === 'wave') this.o.type = WAVES[v];
+    if (id === 'oct') this.o.frequency.setValueAtTime(this.freq(), ac.currentTime);
+  }
+
+  onEvent(_port: string, ev: Ev) {
+    if (ev.note === undefined) return;
+    this.note = ev.note;
+    const glide = this.p.glide;
+    if (glide > 0) this.o.frequency.setTargetAtTime(this.freq(), ev.t, glide / 3);
+    else this.o.frequency.setValueAtTime(this.freq(), ev.t);
+  }
+
+  audioIn() { return this.cv; }
+  audioOut() { return this.out; }
+  destroy() { this.o.stop(); }
+}
+
+export class Noise extends Mod {
+  src = ac.createBufferSource();
+  f = ac.createBiquadFilter();
+  out = ac.createGain();
+
+  constructor(e: Engine) {
+    super(e, 'noise', 'NOISE', 'synth', 50, 52);
+    this.src.buffer = noiseBuffer();
+    this.src.loop = true;
+    this.f.type = 'lowpass';
+    this.src.connect(this.f).connect(this.out);
+    this.src.start();
+    this.knobRow([
+      { id: 'tone', label: 'TON', min: 0, max: 1, def: 0.8, fmt: hz },
+      { id: 'lvl', label: 'LVL', min: 0, max: 1, def: 0.3, fmt: pct },
+    ], 13);
+    this.port('out', 'OUT', 'audio', 'out', 37, 32);
+  }
+
+  onParam(id: string, v: number) {
+    if (id === 'tone') this.f.frequency.setTargetAtTime(cutHz(v), ac.currentTime, 0.02);
+    if (id === 'lvl') this.out.gain.setTargetAtTime(v, ac.currentTime, 0.02);
+  }
+
+  drawBody(g: Gfx) {
+    for (let i = 0; i < 40; i++) g.px(5 + ((i * 37) % 26), 34 + ((i * 11) % 13), C.slate);
+  }
+
+  audioOut() { return this.out; }
+  destroy() { this.src.stop(); }
+}
+
+// ---------------------------------------------------------------- MODULATION
+
+const lfoHz = (v: number) => 0.05 * 2 ** (v * 9);
+
+export class Lfo extends Mod {
+  o = ac.createOscillator();
+  out = ac.createGain();
+  an = ac.createAnalyser();
+  private buf = new Float32Array(32);
+
+  constructor(e: Engine) {
+    super(e, 'lfo', 'LFO', 'mod', 50, 52);
+    this.an.fftSize = 32;
+    this.o.connect(this.out);
+    this.out.connect(this.an);
+    this.o.start();
+    this.knobRow([
+      { id: 'rate', label: 'RAT', min: 0, max: 1, def: 0.4, fmt: (v) => lfoHz(v).toFixed(2) + 'HZ' },
+      { id: 'shape', label: 'SHP', min: 0, max: 3, def: 0, names: ['SIN', 'TRI', 'SAW', 'SQR'] },
+      { id: 'depth', label: 'DEP', min: 0, max: 1, def: 0.5, fmt: pct },
+    ], 13);
+    this.port('out', 'OUT', 'cv', 'out', 37, 32);
+  }
+
+  onParam(id: string, v: number) {
+    const t = ac.currentTime;
+    if (id === 'rate') this.o.frequency.setTargetAtTime(lfoHz(v), t, 0.02);
+    if (id === 'shape') this.o.type = (['sine', 'triangle', 'sawtooth', 'square'] as const)[v];
+    if (id === 'depth') this.out.gain.setTargetAtTime(v, t, 0.02);
+  }
+
+  drawBody(g: Gfx) {
+    // A centre-zero meter showing where the LFO is right now.
+    this.an.getFloatTimeDomainData(this.buf);
+    const v = Math.max(-1, Math.min(1, this.buf[this.buf.length - 1]));
+    g.rect(4, 34, 29, 7, C.black);
+    g.rect(18, 33, 1, 9, C.slate);
+    const n = Math.round(v * 13);
+    g.rect(n < 0 ? 18 + n : 19, 36, Math.abs(n), 3, C.lime);
+  }
+
+  audioOut() { return this.out; }
+  destroy() { this.o.stop(); }
+}
+
+const envSec = (v: number) => 0.002 * 1000 ** v;
+
+export class Envelope extends Mod {
+  src = ac.createConstantSource();
+  private flash = 0;
+
+  constructor(e: Engine) {
+    super(e, 'env', 'ENVELOPE', 'mod', 64, 70);
+    this.src.offset.value = 0;
+    this.src.start();
+    const time = (v: number) => ms(envSec(v));
+    this.knobRow([
+      { id: 'a', label: 'A', min: 0, max: 1, def: 0.1, fmt: time },
+      { id: 'd', label: 'D', min: 0, max: 1, def: 0.6, fmt: time },
+      { id: 's', label: 'S', min: 0, max: 1, def: 0.3, fmt: pct },
+      { id: 'r', label: 'R', min: 0, max: 1, def: 0.55, fmt: time },
+    ], 31);
+    this.port('in', 'GATE', 'trig', 'in', 5, 51);
+    this.port('out', 'OUT', 'cv', 'out', 51, 51);
+  }
+
+  onEvent(_port: string, ev: Ev) {
+    const a = envSec(this.p.a), d = envSec(this.p.d), r = envSec(this.p.r), s = this.p.s;
+    const t = ev.t, off = this.src.offset;
+    off.cancelScheduledValues(t);
+    off.setTargetAtTime(1, t, a / 4);
+    off.setTargetAtTime(s, t + a, d / 4);
+    off.setTargetAtTime(0, t + Math.max(a, ev.dur), r / 4);
+    this.eng.at(t, () => (this.flash = now()));
+  }
+
+  drawBody(g: Gfx) {
+    // Envelope shape: attack, decay, a fixed-length sustain, release.
+    g.rect(3, 12, 58, 16, C.black);
+    const a = envSec(this.p.a), d = envSec(this.p.d), r = envSec(this.p.r), s = this.p.s;
+    const hold = 0.3, total = a + d + hold + r, k = 54 / total;
+    const pts: [number, number][] = [[0, 0], [a, 1], [a + d, s], [a + d + hold, s], [total, 0]];
+    for (let i = 1; i < pts.length; i++) {
+      const [t0, v0] = pts[i - 1], [t1, v1] = pts[i];
+      g.line(5 + Math.round(t0 * k), 26 - Math.round(v0 * 12), 5 + Math.round(t1 * k), 26 - Math.round(v1 * 12), C.lime);
+    }
+    led(g, 30, 53, now() - this.flash < 90, C.lime);
+  }
+
+  audioOut() { return this.src; }
+  destroy() { this.src.stop(); }
+}
+
+export class Vca extends Mod {
+  g = ac.createGain();
+  cv = ac.createGain();
+
+  constructor(e: Engine) {
+    super(e, 'vca', 'VCA', 'mod', 50, 52);
+    this.cv.connect(this.g.gain);
+    this.knobRow([
+      { id: 'base', label: 'LVL', min: 0, max: 1, def: 0, fmt: pct },
+      { id: 'amt', label: 'CV', min: 0, max: 1, def: 1, fmt: pct },
+    ], 13);
+    io(this, 'audio');
+    this.port('cv', 'CV', 'cv', 'in', 20, 32);
+  }
+
+  onParam(id: string, v: number) {
+    const t = ac.currentTime;
+    if (id === 'base') this.g.gain.setTargetAtTime(v, t, 0.01);
+    if (id === 'amt') this.cv.gain.setTargetAtTime(v, t, 0.01);
+  }
+
+  audioIn(port: string) { return port === 'cv' ? this.cv : this.g; }
+  audioOut() { return this.g; }
+}
+
 // ---------------------------------------------------------------- registry
 
 export interface Kind { type: string; label: string; cat: Cat; make: (e: Engine) => Mod }
@@ -639,6 +931,11 @@ export const KINDS: Kind[] = [
   { type: 'clap', label: 'CLAP', cat: 'drum', make: (e) => new Clap(e) },
   { type: 'cowbell', label: 'BELL', cat: 'drum', make: (e) => new Cowbell(e) },
   { type: 'synth', label: 'SYNTH', cat: 'synth', make: (e) => new Synth(e) },
+  { type: 'osc', label: 'OSC', cat: 'synth', make: (e) => new Osc(e) },
+  { type: 'noise', label: 'NOISE', cat: 'synth', make: (e) => new Noise(e) },
+  { type: 'lfo', label: 'LFO', cat: 'mod', make: (e) => new Lfo(e) },
+  { type: 'env', label: 'ENV', cat: 'mod', make: (e) => new Envelope(e) },
+  { type: 'vca', label: 'VCA', cat: 'mod', make: (e) => new Vca(e) },
   { type: 'filter', label: 'FILTER', cat: 'fx', make: (e) => new Filter(e) },
   { type: 'delay', label: 'DELAY', cat: 'fx', make: (e) => new Delay(e) },
   { type: 'reverb', label: 'REVERB', cat: 'fx', make: (e) => new Reverb(e) },

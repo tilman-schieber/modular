@@ -99,7 +99,7 @@ export class Engine {
     const pi = b.ports.find((p) => p.id === bp && p.dir === 'in');
     if (!po || !pi || !compatible(po.type, pi.type)) return null;
     if (this.cables.some((c) => c.a === a && c.ap === ap && c.b === b && c.bp === bp)) return null;
-    if (po.type === 'audio') {
+    if (po.type === 'audio' || po.type === 'cv') {
       const o = a.audioOut(ap), i = b.audioIn(bp);
       if (!o || !i) return null;
       o.connect(i);
@@ -112,7 +112,7 @@ export class Engine {
 
   disconnect(c: Cable) {
     this.cables = this.cables.filter((x) => x !== c);
-    if (c.type === 'audio') {
+    if (c.type === 'audio' || c.type === 'cv') {
       try { c.a.audioOut(c.ap)!.disconnect(c.b.audioIn(c.bp)!); } catch { /* already gone */ }
     }
     this.dirty = true;

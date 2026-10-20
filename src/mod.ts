@@ -1,20 +1,22 @@
 import { C, type Gfx } from './gfx';
 import type { Engine } from './engine';
 
-export type SigType = 'trig' | 'note' | 'audio';
-export type Cat = 'util' | 'drum' | 'seq' | 'synth' | 'fx';
+export type SigType = 'trig' | 'note' | 'audio' | 'cv';
+export type Cat = 'util' | 'drum' | 'seq' | 'synth' | 'mod' | 'fx';
 
 export const CAT: Record<Cat, { bar: string; cap: string }> = {
-  util: { bar: C.green, cap: C.lime },
+  util: { bar: C.slate, cap: C.silver },
   drum: { bar: C.red, cap: C.orange },
   seq: { bar: C.plum, cap: C.yellow },
   synth: { bar: C.blue, cap: C.sky },
+  mod: { bar: C.green, cap: C.lime },
   fx: { bar: C.teal, cap: C.cyan },
 };
 
-export const TYPEC: Record<SigType, string> = { trig: C.yellow, note: C.sky, audio: C.red };
+export const TYPEC: Record<SigType, string> = { trig: C.yellow, note: C.sky, audio: C.red, cv: C.green };
 
 // Notes can also fire trigger inputs; everything else must match exactly.
+// CV cables are continuous control signals (roughly -1..1) that modulate knobs.
 export function compatible(out: SigType, inp: SigType) {
   return out === inp || (out === 'note' && inp === 'trig');
 }
@@ -96,6 +98,7 @@ export abstract class Mod {
   onEvent(_port: string, _ev: Ev) {}
   schedule(_until: number) {}
   reset(_t0: number) {}
+  // Audio and CV ports are both plain Web Audio nodes.
   audioIn(_port: string): AudioNode | null { return null; }
   audioOut(_port: string): AudioNode | null { return null; }
   drawBody(_g: Gfx) {}

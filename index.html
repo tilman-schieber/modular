@@ -7,10 +7,12 @@
     <style>
       html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1c2c; }
       canvas { display: block; image-rendering: pixelated; touch-action: none; }
+      #ui { position: absolute; left: 0; top: 0; pointer-events: none; }
     </style>
   </head>
   <body>
     <canvas id="c"></canvas>
+    <canvas id="ui"></canvas>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

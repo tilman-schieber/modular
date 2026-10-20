@@ -3,29 +3,45 @@ import { Engine } from './engine';
 import { C, Gfx, textWidth } from './gfx';
 import { CAT, TYPEC, compatible, type Drag, type Knob, type Mod, type Port } from './mod';
 import { KINDS } from './modules';
+import { PATCHES, type PatchData } from './patches';
 import { drawButton, drawCable, drawModule } from './render';
 
+// The patch field zooms; the UI overlay (toolbar, menu, hints) keeps a fixed pixel scale.
 const canvas = document.getElementById('c') as HTMLCanvasElement;
+const uiCanvas = document.getElementById('ui') as HTMLCanvasElement;
 const g = new Gfx(canvas.getContext('2d')!);
+const ui = new Gfx(uiCanvas.getContext('2d')!);
 const eng = new Engine();
 const SAVE_KEY = 'pixel-modular.patch.v1';
 
-let scale = innerWidth >= 1500 ? 3 : 2;
-let W = 0, H = 0;
+const uiScale = innerWidth >= 1500 ? 3 : 2;
+let scale = uiScale;
+let W = 0, H = 0, UW = 0, UH = 0;
 let camX = 0, camY = 0;
-let mx = -100, my = -100;
+let clientX = -1000, clientY = -1000;
+let mx = 0, my = 0, ux = 0, uy = 0;
 let spawnCount = 0;
 let everPlayed = false;
+let menuOpen = false;
+
+function sizeCanvas(c: HTMLCanvasElement, s: number) {
+  const w = Math.ceil(innerWidth / s), h = Math.ceil(innerHeight / s);
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  c.style.width = w * s + 'px';
+  c.style.height = h * s + 'px';
+  return [w, h];
+}
 
 function resize() {
-  W = Math.ceil(innerWidth / scale);
-  H = Math.ceil(innerHeight / scale);
-  if (canvas.width !== W || canvas.height !== H) {
-    canvas.width = W;
-    canvas.height = H;
-  }
-  canvas.style.width = W * scale + 'px';
-  canvas.style.height = H * scale + 'px';
+  [W, H] = sizeCanvas(canvas, scale);
+  [UW, UH] = sizeCanvas(uiCanvas, uiScale);
+}
+
+function updatePointer() {
+  mx = Math.floor(clientX / scale);
+  my = Math.floor(clientY / scale);
+  ux = Math.floor(clientX / uiScale);
+  uy = Math.floor(clientY / uiScale);
 }
 
 // ---------------------------------------------------------------- toolbar
@@ -33,6 +49,8 @@ function resize() {
 interface Btn { label: string; x: number; y: number; w: number; col: string; act?: () => void; spawn?: string }
 let bar: Btn[] = [];
 let barH = 13;
+// Bar height in field pixels, for keeping modules out from under it.
+const barWorld = () => Math.ceil((barH * uiScale) / scale);
 
 function togglePlay() {
   if (eng.running) eng.stop();
@@ -42,32 +60,58 @@ function togglePlay() {
 function layoutBar() {
   const items: Omit<Btn, 'x' | 'y' | 'w'>[] = [
     { label: eng.running ? '  STOP' : '  PLAY', col: eng.running ? C.red : C.green, act: togglePlay },
+    { label: 'PATCHES', col: menuOpen ? C.white : C.silver, act: () => (menuOpen = !menuOpen) },
     ...KINDS.map((k) => ({ label: k.label, col: CAT[k.cat].cap, spawn: k.type })),
     { label: 'CLEAR', col: C.silver, act: () => eng.clear() },
-    { label: 'DEMO', col: C.silver, act: () => { loadPatch(demoPatch()); fitView(); } },
   ];
   bar = [];
   let x = 2, y = 2;
   for (const it of items) {
     const w = textWidth(it.label) + 8;
-    if (x + w > W - 2 && x > 2) { x = 2; y += 11; }
+    if (x + w > UW - 2 && x > 2) { x = 2; y += 11; }
     bar.push({ ...it, x, y, w });
     x += w + 2;
-    if (it.act === togglePlay) x += 4;
+    if (it.act && it.label !== 'CLEAR') x += 4;
   }
   barH = y + 12;
 }
 
+const menuBtn = () => bar[1];
+const MENU_ROW = 10;
+
+function menuRect() {
+  const b = menuBtn();
+  const w = Math.max(...PATCHES.map((p) => textWidth(p.name))) + 10;
+  return { x: b.x, y: b.y + 10, w, h: PATCHES.length * MENU_ROW + 2 };
+}
+
+function menuItemAt(x: number, y: number) {
+  const r = menuRect();
+  if (x < r.x || x >= r.x + r.w || y < r.y + 1 || y >= r.y + r.h - 1) return -1;
+  return Math.floor((y - r.y - 1) / MENU_ROW);
+}
+
 function drawBar() {
-  g.rect(0, 0, W, barH, C.black);
-  g.rect(0, barH - 1, W, 1, C.dark);
+  ui.rect(0, 0, UW, barH, C.black);
+  ui.rect(0, barH - 1, UW, 1, C.dark);
   for (const b of bar) {
-    const hover = mx >= b.x && mx < b.x + b.w && my >= b.y && my < b.y + 9;
-    drawButton(g, b.x, b.y, b.w, b.label, hover ? C.white : b.col);
+    const hover = ux >= b.x && ux < b.x + b.w && uy >= b.y && uy < b.y + 9;
+    drawButton(ui, b.x, b.y, b.w, b.label, hover ? C.white : b.col);
     if (b.act === togglePlay) {
-      if (eng.running) g.rect(b.x + 4, b.y + 2, 5, 5, C.ink);
-      else for (let i = 0; i < 3; i++) g.rect(b.x + 4 + i, b.y + 2 + i, 1, 5 - i * 2, C.ink);
+      if (eng.running) ui.rect(b.x + 4, b.y + 2, 5, 5, C.ink);
+      else for (let i = 0; i < 3; i++) ui.rect(b.x + 4 + i, b.y + 2 + i, 1, 5 - i * 2, C.ink);
     }
+  }
+  if (menuOpen) {
+    const r = menuRect(), hi = menuItemAt(ux, uy);
+    ui.rect(r.x + 2, r.y + 2, r.w, r.h, C.black);
+    ui.rect(r.x, r.y, r.w, r.h, C.black);
+    ui.rect(r.x + 1, r.y + 1, r.w - 2, r.h - 2, C.dark);
+    PATCHES.forEach((p, i) => {
+      const y = r.y + 1 + i * MENU_ROW;
+      if (i === hi) ui.rect(r.x + 1, y, r.w - 2, MENU_ROW, C.yellow);
+      ui.text(p.name, r.x + 5, y + 3, i === hi ? C.ink : C.white);
+    });
   }
 }
 
@@ -75,6 +119,7 @@ function drawBar() {
 
 type Hit =
   | { k: 'bar'; b: Btn }
+  | { k: 'menu'; i: number }
   | { k: 'close'; m: Mod }
   | { k: 'port'; m: Mod; p: Port }
   | { k: 'knob'; m: Mod; kn: Knob }
@@ -89,21 +134,21 @@ function modAt(wx: number, wy: number) {
   return undefined;
 }
 
-function portHit(m: Mod, lx: number, ly: number, r: number) {
-  return m.ports.find((p) => Math.abs(lx - (p.x + 4)) <= r && Math.abs(ly - (p.y + 4)) <= r);
-}
-
-function hitTest(sx: number, sy: number): Hit {
-  if (sy < barH) {
-    const b = bar.find((b) => sx >= b.x && sx < b.x + b.w && sy >= b.y && sy < b.y + 9);
+function hitTest(): Hit {
+  if (menuOpen) {
+    const i = menuItemAt(ux, uy);
+    if (i >= 0) return { k: 'menu', i };
+  }
+  if (uy < barH) {
+    const b = bar.find((b) => ux >= b.x && ux < b.x + b.w && uy >= b.y && uy < b.y + 9);
     return b ? { k: 'bar', b } : { k: 'none' };
   }
-  const wx = sx + camX, wy = sy + camY;
+  const wx = mx + camX, wy = my + camY;
   const m = modAt(wx, wy);
   if (!m) return { k: 'none' };
   const lx = wx - m.x, ly = wy - m.y;
   if (lx >= m.w - 9 && lx < m.w - 2 && ly >= 1 && ly < 9) return { k: 'close', m };
-  const p = portHit(m, lx, ly, 5);
+  const p = m.ports.find((p) => Math.abs(lx - (p.x + 4)) <= 5 && Math.abs(ly - (p.y + 4)) <= 5);
   if (p) return { k: 'port', m, p };
   const kn = m.knobs.find((k) => lx >= k.x - 1 && lx < k.x + 12 && ly >= k.y - 1 && ly < k.y + 12);
   if (kn) return { k: 'knob', m, kn };
@@ -111,6 +156,11 @@ function hitTest(sx: number, sy: number): Hit {
 }
 
 const jackPos = (m: Mod, p: Port) => [m.x + p.x + 4, m.y + p.y + 4] as const;
+
+function canPlug(a: Port, b: Port) {
+  if (a.dir === b.dir) return false;
+  return a.dir === 'out' ? compatible(a.type, b.type) : compatible(b.type, a.type);
+}
 
 // Nearest port that the dragged cable end could plug into.
 function dropTarget(from: { m: Mod; p: Port }, wx: number, wy: number) {
@@ -124,11 +174,6 @@ function dropTarget(from: { m: Mod; p: Port }, wx: number, wy: number) {
     }
   }
   return best;
-}
-
-function canPlug(a: Port, b: Port) {
-  if (a.dir === b.dir) return false;
-  return a.dir === 'out' ? compatible(a.type, b.type) : compatible(b.type, a.type);
 }
 
 // ---------------------------------------------------------------- interaction
@@ -151,13 +196,15 @@ function toFront(m: Mod) {
 
 function placeInView(m: Mod) {
   const j = (spawnCount++ % 6) * 10;
+  const top = barWorld();
   m.x = camX + Math.floor((W - m.w) / 2) + j - 25;
-  m.y = camY + barH + Math.floor((H - barH - m.h) / 2) + j - 25;
+  m.y = camY + top + Math.floor((H - top - m.h) / 2) + j - 25;
 }
 
 function setPointer(e: MouseEvent) {
-  mx = Math.floor(e.clientX / scale);
-  my = Math.floor(e.clientY / scale);
+  clientX = e.clientX;
+  clientY = e.clientY;
+  updatePointer();
 }
 
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -167,7 +214,16 @@ canvas.addEventListener('pointerdown', (e) => {
   canvas.setPointerCapture(e.pointerId);
   void ac.resume();
   if (e.button === 1) { mode = { k: 'pan', sx: mx, sy: my, cx: camX, cy: camY }; return; }
-  const h = hitTest(mx, my);
+  const h = hitTest();
+
+  if (menuOpen && !(h.k === 'bar' && h.b === menuBtn())) {
+    menuOpen = false;
+    if (h.k === 'menu') {
+      loadPatch(PATCHES[h.i].build());
+      fitView();
+    }
+    return;
+  }
 
   if (e.button === 2) {
     if (h.k === 'port') for (const c of eng.cablesAt(h.m, h.p.id)) eng.disconnect(c);
@@ -180,7 +236,7 @@ canvas.addEventListener('pointerdown', (e) => {
       const kind = KINDS.find((k) => k.type === h.b.spawn)!;
       const m = kind.make(eng);
       m.x = mx + camX - 12;
-      m.y = Math.max(my, barH + 2) + camY - 4;
+      m.y = Math.max(my, barWorld() + 2) + camY - 4;
       eng.add(m);
       mode = { k: 'move', m, dx: 12, dy: 4, spawned: true, moved: false };
       return;
@@ -255,7 +311,7 @@ function endPointer() {
       else eng.connect(t.m, t.p.id, mode.m, mode.p.id);
     }
   }
-  if (mode.k === 'move' && mode.spawned && (!mode.moved || my < barH)) placeInView(mode.m);
+  if (mode.k === 'move' && mode.spawned && (!mode.moved || uy < barH)) placeInView(mode.m);
   if (mode.k === 'drag') mode.d.up?.();
   mode = { k: 'none' };
 }
@@ -266,7 +322,9 @@ canvas.addEventListener('pointercancel', endPointer);
 let wheelAcc = 0;
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
-  const h = hitTest(mx, my);
+  setPointer(e);
+  const h = hitTest();
+  if (h.k === 'bar' || h.k === 'menu') return;
   if (h.k === 'knob') {
     const k = h.kn;
     const step = k.step ?? (k.max - k.min) / 50;
@@ -275,14 +333,14 @@ canvas.addEventListener('wheel', (e) => {
   }
   wheelAcc += e.deltaY;
   if (Math.abs(wheelAcc) < 60) return;
-  const next = Math.min(5, Math.max(1, scale - Math.sign(wheelAcc)));
+  const next = Math.min(6, Math.max(1, scale - Math.sign(wheelAcc)));
   wheelAcc = 0;
   if (next === scale) return;
-  // Keep the world point under the cursor fixed.
+  // Keep the field point under the cursor fixed.
   const wx = mx + camX, wy = my + camY;
   scale = next;
   resize();
-  setPointer(e);
+  updatePointer();
   camX = wx - mx;
   camY = wy - my;
 }, { passive: false });
@@ -293,20 +351,16 @@ addEventListener('keydown', (e) => {
     void ac.resume();
     togglePlay();
   }
+  if (e.code === 'Escape') menuOpen = false;
   if (e.code === 'Delete' || e.code === 'Backspace') {
-    const h = hitTest(mx, my);
-    if (h.k !== 'none' && h.k !== 'bar') eng.remove(h.m);
+    const h = hitTest();
+    if (h.k === 'close' || h.k === 'port' || h.k === 'knob' || h.k === 'body') eng.remove(h.m);
   }
 });
 
 addEventListener('resize', resize);
 
 // ---------------------------------------------------------------- patches
-
-interface PatchData {
-  mods: { id: number; type: string; x: number; y: number; p: Record<string, number>; s?: unknown }[];
-  cables: { a: number; ap: string; b: number; bp: string }[];
-}
 
 function serialize(): PatchData {
   return {
@@ -335,60 +389,30 @@ function loadPatch(data: PatchData) {
   }
 }
 
-function demoPatch(): PatchData {
-  const mods: PatchData['mods'] = [];
-  const cables: PatchData['cables'] = [];
-  const add = (type: string, x: number, y: number, p: Record<string, number> = {}, s?: unknown) => {
-    mods.push({ id: mods.length + 1, type, x, y, p, s });
-    return mods.length;
-  };
-  const wire = (a: number, ap: string, b: number, bp: string) => cables.push({ a, ap, b, bp });
-  const steps = (on: number[]) => Array.from({ length: 16 }, (_, i) => (on.includes(i) ? '1' : '0')).join('');
-
-  const clock = add('clock', 10, 30);
-  const beats = add('beats', 82, 30, {}, [
-    steps([0, 4, 8, 12]), steps([4, 12]), steps([2, 6, 10, 14]), steps([12, 15]),
-  ]);
-  const kick = add('kick', 256, 22);
-  const snare = add('snare', 312, 22);
-  const hat = add('hihat', 256, 80);
-  const clap = add('clap', 312, 80);
-  const mixer = add('mixer', 378, 40);
-  const speaker = add('speaker', 458, 60);
-  const melody = add('melody', 82, 104, { oct: 2, scale: 1 },
-    [0, -1, 0, 2, -1, 0, 3, -1, 0, -1, 4, 3, 2, -1, 0, 7]);
-  const synth = add('synth', 256, 146);
-  const delay = add('delay', 334, 160);
-  const reverb = add('reverb', 398, 160);
-
-  wire(clock, 'o16', beats, 'clk');
-  wire(clock, 'o16', melody, 'clk');
-  [kick, snare, hat, clap].forEach((d, i) => {
-    wire(beats, 'o' + i, d, 'in');
-    wire(d, 'out', mixer, 'i' + i);
-  });
-  wire(mixer, 'out', speaker, 'in');
-  wire(melody, 'note', synth, 'in');
-  wire(synth, 'out', delay, 'in');
-  wire(delay, 'out', reverb, 'in');
-  wire(reverb, 'out', speaker, 'in');
-  return { mods, cables };
-}
-
+// Zoom out (down to 2x) until the whole patch fits below the toolbar, then centre it.
 function fitView() {
-  if (!eng.mods.length) { camX = 0; camY = -barH; return; }
+  if (!eng.mods.length) { camX = 0; camY = -barWorld(); return; }
   const x0 = Math.min(...eng.mods.map((m) => m.x)), x1 = Math.max(...eng.mods.map((m) => m.x + m.w));
   const y0 = Math.min(...eng.mods.map((m) => m.y)), y1 = Math.max(...eng.mods.map((m) => m.y + m.h));
-  camX = Math.floor((x0 + x1 - W) / 2);
-  camY = Math.floor((y0 + y1 - H - barH) / 2);
+  for (scale = uiScale; scale > 2; scale--) {
+    resize();
+    if (x1 - x0 + 12 <= W && y1 - y0 + 20 <= H - barWorld()) break;
+  }
+  resize();
+  const top = barWorld();
+  camX = Math.min(Math.floor((x0 + x1 - W) / 2), x0 - 6);
+  camY = Math.min(Math.floor((y0 + y1 - H - top) / 2), y0 - top - 6);
 }
 
 function restore() {
+  // ?patch=N opens one of the built-in patches, e.g. for sharing a link.
+  const n = Number(new URLSearchParams(location.search).get('patch'));
+  if (n >= 1 && n <= PATCHES.length) { loadPatch(PATCHES[n - 1].build()); return; }
   try {
     const raw = localStorage.getItem(SAVE_KEY);
     if (raw) { loadPatch(JSON.parse(raw)); return; }
-  } catch { /* fall through to the demo */ }
-  loadPatch(demoPatch());
+  } catch { /* fall through to the first patch */ }
+  loadPatch(PATCHES[0].build());
 }
 
 setInterval(() => {
@@ -413,10 +437,12 @@ function drawTooltip(x: number, y: number, s: string) {
   g.text(s, x + 2, y + 1, C.ink);
 }
 
+const PORT_KIND = { audio: 'AUDIO', note: 'NOTES', trig: 'TRIGGER', cv: 'CV' };
+
 function frame() {
   eng.flush();
   layoutBar();
-  const h = mode.k === 'none' ? hitTest(mx, my) : { k: 'none' as const };
+  const h = mode.k === 'none' ? hitTest() : { k: 'none' as const };
   const t = performance.now();
   const blink = Math.floor(t / 250) % 2 === 0;
 
@@ -450,28 +476,26 @@ function frame() {
     drawCable(g, x0, y0, x1, y1, TYPEC[from.p.type], false);
   }
 
-  // Tooltips: knob values and port names.
+  // Tooltips: knob values and port kinds.
   const tip = mode.k === 'knob' ? { m: mode.m, kn: mode.kn } : h.k === 'knob' ? h : null;
   if (tip) drawTooltip(tip.m.x + tip.kn.x + 5, tip.m.y + tip.kn.y - 10, tip.m.knobText(tip.kn));
   else if (h.k === 'port') {
-    const kind = h.p.type === 'audio' ? 'AUDIO' : h.p.type === 'note' ? 'NOTES' : 'TRIGGER';
-    drawTooltip(h.m.x + h.p.x + 4, h.m.y + h.p.y - 10, `${kind} ${h.p.dir === 'in' ? 'IN' : 'OUT'}`);
+    drawTooltip(h.m.x + h.p.x + 4, h.m.y + h.p.y - 10, `${PORT_KIND[h.p.type]} ${h.p.dir === 'in' ? 'IN' : 'OUT'}`);
   }
-
   g.ox = 0;
   g.oy = 0;
-  drawBar();
 
-  if (!everPlayed && blink) g.textC('PRESS SPACE TO PLAY', Math.floor(W / 2), barH + 6, C.yellow);
-  g.text('DRAG JACK TO JACK TO PATCH - RIGHT CLICK JACK TO UNPLUG - WHEEL TO ZOOM - DRAG BACKGROUND TO PAN',
-    3, H - 7, C.slate);
+  ui.ctx.clearRect(0, 0, UW, UH);
+  drawBar();
+  if (!everPlayed && blink && !menuOpen) ui.textC('PRESS SPACE TO PLAY', Math.floor(UW / 2), UH - 16, C.yellow);
+  ui.text('DRAG JACK TO JACK TO PATCH - RIGHT CLICK JACK TO UNPLUG - WHEEL TO ZOOM - DRAG BACKGROUND TO PAN',
+    3, UH - 7, C.slate);
 
   canvas.style.cursor =
     mode.k === 'move' || mode.k === 'pan' ? 'grabbing'
-    : mode.k === 'knob' ? 'ns-resize'
+    : mode.k === 'knob' || h.k === 'knob' ? 'ns-resize'
     : mode.k === 'cable' || h.k === 'port' ? 'crosshair'
-    : h.k === 'knob' ? 'ns-resize'
-    : h.k === 'bar' || h.k === 'close' ? 'pointer'
+    : h.k === 'bar' || h.k === 'close' || h.k === 'menu' ? 'pointer'
     : h.k === 'body' ? 'grab'
     : 'default';
 

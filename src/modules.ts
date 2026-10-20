@@ -1195,19 +1195,25 @@ export class Speaker extends Mod {
 
 // ---------------------------------------------------------------- VOICE PARTS
 
+// Linear FM: an input of 1 swings the frequency by this many times the note's own
+// frequency, so the timbre stays the same up and down the keyboard.
+const FM_DEPTH = 4;
+
 export class Osc extends Mod {
   o = ac.createOscillator();
   out = ac.createGain();
   cv = ac.createGain();
+  fm = ac.createGain();
   private note = 48;
 
   constructor(e: Engine) {
-    super(e, 'osc', 'OSC', 'synth', 50, 52);
+    super(e, 'osc', 'OSC', 'synth', 64, 52);
     this.o.connect(this.out);
     this.out.gain.value = 0.3;
     // A CV of 1 bends the pitch by one octave, like 1V/oct.
     this.cv.gain.value = 1200;
     this.cv.connect(this.o.detune);
+    this.fm.connect(this.o.frequency);
     this.o.start();
     this.knobRow([
       { id: 'wave', label: 'WAV', min: 0, max: 3, def: 0, names: ['SAW', 'SQR', 'TRI', 'SIN'] },
@@ -1216,25 +1222,32 @@ export class Osc extends Mod {
     ], 13);
     this.port('in', 'NOTE', 'note', 'in', 5, 32);
     this.port('cv', 'PIT', 'cv', 'in', 20, 32);
-    this.port('out', 'OUT', 'audio', 'out', 37, 32);
+    this.port('fm', 'FM', 'cv', 'in', 35, 32);
+    this.port('out', 'OUT', 'audio', 'out', 51, 32);
   }
 
   private freq() { return 440 * 2 ** ((this.note - 69) / 12 + this.p.oct); }
 
+  private setFreq(t: number, glide: number) {
+    const f = this.freq();
+    for (const [param, v] of [[this.o.frequency, f], [this.fm.gain, f * FM_DEPTH]] as const) {
+      if (glide > 0) param.setTargetAtTime(v, t, glide / 3);
+      else param.setValueAtTime(v, t);
+    }
+  }
+
   onParam(id: string, v: number) {
     if (id === 'wave') this.o.type = WAVES[v];
-    if (id === 'oct') this.o.frequency.setValueAtTime(this.freq(), ac.currentTime);
+    if (id === 'oct') this.setFreq(ac.currentTime, 0);
   }
 
   onEvent(_port: string, ev: Ev) {
     if (ev.note === undefined || ev.off) return;
     this.note = ev.note;
-    const glide = ev.slide ? Math.max(this.p.glide, 0.06) : this.p.glide;
-    if (glide > 0) this.o.frequency.setTargetAtTime(this.freq(), ev.t, glide / 3);
-    else this.o.frequency.setValueAtTime(this.freq(), ev.t);
+    this.setFreq(ev.t, ev.slide ? Math.max(this.p.glide, 0.06) : this.p.glide);
   }
 
-  audioIn() { return this.cv; }
+  audioIn(port: string) { return port === 'fm' ? this.fm : this.cv; }
   audioOut() { return this.out; }
   destroy() { this.o.stop(); }
 }

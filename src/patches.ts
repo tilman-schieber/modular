@@ -94,13 +94,13 @@ function voice() {
   const clock = b.add('clock', 10, 30, { bpm: 110 });
   const melody = b.melody(82, 30, 'ARP', { oct: 3, gate: 0.6 });
   const osc = b.add('osc', 256, 30, { wave: 0 });
-  const filter = b.add('filter', 316, 30, { cut: 0.3, res: 8 });
-  const vca = b.add('vca', 376, 30);
-  const delay = b.add('delay', 436, 30, { time: 0.41, fb: 0.4, mix: 0.3 });
-  const reverb = b.add('reverb', 496, 30, { size: 0.6, mix: 0.3 });
+  const filter = b.add('filter', 330, 30, { cut: 0.3, res: 8 });
+  const vca = b.add('vca', 390, 30);
+  const delay = b.add('delay', 450, 30, { time: 0.41, fb: 0.4, mix: 0.3 });
+  const reverb = b.add('reverb', 510, 30, { size: 0.6, mix: 0.3 });
   const env = b.add('env', 256, 100, { a: 0.05, d: 0.55, s: 0.2, r: 0.5 });
-  const lfo = b.add('lfo', 336, 100, { rate: 0.55, depth: 0.02 });
-  const speaker = b.add('speaker', 436, 100);
+  const lfo = b.add('lfo', 340, 100, { rate: 0.55, depth: 0.02 });
+  const speaker = b.add('speaker', 450, 100);
   // Play the same voice live from the computer keyboard.
   const keys = b.add('keys', 82, 142);
   b.wire(clock, 'o16', melody, 'clk');
@@ -127,12 +127,12 @@ function ambient() {
   const oscB = b.add('osc', 256, 90, { wave: 2, oct: 1, glide: 0.3 });
   const noise = b.add('noise', 256, 150, { tone: 0.5, lvl: 0.12 });
   const drift = b.add('lfo', 176, 140, { rate: 0.15, depth: 0.015 });
-  const mixer = b.add('mixer', 320, 40, { l0: 0.6, l1: 0.5, l2: 0.6 });
-  const filter = b.add('filter', 398, 40, { cut: 0.4, res: 5 });
-  const sweep = b.add('lfo', 398, 110, { rate: 0.05, depth: 0.6 });
-  const reverb = b.add('reverb', 458, 40, { size: 1, mix: 0.6 });
-  const delay = b.add('delay', 518, 40, { time: 0.8, fb: 0.6, mix: 0.4 });
-  const speaker = b.add('speaker', 458, 110);
+  const mixer = b.add('mixer', 330, 40, { l0: 0.6, l1: 0.5, l2: 0.6 });
+  const filter = b.add('filter', 408, 40, { cut: 0.4, res: 5 });
+  const sweep = b.add('lfo', 408, 110, { rate: 0.05, depth: 0.6 });
+  const reverb = b.add('reverb', 468, 40, { size: 1, mix: 0.6 });
+  const delay = b.add('delay', 528, 40, { time: 0.8, fb: 0.6, mix: 0.4 });
+  const speaker = b.add('speaker', 468, 110);
   b.wire(clock, 'o16', melody, 'clk');
   b.wire(melody, 'note', oscA, 'in');
   b.wire(melody, 'note', oscB, 'in');
@@ -301,30 +301,38 @@ function generative() {
   return b.data;
 }
 
-// FM synthesis: one oscillator's audio bends another's pitch. Play it on KEYS too.
+// FM electric piano, DX7-style: the modulator OSC bends the carrier's pitch at audio
+// rate, which adds bell-like overtones. A second envelope fades that FM depth during
+// each note, so notes start bright and "tiny" and mellow out, like a struck tine.
+// Play it on KEYS too.
 function fmPiano() {
   const b = new Builder();
   const clock = b.add('clock', 10, 30, { bpm: 84 });
-  const melody = b.melody(82, 30, 'ARP', { oct: 4, gate: 0.3, len: 12 });
+  const melody = b.melody(82, 30, 'ARP', { oct: 4, gate: 0.6, len: 12 });
   const keys = b.add('keys', 82, 142, { oct: 4 });
   const mod = b.add('osc', 256, 30, { wave: 3, oct: 1 });
-  const atten = b.add('atten', 316, 30, { amt: 2.5 });
-  const carrier = b.add('osc', 376, 30, { wave: 3 });
-  const vca = b.add('vca', 436, 30);
-  const env = b.add('env', 376, 92, { a: 0.05, d: 0.75, s: 0, r: 0.6 });
-  const delay = b.add('delay', 496, 30, { time: 0.36, fb: 0.35, mix: 0.25 });
-  const reverb = b.add('reverb', 556, 30, { size: 0.7, mix: 0.35 });
-  const speaker = b.add('speaker', 496, 100);
+  const depth = b.add('vca', 330, 30);
+  const atten = b.add('atten', 390, 30, { amt: 2.5 });
+  const carrier = b.add('osc', 450, 30, { wave: 3 });
+  const vca = b.add('vca', 524, 30);
+  const bright = b.add('env', 330, 100, { a: 0, d: 0.7, s: 0.1, r: 0.45 });
+  const amp = b.add('env', 450, 100, { a: 0.05, d: 0.8, s: 0.2, r: 0.6 });
+  const delay = b.add('delay', 584, 30, { time: 0.36, fb: 0.35, mix: 0.25 });
+  const reverb = b.add('reverb', 644, 30, { size: 0.7, mix: 0.35 });
+  const speaker = b.add('speaker', 584, 100);
   b.wire(clock, 'o16', melody, 'clk');
   for (const src of [melody, keys]) {
     b.wire(src, 'note', mod, 'in');
     b.wire(src, 'note', carrier, 'in');
-    b.wire(src, 'note', env, 'in');
+    b.wire(src, 'note', bright, 'in');
+    b.wire(src, 'note', amp, 'in');
   }
-  b.wire(mod, 'out', atten, 'in');
-  b.wire(atten, 'out', carrier, 'cv');
+  b.wire(mod, 'out', depth, 'in');
+  b.wire(bright, 'out', depth, 'cv');
+  b.wire(depth, 'out', atten, 'in');
+  b.wire(atten, 'out', carrier, 'fm');
   b.wire(carrier, 'out', vca, 'in');
-  b.wire(env, 'out', vca, 'cv');
+  b.wire(amp, 'out', vca, 'cv');
   b.wire(vca, 'out', delay, 'in');
   b.wire(delay, 'out', reverb, 'in');
   b.wire(reverb, 'out', speaker, 'in');

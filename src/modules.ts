@@ -718,6 +718,41 @@ export class Mixer extends Mod {
   audioOut() { return this.out; }
 }
 
+// Eight channels, each with level and stereo pan, plus a master volume.
+export class BigMixer extends Mod {
+  ins = Array.from({ length: 8 }, () => ac.createGain());
+  pans = this.ins.map((g) => g.connect(ac.createStereoPanner()) as StereoPannerNode);
+  out = ac.createGain();
+
+  constructor(e: Engine) {
+    super(e, 'mixer8', 'BIG MIXER', 'util', 142, 84);
+    const panFmt = (v: number) => (Math.abs(v) < 0.02 ? 'C' : (v < 0 ? 'L' : 'R') + Math.round(Math.abs(v) * 100));
+    this.ins.forEach((_, c) => {
+      this.pans[c].connect(this.out);
+      this.port('i' + c, String(c + 1), 'audio', 'in', 19 + c * 15, 13);
+      this.knob({ id: 'l' + c, label: '', x: 18 + c * 15, y: 30, min: 0, max: 1, def: 0.8, fmt: pct });
+      this.knob({ id: 'p' + c, label: '', x: 18 + c * 15, y: 45, min: -1, max: 1, def: 0, fmt: panFmt });
+    });
+    this.knob({ id: 'vol', label: 'VOL', x: 18, y: 62, min: 0, max: 1.5, def: 1, fmt: pct });
+    this.port('out', 'OUT', 'audio', 'out', 129, 62);
+  }
+
+  onParam(id: string, v: number) {
+    const t = ac.currentTime, c = Number(id.slice(1));
+    if (id === 'vol') this.out.gain.setTargetAtTime(v, t, 0.01);
+    else if (id[0] === 'l') this.ins[c].gain.setTargetAtTime(v, t, 0.01);
+    else this.pans[c].pan.setTargetAtTime(v, t, 0.01);
+  }
+
+  drawBody(g: Gfx) {
+    g.text('LVL', 3, 33, C.silver);
+    g.text('PAN', 3, 48, C.silver);
+  }
+
+  audioIn(port: string) { return this.ins[Number(port.slice(1))]; }
+  audioOut() { return this.out; }
+}
+
 // ---------------------------------------------------------------- FX
 
 export class Filter extends Mod {
@@ -1083,5 +1118,6 @@ export const KINDS: Kind[] = [
   { type: 'delay', label: 'DELAY', cat: 'fx', make: (e) => new Delay(e) },
   { type: 'reverb', label: 'REVERB', cat: 'fx', make: (e) => new Reverb(e) },
   { type: 'mixer', label: 'MIXER', cat: 'util', make: (e) => new Mixer(e) },
+  { type: 'mixer8', label: 'BIG MIXER', cat: 'util', make: (e) => new BigMixer(e) },
   { type: 'speaker', label: 'SPEAKER', cat: 'util', make: (e) => new Speaker(e) },
 ];

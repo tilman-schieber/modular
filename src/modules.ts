@@ -635,16 +635,34 @@ export class Kick extends Drum {
       { name: '909', set: { tune: 55, punch: 0.7, dec: 0.3 } },
       { name: 'HARD', set: { tune: 50, punch: 0.9, dec: 0.35 } },
       { name: 'SUB', set: { tune: 40, punch: 0.1, dec: 1 } },
-      { name: 'LOFI', set: { tune: 52, punch: 0.5, dec: 0.4 } },
+      { name: 'LOFI', set: { tune: 52, punch: 0.3, dec: 0.4 } },
+      { name: 'JAZZ', set: { tune: 60, punch: 0.3, dec: 0.3 } },
     ]);
   }
 
   hit(t: number) {
     const { tune, punch, dec } = this.q(), kit = this.kit;
     const dest = this.dest();
+    if (kit === 'JAZZ') {
+      // a soft felt beater on a round drum: barely any pitch drop, a muffled thump
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.frequency.setValueAtTime(tune * (1.2 + punch), t);
+      o.frequency.exponentialRampToValueAtTime(tune, t + 0.025);
+      decay(g.gain, t, 0.9, dec);
+      o.connect(g).connect(dest);
+      o.start(t);
+      o.stop(t + dec + 0.02);
+      const n = noiseSrc(t, 0.03), lp = ac.createBiquadFilter(), ng = ac.createGain();
+      lp.type = 'lowpass';
+      lp.frequency.value = 900;
+      decay(ng.gain, t, 0.15 + punch * 0.3, 0.02);
+      n.connect(lp).connect(ng).connect(dest);
+      return;
+    }
     const o = ac.createOscillator(), g = ac.createGain();
     if (kit === 'LOFI') o.type = 'triangle';
-    const drop = kit === '909' ? 0.035 : kit === 'HARD' ? 0.05 : 0.07;
+    // A short drop is a punch; a long one through LOFI's crusher turns into a laser zap.
+    const drop = kit === '909' || kit === 'LOFI' ? 0.035 : kit === 'HARD' ? 0.05 : 0.07;
     o.frequency.setValueAtTime(tune * (1 + punch * 7), t);
     o.frequency.exponentialRampToValueAtTime(tune, t + drop);
     decay(g.gain, t, 1, dec);
@@ -673,6 +691,7 @@ export class Snare extends Drum {
       { name: '909', set: { tune: 200, snap: 0.85, dec: 0.22 } },
       { name: 'RIM', set: { tune: 180, snap: 0.2, dec: 0.06 } },
       { name: 'LOFI', set: { tune: 170, snap: 0.7, dec: 0.2 } },
+      { name: 'JAZZ', set: { tune: 180, snap: 0.5, dec: 0.2 } },
     ]);
   }
 
@@ -698,6 +717,18 @@ export class Snare extends Drum {
   hit(t: number) {
     const { tune, snap, dec } = this.q();
     switch (this.kit) {
+      case 'JAZZ': {
+        // a brush: a soft swish of noise that swells in, no drum tone
+        const n = noiseSrc(t, dec + 0.1), bp = ac.createBiquadFilter(), g = ac.createGain();
+        bp.type = 'bandpass';
+        bp.frequency.value = 2500;
+        bp.Q.value = 0.7;
+        g.gain.setValueAtTime(0.001, t);
+        g.gain.exponentialRampToValueAtTime(0.15 + snap * 0.4, t + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.001, t + dec);
+        n.connect(bp).connect(g).connect(this.dest());
+        break;
+      }
       case '909':
         this.tone(t, tune, 'triangle', 0.6, 0.1);
         this.tone(t, tune * 1.8, 'triangle', 0.3, 0.07);
@@ -737,6 +768,7 @@ export class HiHat extends Drum {
       { name: '808', set: { tone: 0.5, dec: 0.06 } },
       { name: '909', set: { tone: 0.6, dec: 0.05 } },
       { name: 'LOFI', set: { tone: 0.4, dec: 0.06 } },
+      { name: 'JAZZ', set: { tone: 0.7, dec: 0.05 } },
     ]);
   }
 
@@ -748,6 +780,15 @@ export class HiHat extends Drum {
     hp.type = 'highpass';
     hp.frequency.value = 5000 + tone * 4000;
     bp.connect(hp).connect(g).connect(this.dest());
+    if (this.kit === 'JAZZ') {
+      // thin and soft, close to a shaker, with a gentle attack
+      bp.Q.value = 0.5;
+      g.gain.setValueAtTime(0.001, t);
+      g.gain.exponentialRampToValueAtTime(0.25, t + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dec);
+      noiseSrc(t, dec + 0.02).connect(bp);
+      return;
+    }
     if (this.kit === '909') {
       // brighter and noisier
       bp.Q.value = 0.7;
@@ -777,11 +818,29 @@ export class Clap extends Drum {
       { name: '909', set: { tone: 1500, dec: 0.25 } },
       { name: 'SNAP', set: { tone: 2200, dec: 0.08 } },
       { name: 'LOFI', set: { tone: 1100, dec: 0.2 } },
+      { name: 'JAZZ', set: { tone: 1700, dec: 0.05 } },
     ]);
   }
 
   hit(t: number) {
     const { tone, dec } = this.q(), kit = this.kit;
+    if (kit === 'JAZZ') {
+      // a cross-stick: the stick laid on the head, clicking on the rim. Woody, short.
+      const o = ac.createOscillator(), bp = ac.createBiquadFilter(), g = ac.createGain();
+      o.type = 'square';
+      o.frequency.value = tone / 2;
+      bp.type = 'bandpass';
+      bp.frequency.value = tone;
+      bp.Q.value = 5;
+      decay(g.gain, t, 0.8, dec);
+      o.connect(bp).connect(g).connect(this.dest());
+      o.start(t);
+      o.stop(t + dec + 0.02);
+      const n = noiseSrc(t, 0.01), ng = ac.createGain();
+      decay(ng.gain, t, 0.3, 0.006);
+      n.connect(ng).connect(this.dest());
+      return;
+    }
     const n = noiseSrc(t, 0.05 + dec), bp = ac.createBiquadFilter(), g = ac.createGain();
     bp.type = 'bandpass';
     bp.frequency.value = tone;
@@ -863,7 +922,7 @@ const DM_ROWS = [
 ];
 // Mix level per row.
 const DM_LEVELS = [1, 0.8, 0.45, 0.4, 0.7];
-const DM_KITS = ['808', '909', 'LOFI'];
+const DM_KITS = ['808', '909', 'LOFI', 'JAZZ'];
 
 // A few patterns with open hats, then the TRIG SEQ ones (whose hats become closed hats).
 export const DM_PRESETS: GridPreset[] = [

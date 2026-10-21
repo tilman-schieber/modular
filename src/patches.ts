@@ -182,13 +182,13 @@ function phrase(notes: [number, number, number][]) {
 // An original bossa nova over ii-V-I-vi in C (Dm7 G7 Cmaj7 Am7), four bars, chained as
 // patterns A-D in two MELODYs. The one EUCLID plays the rim clave, the most famous
 // Euclidean rhythm: 5 hits over 16 steps, turned by 6, x..x..x...x..x.. (Toussaint).
-// The DRUM MACHINE plays the bossa kick, x..xx..xx..xx..x, and soft 8th-note hats,
+// The DRUM MACHINE's JAZZ kit plays the bossa kick, x..xx..xx..xx..x, and soft 8th-note shaker,
 // and its 16TH output clocks everything else.
 function euclidBossa() {
   const b = new Builder();
   const bass = (root: number, fifth: number) => phrase([[0, root, 5], [6, fifth, 2], [8, root, 5], [14, fifth, 2]]);
   const bank = (pats: object[]) => ({ pats, pr: ['', '', '', ''], rt: ['', '', '', ''], e: 0 });
-  const drums = b.add('drums', 10, 30, { bpm: 128, kit: 2, vol: 0.8 }, gridSteps({
+  const drums = b.add('drums', 10, 30, { bpm: 128, kit: 3, vol: 0.9 }, gridSteps({
     name: 'BOSSA', rows: [[0, 3, 4, 7, 8, 11, 12, 15], [], [0, 2, 4, 6, 8, 10, 12, 14], [], []],
   }, 5));
   const euclid = b.add('euclid', 186, 30, { steps: 16, hits: 5, rot: 6 });

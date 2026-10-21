@@ -94,6 +94,8 @@ export abstract class Mod {
   private knobTaps: Record<string, CvTap> = {};
   // MIDI CC number mapped to each knob, by knob id.
   cc: Record<string, number> = {};
+  // Effects can be bypassed (shift+click): IN goes straight to OUT. The `byp` param.
+  private byp: { in: GainNode; out: GainNode; dry: GainNode; wet: GainNode } | null = null;
 
   constructor(
     public eng: Engine, public type: string, public title: string,
@@ -162,8 +164,48 @@ export abstract class Mod {
     return Math.min(k.max, Math.max(k.min, v + (tap.read() * (k.max - k.min)) / 2));
   }
 
-  // Where a cable plugged into this input goes.
-  input(port: string) { return this.cvIns[port] ?? this.audioIn(port); }
+  // An input CV at time t, for values read when scheduling ahead. A source that knows
+  // its own schedule (valueAt, e.g. ARRANGER) gives it exactly; any other is read now.
+  cvAt(port: string, t: number, tap: CvTap) {
+    let sum = 0;
+    for (const c of this.eng.cables) {
+      if (c.b !== this || c.bp !== port) continue;
+      const v = c.a.valueAt(c.ap, t);
+      if (v === undefined) return tap.read();
+      sum += v;
+    }
+    return sum;
+  }
+
+  // What output `port` will be at time t, if this module knows it ahead of time.
+  valueAt(_port: string, _t: number): number | undefined { return undefined; }
+
+  // Where a cable plugged into this input goes, and where one from this output comes from.
+  input(port: string) {
+    if (this.byp && port === 'in') return this.byp.in;
+    return this.cvIns[port] ?? this.audioIn(port);
+  }
+
+  output(port: string) {
+    if (this.byp && port === 'out') return this.byp.out;
+    return this.audioOut(port);
+  }
+
+  // Let the effect be bypassed. Call at the end of the constructor: from then on the
+  // 'in' and 'out' jacks go through a dry/wet switch around the effect.
+  protected bypassable() {
+    const g = () => ac.createGain();
+    const b = { in: g(), out: g(), dry: g(), wet: g() };
+    b.dry.gain.value = 0;
+    b.in.connect(this.audioIn('in')!);
+    b.in.connect(b.dry).connect(b.out);
+    this.audioOut('out')!.connect(b.wet).connect(b.out);
+    this.byp = b;
+    this.p.byp = 0;
+  }
+
+  get canBypass() { return this.byp !== null; }
+  get bypassed() { return this.p.byp === 1; }
 
   protected portById(id: string) { return this.allPorts.find((p) => p.id === id)!; }
   protected knobById(id: string) { return this.allKnobs.find((k) => k.id === id)!; }
@@ -198,6 +240,11 @@ export abstract class Mod {
   set(id: string, v: number) {
     this.p[id] = v;
     if (id === 'adv' && this.advName) this.applyLayout();
+    if (id === 'byp' && this.byp) {
+      const t = ac.currentTime;
+      this.byp.dry.gain.setTargetAtTime(v, t, 0.005);
+      this.byp.wet.gain.setTargetAtTime(1 - v, t, 0.005);
+    }
     this.onParam(id, v);
     this.eng.dirty = true;
   }
@@ -231,7 +278,12 @@ export abstract class Mod {
   drawBody(_g: Gfx) {}
   press(_lx: number, _ly: number): Drag | null { return null; }
   // Shift+click on the module body; return true if used (otherwise it toggles selection).
-  pressShift(_lx: number, _ly: number) { return false; }
+  // On an effect it switches the bypass.
+  pressShift(_lx: number, _ly: number) {
+    if (!this.byp) return false;
+    this.set('byp', this.bypassed ? 0 : 1);
+    return true;
+  }
   save(): unknown { return undefined; }
   load(_s: unknown) {}
   destroy() {}

@@ -37,8 +37,12 @@ export function drawKnob(g: Gfx, m: Mod, k: Knob) {
   if (m.cc[k.id] !== undefined) g.rect(k.x + 10, k.y - 1, 2, 2, C.sky);
 }
 
+const GRAY = 'grayscale(1) brightness(0.6)';
+
 export function drawModule(g: Gfx, m: Mod, closeHover: boolean, advHover = false) {
   const { w, h } = m;
+  // A bypassed effect is drawn grayed out.
+  if (m.bypassed) g.ctx.filter = GRAY;
   const bar = CAT[m.cat].bar;
   g.rect(2, 2, w, h, C.black); // drop shadow
   g.rect(0, 0, w, h, C.black);
@@ -66,6 +70,24 @@ export function drawModule(g: Gfx, m: Mod, closeHover: boolean, advHover = false
   m.drawBody(g);
   for (const p of m.ports) drawJack(g, p);
   for (const k of m.knobs) drawKnob(g, m, k);
+  if (!m.bypassed) return;
+  if (g.ctx.filter !== GRAY) {
+    // no canvas filters in this browser: dim it instead
+    g.ctx.globalAlpha = 0.55;
+    g.rect(0, 0, w, h, C.ink);
+    g.ctx.globalAlpha = 1;
+  }
+  g.ctx.filter = 'none';
+}
+
+// Signal flowing along a cable, from its output end: dots that move along it and
+// glow with the level (0..1).
+export function drawFlow(g: Gfx, x0: number, y0: number, x1: number, y1: number, level: number, phase: number) {
+  if (level < 0.02) return;
+  const pts = cablePoints(x0, y0, x1, y1), gap = 8, off = Math.floor(phase) % gap;
+  g.ctx.globalAlpha = Math.min(1, 0.25 + level);
+  for (let i = off; i < pts.length; i += gap) g.rect(pts[i][0], pts[i][1], 2, 2, C.white);
+  g.ctx.globalAlpha = 1;
 }
 
 export function cablePoints(x0: number, y0: number, x1: number, y1: number) {

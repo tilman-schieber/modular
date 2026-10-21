@@ -4,7 +4,7 @@ import { C, Gfx, textWidth } from './gfx';
 import { CAT, TYPEC, compatible, type Cat, type Drag, type Knob, type Mod, type Port } from './mod';
 import { KINDS, Keys, type Kind } from './modules';
 import { PATCHES, migrate, type PatchData } from './patches';
-import { cablePoints, drawButton, drawCable, drawModule, plug } from './render';
+import { cablePoints, drawButton, drawCable, drawFlow, drawModule, plug } from './render';
 import { BAR_HELP, CABLE_HELP, HELP, MODULE_HOW, jackHelp, knobHelp } from './help';
 import { midi } from './midi';
 import { download, stamp } from './rec';
@@ -237,6 +237,44 @@ function hitTest(): Hit {
 function cableEnds(c: Cable) {
   const pa = c.a.ports.find((p) => p.id === c.ap)!, pb = c.b.ports.find((p) => p.id === c.bp)!;
   return [...jackPos(c.a, pa), ...jackPos(c.b, pb)] as const;
+}
+
+// One analyser per audio or CV output with a cable on it, so cables can show their signal.
+interface Meter { node: AudioNode; an: AnalyserNode; buf: Float32Array<ArrayBuffer>; lvl: number; frame: number }
+const meters = new Map<string, Meter>();
+let meterFrame = 0;
+
+// Audio: its peak level. CV: how far from 0 it is (1 = full glow).
+function signalLevel(c: Cable) {
+  const key = c.a.id + ':' + c.ap;
+  let m = meters.get(key);
+  if (!m) {
+    const node = c.a.output(c.ap);
+    if (!node) return 0;
+    const an = ac.createAnalyser();
+    an.fftSize = 256;
+    node.connect(an);
+    m = { node, an, buf: new Float32Array(256), lvl: 0, frame: -1 };
+    meters.set(key, m);
+  }
+  if (m.frame !== meterFrame) {
+    m.frame = meterFrame;
+    m.an.getFloatTimeDomainData(m.buf);
+    let peak = 0, sum = 0;
+    for (const v of m.buf) { peak = Math.max(peak, Math.abs(v)); sum += v; }
+    m.lvl = c.type === 'audio' ? Math.sqrt(peak) : Math.min(1, Math.abs(sum / m.buf.length));
+  }
+  return m.lvl;
+}
+
+// Drop the analysers of outputs that no longer have a cable.
+function pruneMeters() {
+  const used = new Set(eng.cables.map((c) => c.a.id + ':' + c.ap));
+  for (const [key, m] of meters) {
+    if (used.has(key)) continue;
+    try { m.node.disconnect(m.an); } catch { /* already gone */ }
+    meters.delete(key);
+  }
 }
 
 function cableAt(wx: number, wy: number, r: number) {
@@ -1033,6 +1071,7 @@ function frame() {
   g.ox = -camX;
   g.oy = -camY;
 
+  meterFrame++;
   for (const c of eng.cables) {
     const [x0, y0, x1, y1] = cableEnds(c);
     const col = TYPEC[c.type];
@@ -1043,8 +1082,13 @@ function frame() {
       g.ctx.globalAlpha = wires === 1 ? 0.25 : 1;
       drawCable(g, x0, y0, x1, y1, col, lit);
       g.ctx.globalAlpha = 1;
+      // Audio and CV cables show their signal (trig cables flash on each event instead).
+      if (wires === 0 && c.type !== 'trig' && eng.running) {
+        drawFlow(g, x0, y0, x1, y1, signalLevel(c), t / (c.type === 'audio' ? 40 : 120));
+      }
     }
   }
+  if (meterFrame % 60 === 0) pruneMeters();
 
   if (mode.k === 'box') {
     const x = Math.min(mode.x0, mx + camX), y = Math.min(mode.y0, my + camY);
@@ -1079,6 +1123,7 @@ function frame() {
     drawTooltip(tip.m.x + tip.kn.x + 5, tip.m.y + tip.kn.y - 10, tip.m.knobText(tip.kn) + (cc === undefined ? '' : ` CC${cc}`));
   }
   else if (h.k === 'adv') drawTooltip(h.m.x + h.m.w - 13, h.m.y - 10, h.m.isAdv ? 'SIMPLE' : h.m.advName);
+  else if (h.k === 'body' && h.m.bypassed) drawTooltip(h.m.x + Math.floor(h.m.w / 2), h.m.y - 10, 'BYPASSED - SHIFT+CLICK');
   else if (h.k === 'port') {
     drawTooltip(h.m.x + h.p.x + 4, h.m.y + h.p.y - 10, `${PORT_KIND[h.p.type]} ${h.p.dir === 'in' ? 'IN' : 'OUT'}`);
   }

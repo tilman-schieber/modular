@@ -223,10 +223,15 @@ const digits = (str: string | undefined, def: number) =>
 
 // Four patterns A-D. The advanced layout edits all of them, plays chance and ratchets
 // and can chain the first CHN patterns; the simple layout plays the one last edited.
+// A cable at PAT picks where the chain starts: CV 0 is A, 1/3 B, 2/3 C, 1 D. With
+// CHN:A that is the pattern itself; with CHN:AB, PAT C plays C D C D.
 class Bank<T> {
   pats: Pat<T>[];
   edit = 0;
   private pass = -1;
+  // The pattern PAT picked (or -1), and how many passes ago it did.
+  private forced = -1;
+  private since = 0;
 
   constructor(make: () => T) {
     this.pats = [0, 1, 2, 3].map(() => ({ d: make(), pr: Array(16).fill(4), rt: Array(16).fill(1) }));
@@ -234,13 +239,20 @@ class Bank<T> {
 
   get cur() { return this.pats[this.edit]; }
 
-  reset() { this.pass = -1; }
-  // Call on step 0 of every pass.
-  wrap() { this.pass++; }
+  reset() { this.pass = -1; this.forced = -1; }
+  // Call on step 0 of every pass, with the PAT CV if a cable is plugged in there.
+  wrap(pat?: number) {
+    this.pass++;
+    const f = pat === undefined ? -1 : Math.min(3, Math.max(0, Math.round(pat * 3)));
+    this.since = f === this.forced ? this.since + 1 : 0;
+    this.forced = f;
+  }
 
   // The pattern playing this pass.
   playing(chain: number, adv: boolean) {
-    return adv && chain > 1 ? this.pass % chain : this.edit;
+    if (!adv) return this.edit;
+    if (this.forced >= 0) return (this.forced + (this.since % chain)) % 4;
+    return chain > 1 ? this.pass % chain : this.edit;
   }
 
   // How many times step s of pattern i fires this time (0 when its chance says no).
@@ -308,6 +320,12 @@ function patRowHit(lx: number, ly: number, y: number): number | 'chain' | null {
   return inBtn(lx, ly, 76, y, 36) ? 'chain' : null;
 }
 
+// The PAT CV at time t, or undefined with no cable at PAT (or in the simple layout).
+function patIn(m: Mod & { patTap: CvTap }, t: number) {
+  if (!m.isAdv || !m.eng.cablesAt(m, 'pat').length) return undefined;
+  return m.cvAt('pat', t, m.patTap);
+}
+
 interface GridPreset { name: string; rows: number[][] }
 
 // Step strings for a grid preset: one per row, plus the accent row.
@@ -334,6 +352,7 @@ abstract class StepGrid extends Mod {
   private shownPat = 0;
   private preset = -1;
   private resetAt = Infinity;
+  patTap = new CvTap();
 
   constructor(
     e: Engine, type: string, title: string, w: number, h: number,
@@ -346,8 +365,13 @@ abstract class StepGrid extends Mod {
     this.advanced('ADVANCED', w, h + 31);
     this.p.chain = 1;
     this.port('clk', 'CLK', 'trig', 'in', 4, 12);
-    this.advOnly(() => this.port('rst', 'RST', 'trig', 'in', 4, 52));
+    this.advOnly(() => {
+      this.port('rst', 'RST', 'trig', 'in', 4, 52);
+      this.port('pat', 'PAT', 'cv', 'in', 4, 73);
+    });
   }
+
+  audioIn(port: string): AudioNode | null { return port === 'pat' ? this.patTap.in : null; }
 
   // The pattern being edited.
   get steps() { return this.bank.cur.d; }
@@ -381,7 +405,7 @@ abstract class StepGrid extends Mod {
   protected step(ev: Ev, play: (row: number, ev: Ev) => void) {
     if (ev.t >= this.resetAt - 0.001) { this.pos = -1; this.bank.reset(); this.resetAt = Infinity; }
     const s = (this.pos = (this.pos + 1) % this.p.len);
-    if (s === 0) this.bank.wrap();
+    if (s === 0) this.bank.wrap(patIn(this, ev.t));
     const i = this.bank.playing(this.p.chain, this.isAdv), pat = this.bank.pats[i].d;
     this.eng.at(ev.t, () => { this.shown = s; this.shownPat = i; });
     const n = this.bank.hits(i, s, this.isAdv), acc = pat[this.acc][s];
@@ -620,10 +644,21 @@ abstract class Drum extends Mod {
   }
 }
 
+// A dull lowpass into gentle saturation: a kick off an old tape.
+function muffled(dest: AudioNode) {
+  const lp = ac.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 700;
+  lp.connect(overdrive(dest, 2.5));
+  return lp;
+}
+
 export class Kick extends Drum {
   private drive = overdrive(this.out, 5);
+  // A kick through the crusher's few levels turns into a buzz, so LOFI muffles it instead.
+  private dusty = muffled(this.out);
 
-  protected route() { return this.kit === 'HARD' ? this.drive : super.route(); }
+  protected route() { return this.kit === 'HARD' ? this.drive : this.kit === 'LOFI' ? this.dusty : super.route(); }
 
   constructor(e: Engine) {
     super(e, 'kick', 'KICK', [
@@ -660,8 +695,6 @@ export class Kick extends Drum {
       return;
     }
     const o = ac.createOscillator(), g = ac.createGain();
-    if (kit === 'LOFI') o.type = 'triangle';
-    // A short drop is a punch; a long one through LOFI's crusher turns into a laser zap.
     const drop = kit === '909' || kit === 'LOFI' ? 0.035 : kit === 'HARD' ? 0.05 : 0.07;
     o.frequency.setValueAtTime(tune * (1 + punch * 7), t);
     o.frequency.exponentialRampToValueAtTime(tune, t + drop);
@@ -1042,6 +1075,10 @@ interface MelPat { n: number[]; a: boolean[]; s: boolean[] }
 export class Melody extends Mod {
   bank = new Bank<MelPat>(() => Melody.parse(null));
   pit = cvSource();
+  // TRN is added to the sequence's pitch: KEYS or another sequencer transposes it.
+  trn = ac.createGain();
+  pitOut = ac.createGain();
+  patTap = new CvTap();
   accCv = cvSource();
   private pos = -1;
   private shown = -1;
@@ -1054,6 +1091,9 @@ export class Melody extends Mod {
     this.advanced('ADVANCED', 160, 123);
     this.p.chain = 1;
     this.port('clk', 'CLK', 'trig', 'in', 4, 12);
+    this.port('trn', 'TRN', 'cv', 'in', 4, 73);
+    this.pit.connect(this.pitOut);
+    this.trn.connect(this.pitOut);
     this.port('pit', 'PIT', 'cv', 'out', 147, 12);
     this.port('gate', 'GAT', 'trig', 'out', 147, 33);
     this.port('acc', 'ACC', 'cv', 'out', 147, 54);
@@ -1062,7 +1102,10 @@ export class Melody extends Mod {
     this.knob({ id: 'scale', label: 'SCL', x: 42, y: 80, min: 0, max: 3, def: 1, names: SCALE_NAMES });
     this.knob({ id: 'oct', label: 'OCT', x: 58, y: 80, min: 1, max: 5, def: 2, step: 1 });
     this.knob({ id: 'gate', label: 'GAT', x: 74, y: 80, min: 0.1, max: 1, def: 0.5, fmt: pct });
-    this.advOnly(() => this.port('rst', 'RST', 'trig', 'in', 4, 52));
+    this.advOnly(() => {
+      this.port('rst', 'RST', 'trig', 'in', 4, 52);
+      this.port('pat', 'PAT', 'cv', 'in', 4, 94);
+    });
   }
 
   // The pattern being edited.
@@ -1077,7 +1120,8 @@ export class Melody extends Mod {
     for (const id of ['root', 'scale', 'oct', 'gate']) this.knobById(id).y = 80 + this.dy;
   }
 
-  audioOut(port: string) { return port === 'acc' ? this.accCv : this.pit; }
+  audioIn(port: string) { return port === 'pat' ? this.patTap.in : this.trn; }
+  audioOut(port: string) { return port === 'acc' ? this.accCv : this.pitOut; }
   destroy() { this.pit.stop(); this.accCv.stop(); }
 
   private semi(r: number) {
@@ -1117,7 +1161,7 @@ export class Melody extends Mod {
     if (ev.t >= this.resetAt - 0.001) { this.pos = -1; this.bank.reset(); this.resetAt = Infinity; }
     const len = this.p.len;
     const s = (this.pos = (this.pos + 1) % len);
-    if (s === 0) this.bank.wrap();
+    if (s === 0) this.bank.wrap(patIn(this, ev.t));
     const i = this.bank.playing(this.p.chain, this.isAdv), pat = this.bank.pats[i].d;
     this.eng.at(ev.t, () => { this.shown = s; this.shownPat = i; });
     const r = pat.n[s], hits = r < 0 ? 0 : this.bank.hits(i, s, this.isAdv);
@@ -1581,7 +1625,47 @@ export class Mixer extends Mod {
       this.knob({ id: 'p' + c, label: '', x: 0, y: 45, min: -1, max: 1, def: 0, fmt: panFmt })));
     this.knob({ id: 'vol', label: 'VOL', x: 0, y: 0, min: 0, max: 1.5, def: 1, fmt: pct });
     this.port('out', 'OUT', 'audio', 'out', 0, 0);
+    // Mute ('mu') and solo ('so') per channel: click / shift+click the channel number.
+    this.ins.forEach((_, c) => { this.p['mu' + c] = 0; this.p['so' + c] = 0; });
     this.layout(false);
+  }
+
+  private get chans() { return this.isAdv ? 8 : 4; }
+
+  // A channel plays at its level unless it is muted, or another channel is soloed.
+  private levels() {
+    // (Not until the constructor has made every channel.)
+    if (this.p.mu0 === undefined) return;
+    const t = ac.currentTime, n = this.chans;
+    const solo = this.ins.some((_, c) => c < n && this.p['so' + c]);
+    this.ins.forEach((g, c) => {
+      const on = !this.p['mu' + c] && (!solo || this.p['so' + c]);
+      g.gain.setTargetAtTime(on ? this.p['l' + c] : 0, t, 0.01);
+    });
+  }
+
+  // The channel number under a jack, if lx, ly is on one.
+  private numAt(lx: number, ly: number) {
+    if (ly < 23 || ly > 29) return -1;
+    for (let c = 0; c < this.chans; c++) {
+      const x = this.portById('i' + c).x;
+      if (lx >= x && lx < x + 9) return c;
+    }
+    return -1;
+  }
+
+  press(lx: number, ly: number): Drag | null {
+    const c = this.numAt(lx, ly);
+    if (c < 0) return null;
+    this.set('mu' + c, this.p['mu' + c] ? 0 : 1);
+    return noDrag;
+  }
+
+  pressShift(lx: number, ly: number) {
+    const c = this.numAt(lx, ly);
+    if (c < 0) return false;
+    this.set('so' + c, this.p['so' + c] ? 0 : 1);
+    return true;
   }
 
   // Big: a LVL / PAN label column on the left, the master row at the bottom.
@@ -1594,6 +1678,7 @@ export class Mixer extends Mod {
       // Panning only applies in the big layout.
       this.pans[c].pan.setTargetAtTime(big ? this.p['p' + c] : 0, ac.currentTime, 0.01);
     });
+    this.levels();
     Object.assign(this.knobById('vol'), big ? { x: 18, y: 62 } : { x: 4, y: 47 });
     Object.assign(this.portById('out'), big ? { x: 129, y: 62 } : { x: 51, y: 46 });
   }
@@ -1601,11 +1686,16 @@ export class Mixer extends Mod {
   onParam(id: string, v: number) {
     const t = ac.currentTime, c = Number(id.slice(1));
     if (id === 'vol') this.out.gain.setTargetAtTime(v, t, 0.01);
-    else if (id[0] === 'l') this.ins[c].gain.setTargetAtTime(v, t, 0.01);
+    else if (id[0] === 'l' || id.startsWith('mu') || id.startsWith('so')) this.levels();
     else if (id[0] === 'p' && this.isAdv) this.pans[c].pan.setTargetAtTime(v, t, 0.01);
   }
 
   drawBody(g: Gfx) {
+    // A muted channel's number turns red, a soloed one's green.
+    for (let c = 0; c < this.chans; c++) {
+      const col = this.p['so' + c] ? C.green : this.p['mu' + c] ? C.red : '';
+      if (col) g.rect(this.portById('i' + c).x + 1, 23, 7, 7, col);
+    }
     if (!this.isAdv) return;
     g.text('LVL', 3, 33, C.silver);
     g.text('PAN', 3, 48, C.silver);
@@ -1635,6 +1725,7 @@ export class Filter extends Mod {
     this.advanced('ADVANCED', 50, 70);
     // A CV of 1 adds 10 to the resonance.
     this.cvParam('res', 35, 51, this.f.Q, 10);
+    this.bypassable();
   }
 
   onParam(id: string, v: number) {
@@ -1647,7 +1738,15 @@ export class Filter extends Mod {
   audioOut() { return this.f; }
 }
 
+// Synced delay times, in 16th notes: 1/16, 1/8 triplet, 1/8, dotted 1/8, 1/4, dotted 1/4, 1/2.
+const SYNC_NAMES = ['1/16', '1/8T', '1/8', '1/8.', '1/4', '1/4.', '1/2'];
+const SYNC_16THS = [1, 4 / 3, 2, 3, 4, 6, 8];
+
 export class Delay extends Mod {
+  private clk: number[] = [];
+  // Seconds per clock tick, measured at CLK (0 until two ticks have arrived).
+  private tick = 0;
+  private time = -1;
   in = ac.createGain();
   out = ac.createGain();
   d = ac.createDelay(2);
@@ -1656,7 +1755,7 @@ export class Delay extends Mod {
   cv = ac.createGain();
 
   constructor(e: Engine) {
-    super(e, 'delay', 'DELAY', 'fx', 50, 52);
+    super(e, 'delay', 'DELAY', 'fx', 50, 70);
     this.in.connect(this.out);
     this.in.connect(this.d);
     // The repeats run through a soft clipper, so feedback pushed past 100% saturates
@@ -1671,20 +1770,48 @@ export class Delay extends Mod {
     this.cv.gain.value = 0.25;
     this.cv.connect(this.d.delayTime);
     this.knobRow([
-      { id: 'time', label: 'TIM', min: 0.05, max: 1, def: 0.375, fmt: ms },
+      { id: 'time', label: 'TIM', min: 0.05, max: 1, def: 0.375, fmt: (v) => (this.synced ? SYNC_NAMES[this.syncIdx(v)] : ms(v)) },
       { id: 'fb', label: 'FBK', min: 0, max: 0.9, def: 0.4, fmt: pct },
       { id: 'mix', label: 'MIX', min: 0, max: 1, def: 0.35, fmt: pct },
     ], 13);
     io(this, 'audio');
     this.port('cv', 'TIM', 'cv', 'in', 20, 32);
+    // With a clock at CLK, TIM picks a note value instead of a time.
+    this.port('clk', 'CLK', 'trig', 'in', 4, 51);
     this.advanced('ADVANCED', 50, 70);
     this.cvParam('fb', 20, 51, this.fb.gain, 0.45);
     this.cvParam('mix', 35, 51, this.wet.gain, 0.5);
+    this.bypassable();
   }
+
+  get synced() { return this.eng.cablesAt(this, 'clk').length > 0; }
+
+  private syncIdx(v: number) { return Math.round(((v - 0.05) / 0.95) * (SYNC_16THS.length - 1)); }
+
+  // Set the delay time from the knob, or from the clock when synced.
+  private retime(t: number) {
+    const v = this.p.time;
+    const sec = this.synced && this.tick ? Math.min(2, this.tick * SYNC_16THS[this.syncIdx(v)]) : v;
+    if (Math.abs(sec - this.time) < 0.001) return;
+    this.time = sec;
+    this.d.delayTime.setTargetAtTime(sec, t, 0.05);
+  }
+
+  onEvent(port: string, ev: Ev) {
+    if (port !== 'clk' || ev.off) return;
+    // Averaged over two ticks, so swing does not wobble the time.
+    const c = (this.clk = [...this.clk.slice(-2), ev.t]);
+    const tick = c.length === 3 ? (c[2] - c[0]) / 2 : c.length === 2 ? c[1] - c[0] : 0;
+    if (tick > 0.02 && tick < 1) { this.tick = tick; this.retime(ev.t); }
+  }
+
+  // Unplugging the clock goes back to the knob's time.
+  schedule() { if (this.tick && !this.synced) { this.tick = 0; this.retime(ac.currentTime); } }
+  reset() { this.clk = []; }
 
   onParam(id: string, v: number) {
     const t = ac.currentTime;
-    if (id === 'time') this.d.delayTime.setTargetAtTime(v, t, 0.05);
+    if (id === 'time') this.retime(t);
     if (id === 'fb') this.fb.gain.setTargetAtTime(v, t, 0.02);
     if (id === 'mix') this.wet.gain.setTargetAtTime(v, t, 0.02);
   }
@@ -1714,6 +1841,7 @@ export class Reverb extends Mod {
     ], 13);
     io(this, 'audio');
     this.port('cv', 'MIX', 'cv', 'in', 20, 32);
+    this.bypassable();
   }
 
   private build() {
@@ -2452,6 +2580,276 @@ export class Quant extends Mod {
   destroy() { this.node?.disconnect(); }
 }
 
+// ---------------------------------------------------------------- CHORD
+
+// The four notes of a chord on pitch v (1 per octave), as pitch CVs. Types 0-6 stack
+// fixed intervals on v; type 7 (DIA) snaps v to KEY's major scale and stacks thirds
+// inside it, so each degree gets its own chord: C MAJ7, D MIN7, E MIN7, F MAJ7 ...
+// The CHORD worklet runs this function too, so it must not use anything outside itself.
+function chordNotes(v: number, type: number, key: number): number[] {
+  const FIXED = [[0, 4, 7, 12], [0, 3, 7, 12], [0, 4, 7, 10], [0, 4, 7, 11], [0, 3, 7, 10], [0, 5, 7, 12], [0, 3, 6, 9]];
+  if (type < 7) return FIXED[type].map((s) => v + s / 12);
+  const S = [0, 2, 4, 5, 7, 9, 11];
+  const r = v * 12 - key, c = Math.round(r);
+  let best = c, bd = Infinity;
+  for (let n = c - 2; n <= c + 2; n++) {
+    const d = Math.abs(n - r);
+    if (S.includes(((n % 12) + 12) % 12) && d < bd) { bd = d; best = n; }
+  }
+  const pc = ((best % 12) + 12) % 12, oct = (best - pc) / 12, deg = S.indexOf(pc);
+  return [0, 2, 4, 6].map((k) => (S[(deg + k) % 7] + 12 * (oct + Math.floor((deg + k) / 7)) + key) / 12);
+}
+
+const CHORD_TYPES = ['MAJ', 'MIN', '7', 'MAJ7', 'MIN7', 'SUS4', 'DIM', 'DIA'];
+const CHORD_QUALITY: Record<string, string> = {
+  '0,4,7,12': 'MAJ', '0,3,7,12': 'MIN', '0,4,7,10': '7', '0,4,7,11': 'MAJ7', '0,3,7,10': 'MIN7',
+  '0,5,7,12': 'SUS4', '0,3,6,9': 'DIM', '0,3,6,10': 'MIN7B5',
+};
+
+function chordName(notes: number[]) {
+  const semis = notes.map((n) => Math.round(n * 12));
+  const q = CHORD_QUALITY[semis.map((n) => n - semis[0]).join(',')] ?? '';
+  return NOTE_NAMES[((semis[0] % 12) + 12) % 12] + ' ' + q;
+}
+
+const CHORD_PROCESSOR = `
+const chordNotes = ${chordNotes.toString()};
+class Chord extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.type = 0; this.key = 0; this.last = NaN; this.held = [0, 0, 0, 0];
+    this.port.onmessage = (e) => { this.type = e.data.type; this.key = e.data.key; this.last = NaN; };
+  }
+  process(inputs, outputs) {
+    const i = inputs[0][0], o = outputs[0];
+    for (let s = 0; s < o[0].length; s++) {
+      const v = i ? i[s] : 0;
+      if (v !== this.last) { this.last = v; this.held = chordNotes(v, this.type, this.key); }
+      for (let k = 0; k < 4; k++) o[k][s] = this.held[k];
+    }
+    return true;
+  }
+}
+registerProcessor('chord', Chord);
+`;
+
+// Chord: one pitch in, the four notes of a chord on it out (1, 3, 5, 7), each for its
+// own voice. Triads repeat the root an octave up on 7.
+export class Chord extends Mod {
+  in = ac.createGain();
+  outs = [0, 1, 2, 3].map(() => ac.createGain());
+  private node: AudioWorkletNode | null = null;
+  private tap = new CvTap();
+
+  constructor(e: Engine) {
+    super(e, 'chord', 'CHORD', 'mod', 78, 52);
+    this.in.connect(this.tap.in);
+    this.knob({ id: 'type', label: 'TYP', x: 4, y: 13, min: 0, max: 7, def: 0, names: CHORD_TYPES });
+    this.knob({ id: 'key', label: 'KEY', x: 22, y: 13, min: 0, max: 11, def: 0, names: NOTE_NAMES });
+    this.port('in', 'PIT', 'cv', 'in', 4, 32);
+    ['1', '3', '5', '7'].forEach((l, k) => this.port('o' + k, l, 'cv', 'out', 23 + k * 14, 32));
+    void worklet(CHORD_PROCESSOR).then(() => {
+      const node = new AudioWorkletNode(ac, 'chord', { outputChannelCount: [4] });
+      const split = ac.createChannelSplitter(4);
+      this.in.connect(node).connect(split);
+      this.outs.forEach((o, k) => split.connect(o, k));
+      this.node = node;
+      this.send();
+    });
+  }
+
+  private send() { this.node?.port.postMessage({ type: this.p.type, key: this.p.key }); }
+
+  onParam() { this.send(); }
+
+  drawBody(g: Gfx) {
+    g.rect(39, 14, 36, 11, C.black);
+    g.textC(chordName(chordNotes(this.tap.read(), this.p.type, this.p.key)), 57, 17, C.yellow);
+  }
+
+  audioIn() { return this.in; }
+  audioOut(port: string) { return this.outs[Number(port.slice(1))]; }
+  destroy() { this.node?.disconnect(); }
+}
+
+// ---------------------------------------------------------------- ARRANGER
+
+// Section lengths in bars (0 = unused), and the lanes: two pattern lanes (A-D, for the
+// sequencers' PAT jacks), two gate lanes (on/off, e.g. into a VCA) and two CV lanes
+// (a level per section).
+const ARR_SECS = 8;
+const ARR_LENS = [0, 1, 2, 4, 8, 16];
+const ARR_LANES: { name: string; kind: 'pat' | 'gate' | 'cv'; col: string }[] = [
+  { name: 'P1', kind: 'pat', col: C.yellow }, { name: 'P2', kind: 'pat', col: C.orange },
+  { name: 'G1', kind: 'gate', col: C.lime }, { name: 'G2', kind: 'gate', col: C.green },
+  { name: 'C1', kind: 'cv', col: C.sky }, { name: 'C2', kind: 'cv', col: C.cyan },
+];
+const arrX = (c: number) => 26 + c * 15;
+const arrY = (r: number) => 24 + r * 10;
+
+// Song structure over the clock: each column is a section some bars long (a bar is 16
+// clock ticks), each row a lane with a value per section. SEC fires at each section
+// start; END fires the first time the last section is over, and the song starts again.
+export class Arranger extends Mod {
+  lens = [4, 4, 4, 4, 0, 0, 0, 0];
+  // Per lane, per section: a pattern 0-3, a gate 0/1 or a level 0..1.
+  cells = ARR_LANES.map((l) => Array(ARR_SECS).fill(l.kind === 'gate' ? 1 : 0) as number[]);
+  private outs = ARR_LANES.map(() => cvSource());
+  // Clock ticks since play (-1 before the first), and the time of the last one.
+  private n = -1;
+  private lastT = -Infinity;
+  private resetAt = Infinity;
+  private ended = false;
+  private shown = { sec: 0, bar: 0 };
+
+  constructor(e: Engine) {
+    super(e, 'arranger', 'ARRANGER', 'seq', 160, 110);
+    this.port('clk', 'CLK', 'trig', 'in', 4, 12);
+    this.port('rst', 'RST', 'trig', 'in', 4, 40);
+    ARR_LANES.forEach((_, r) => this.port('o' + r, '', 'cv', 'out', 147, arrY(r)));
+    this.port('sec', 'SEC', 'trig', 'out', 118, 90);
+    this.port('end', 'END', 'trig', 'out', 140, 90);
+    this.apply(0);
+  }
+
+  private get bars() { return this.lens.reduce((a, b) => a + b, 0); }
+
+  // Where tick n falls: its section, the bar within it, and whether it starts the section.
+  private where(n: number) {
+    const ticks = Math.max(1, this.bars) * 16, k = ((n % ticks) + ticks) % ticks;
+    let bar = Math.floor(k / 16);
+    for (let sec = 0; sec < ARR_SECS; sec++) {
+      if (bar < this.lens[sec]) return { sec, bar, start: bar === 0 && k % 16 === 0, wrapped: k === 0 && n > 0 };
+      bar -= this.lens[sec];
+    }
+    return { sec: 0, bar: 0, start: true, wrapped: false };
+  }
+
+  // A lane's output value in a section: patterns go out as 0, 1/3, 2/3, 1.
+  private value(r: number, sec: number) {
+    const v = this.cells[r][sec];
+    return ARR_LANES[r].kind === 'pat' ? v / 3 : v;
+  }
+
+  // Patterns jump exactly; gates and levels move over a few ms, so a VCA does not click.
+  private apply(t: number) {
+    const sec = this.where(Math.max(0, this.n)).sec;
+    this.outs.forEach((o, r) => {
+      if (ARR_LANES[r].kind === 'pat') o.offset.setValueAtTime(this.value(r, sec), t);
+      else o.offset.setTargetAtTime(this.value(r, sec), t, 0.004);
+    });
+  }
+
+  // The tick at time t is either the last one handled or the next one.
+  valueAt(port: string, t: number) {
+    const r = Number(port.slice(1));
+    if (port[0] !== 'o') return undefined;
+    const n = t > this.lastT + 0.001 ? (t >= this.resetAt - 0.001 ? 0 : this.n + 1) : this.n;
+    return this.value(r, this.where(Math.max(0, n)).sec);
+  }
+
+  reset() {
+    this.n = -1;
+    this.lastT = -Infinity;
+    this.resetAt = Infinity;
+    this.ended = false;
+    this.shown = { sec: 0, bar: 0 };
+    this.apply(ac.currentTime);
+  }
+
+  onEvent(port: string, ev: Ev) {
+    if (ev.off) return;
+    if (port === 'rst') { this.resetAt = ev.t; return; }
+    if (port !== 'clk') return;
+    if (ev.t >= this.resetAt - 0.001) { this.n = -1; this.resetAt = Infinity; }
+    this.n++;
+    this.lastT = ev.t;
+    const w = this.where(this.n);
+    this.eng.at(ev.t, () => { this.shown = { sec: w.sec, bar: w.bar }; });
+    if (!w.start) return;
+    // END fires once per play, so it can stop a recording that started with play.
+    if (w.wrapped && !this.ended) { this.ended = true; this.emit('end', { t: ev.t, dur: ev.dur }); }
+    this.emit('sec', { t: ev.t, dur: ev.dur });
+    this.apply(ev.t);
+  }
+
+  drawBody(g: Gfx) {
+    const { sec, bar } = this.shown, run = this.eng.running;
+    g.text('BAR', 13, 15, C.silver);
+    ARR_LANES.forEach((l, r) => g.text(l.name, 16, arrY(r) + 2, l.col));
+    for (let c = 0; c < ARR_SECS; c++) {
+      const x = arrX(c), len = this.lens[c], cur = run && c === sec;
+      g.rect(x, 12, 14, 9, cur ? C.white : len ? C.slate : C.ink);
+      g.textC(len ? String(len) : '-', x + 7, 14, cur ? C.ink : len ? C.white : C.slate);
+      // how far into the section the song is
+      g.rect(x, 21, 14, 1, C.black);
+      if (cur && len) g.rect(x, 21, Math.max(1, Math.round(((bar + 1) / len) * 14)), 1, C.lime);
+      ARR_LANES.forEach((l, r) => {
+        const y = arrY(r), v = this.cells[r][c];
+        g.rect(x, y, 14, 9, !len ? C.black : cur ? C.dark : C.ink);
+        if (!len) return;
+        if (l.kind === 'pat') g.textC('ABCD'[v], x + 7, y + 2, l.col);
+        else if (l.kind === 'gate') { if (v) g.rect(x + 1, y + 1, 12, 7, l.col); }
+        else if (v > 0) { const h = Math.max(1, Math.round(v * 7)); g.rect(x + 1, y + 8 - h, 12, h, l.col); }
+      });
+    }
+    g.text(run ? `SEC ${sec + 1} BAR ${bar + 1}/${this.lens[sec]}` : `${this.bars} BARS`, 26, 92, C.silver);
+  }
+
+  private colAt(lx: number) {
+    for (let c = 0; c < ARR_SECS; c++) if (lx >= arrX(c) && lx < arrX(c) + 14) return c;
+    return -1;
+  }
+
+  // Click a BAR cell to step its length; click a lane cell to step a pattern, flip a
+  // gate or set a level (by height). Dragging paints along the row.
+  press(lx: number, ly: number): Drag | null {
+    const c0 = this.colAt(lx);
+    if (c0 < 0) return null;
+    if (ly >= 12 && ly < 21) {
+      const i = ARR_LENS.indexOf(this.lens[c0]);
+      // The first section always plays.
+      this.lens[c0] = ARR_LENS[(i + 1) % ARR_LENS.length] || (c0 === 0 ? 1 : 0);
+      this.edited();
+      return noDrag;
+    }
+    const r = Math.floor((ly - 24) / 10);
+    if (r < 0 || r >= ARR_LANES.length || ly - arrY(r) > 8) return null;
+    const kind = ARR_LANES[r].kind, row = this.cells[r];
+    const level = (y: number) => Math.min(1, Math.max(0, Math.round(((arrY(r) + 8 - y) / 7) * 4) / 4));
+    const val = kind === 'pat' ? (row[c0] + 1) % 4 : kind === 'gate' ? 1 - row[c0] : level(ly);
+    const paint = (c: number, y: number) => {
+      if (c < 0) return;
+      row[c] = kind === 'cv' ? level(y) : val;
+      this.edited();
+    };
+    paint(c0, ly);
+    return { move: (x, y) => paint(this.colAt(x), y) };
+  }
+
+  private edited() {
+    this.eng.dirty = true;
+    this.apply(ac.currentTime);
+  }
+
+  save() { return { l: this.lens, c: this.cells }; }
+
+  load(s: unknown) {
+    const st = s as { l?: unknown; c?: unknown } | null;
+    const lens = st?.l;
+    if (Array.isArray(lens)) this.lens = this.lens.map((v, i) => (ARR_LENS.includes(Number(lens[i])) ? Number(lens[i]) : v));
+    if (!this.lens[0]) this.lens[0] = 1;
+    if (Array.isArray(st?.c)) this.cells = this.cells.map((row, r) => row.map((v, i) => {
+      const x = Number((st.c as unknown[][])[r]?.[i]);
+      return Number.isFinite(x) ? x : v;
+    }));
+    this.apply(ac.currentTime);
+  }
+
+  audioOut(port: string) { return this.outs[Number(port.slice(1))] ?? null; }
+  destroy() { for (const o of this.outs) o.stop(); }
+}
+
 // ---------------------------------------------------------------- TURING
 
 // A Turing machine: a 16-bit shift register that loops its last LEN bits. CHG is the
@@ -2670,6 +3068,7 @@ export class Ring extends Mod {
     this.port('in', 'IN', 'audio', 'in', 4, 32);
     this.port('car', 'CAR', 'cv', 'in', 20, 32);
     this.port('out', 'OUT', 'audio', 'out', 37, 32);
+    this.bypassable();
   }
 
   onParam(_id: string, v: number) {
@@ -2801,6 +3200,7 @@ export class Drive extends Mod {
     io(this, 'audio');
     this.advanced('ADVANCED', 50, 52);
     this.cvParam('drive', 20, 32, this.pre.gain, 15);
+    this.bypassable();
   }
 
   onParam(id: string, v: number) {
@@ -2836,6 +3236,7 @@ export class Fold extends Mod {
     io(this, 'audio');
     this.advanced('ADVANCED', 50, 52);
     this.cvParam('fold', 20, 32, this.pre.gain, 9 / FOLDS / 2);
+    this.bypassable();
   }
 
   onParam(id: string, v: number) {
@@ -2890,6 +3291,7 @@ export class Crush extends Mod {
       { id: 'lvl', label: 'LVL', min: 0, max: 1, def: 0.7, fmt: pct },
     ], 13);
     io(this, 'audio');
+    this.bypassable();
     void worklet(CRUSH_PROCESSOR).then(() => {
       this.node = new AudioWorkletNode(ac, 'crush', { outputChannelCount: [2] });
       this.in.disconnect(this.out);
@@ -2924,6 +3326,7 @@ export const KINDS: Kind[] = [
   { type: 'euclid', label: 'EUCLID', cat: 'seq', make: (e) => new Euclid(e) },
   { type: 'chance', label: 'CHANCE', cat: 'seq', make: (e) => new Chance(e) },
   { type: 'turing', label: 'TURING', cat: 'seq', make: (e) => new Turing(e) },
+  { type: 'arranger', label: 'ARRANGER', cat: 'seq', make: (e) => new Arranger(e) },
   { type: 'logic', label: 'LOGIC', cat: 'seq', make: (e) => new Logic(e) },
   { type: 'kick', label: 'KICK', cat: 'drum', make: (e) => new Kick(e) },
   { type: 'snare', label: 'SNARE', cat: 'drum', make: (e) => new Snare(e) },
@@ -2939,6 +3342,7 @@ export const KINDS: Kind[] = [
   { type: 'snh', label: 'S&H', cat: 'mod', make: (e) => new SampleHold(e) },
   { type: 'atten', label: 'ATTEN', cat: 'mod', make: (e) => new Atten(e) },
   { type: 'quant', label: 'QUANT', cat: 'mod', make: (e) => new Quant(e) },
+  { type: 'chord', label: 'CHORD', cat: 'mod', make: (e) => new Chord(e) },
   { type: 'slew', label: 'SLEW', cat: 'mod', make: (e) => new Slew(e) },
   { type: 'cvmix', label: 'CV MIX', cat: 'mod', make: (e) => new CvMix(e) },
   { type: 'seqsw', label: 'SEQ SW', cat: 'mod', make: (e) => new SeqSwitch(e) },

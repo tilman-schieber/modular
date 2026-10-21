@@ -77,7 +77,7 @@ function voice() {
   const reverb = b.add('reverb', 510, 30, { size: 0.6, mix: 0.3 });
   const env = b.add('env', 256, 100, { a: 0.05, d: 0.55, s: 0.2, r: 0.5 });
   const lfo = b.add('lfo', 340, 100, { rate: 0.55, depth: 0.02 });
-  const speaker = b.add('speaker', 450, 100, { vol: 1 });
+  const speaker = b.add('speaker', 450, 110, { vol: 1 });
   b.wire(clock, 'o16', melody, 'clk');
   b.wire(melody, 'pit', osc, 'cv');
   b.wire(melody, 'gate', env, 'in');
@@ -107,7 +107,7 @@ function ambient() {
   const sweep = b.add('lfo', 408, 110, { rate: 0.05, depth: 0.6 });
   const reverb = b.add('reverb', 468, 40, { size: 1, mix: 0.6 });
   const delay = b.add('delay', 528, 40, { time: 0.8, fb: 0.6, mix: 0.4 });
-  const speaker = b.add('speaker', 468, 110);
+  const speaker = b.add('speaker', 468, 120);
   b.wire(clock, 'o16', melody, 'clk');
   b.wire(melody, 'pit', slew, 'in');
   b.wire(slew, 'out', oscA, 'cv');
@@ -139,7 +139,7 @@ function dubTechno() {
   const lfo = b.add('lfo', 192, 226, { rate: 0.12, shape: 1, depth: 0.3 });
   const delay = b.add('delay', 334, 160, { time: 0.375, fb: 0.62, mix: 0.5 });
   const reverb = b.add('reverb', 398, 160, { size: 0.85, mix: 0.45 });
-  const sub = b.add('synth', 256, 148, { wave: 3, oct: -1, cut: 0.5, env: 0, dec: 0.3 });
+  const sub = b.add('synth', 82, 250, { wave: 3, oct: -1, cut: 0.5, env: 0, dec: 0.3 });
   b.wire(clock, 'o16', beats, 'clk');
   b.wire(clock, 'o16', melody, 'clk');
   b.wire(beats, 'o0', kick, 'in');
@@ -150,12 +150,12 @@ function dubTechno() {
   b.wire(clap, 'out', mixer, 'i2');
   b.play(melody, stab);
   b.play(melody, sub);
-  // The minor stab chord: two more voices, their pitch CV shifted up 3 and 7 semitones.
-  for (const [i, semis] of [3, 7].entries()) {
-    const shift = b.add('atten', 460, 160 + i * 60, { amt: 1, ofs: semis / 12 });
+  // The minor stab chord: CHORD's minor third and fifth play two more voices.
+  const chord = b.add('chord', 440, 226, { type: 1 });
+  b.wire(melody, 'pit', chord, 'in');
+  for (const [i, out] of ['o1', 'o2'].entries()) {
     const voice = b.add('synth', 520, 146 + i * 80, { wave: 0, cut: 0.38, res: 7, env: 0.45, dec: 0.12 });
-    b.wire(melody, 'pit', shift, 'in');
-    b.wire(shift, 'out', voice, 'pit');
+    b.wire(chord, out, voice, 'pit');
     b.wire(melody, 'gate', voice, 'gate');
     b.wire(lfo, 'out', voice, 'cv');
     b.wire(voice, 'out', delay, 'in');
@@ -179,42 +179,78 @@ function phrase(notes: [number, number, number][]) {
   return { n, a: '0'.repeat(16), s: sl.join('') };
 }
 
-// An original bossa nova over ii-V-I-vi in C (Dm7 G7 Cmaj7 Am7), four bars, chained as
-// patterns A-D in two MELODYs. The one EUCLID plays the rim clave, the most famous
-// Euclidean rhythm: 5 hits over 16 steps, turned by 6, x..x..x...x..x.. (Toussaint).
-// The DRUM MACHINE's JAZZ kit plays the bossa kick, x..xx..xx..xx..x, and soft 8th-note shaker,
-// and its 16TH output clocks everything else.
+// An original bossa nova song over ii-V-I-vi in C (Dm7 G7 Cmaj7 Am7), 20 bars long.
+// The ARRANGER plays the form: INTRO, A, B, A, OUTRO, four bars each.
+// - P1 picks the DRUM MACHINE pattern: A is the sparse intro and outro groove
+//   (kick on 1 and 3), B the full bossa kick, x..xx..xx..xx..x. Both have 8th-note shaker.
+// - G1 and G2 open the VCAs of the two tunes: the A melody and the B (answer) melody,
+//   each four bars chained as patterns A-D in its own MELODY.
+// - C1 is the reverb mix: drier in the song, washing out in the outro.
+// The one EUCLID plays the rim clave, the most famous Euclidean rhythm: 5 hits over 16
+// steps, turned by 6, x..x..x...x..x.. (Toussaint). The DRUM MACHINE's 16TH output clocks
+// everything else.
 function euclidBossa() {
   const b = new Builder();
   const bass = (root: number, fifth: number) => phrase([[0, root, 5], [6, fifth, 2], [8, root, 5], [14, fifth, 2]]);
   const bank = (pats: object[]) => ({ pats, pr: ['', '', '', ''], rt: ['', '', '', ''], e: 0 });
-  const drums = b.add('drums', 10, 30, { bpm: 128, kit: 3, vol: 0.9 }, gridSteps({
-    name: 'BOSSA', rows: [[0, 3, 4, 7, 8, 11, 12, 15], [], [0, 2, 4, 6, 8, 10, 12, 14], [], []],
-  }, 5));
+  const shaker = [0, 2, 4, 6, 8, 10, 12, 14];
+  const drums = b.add('drums', 10, 30, { adv: 1, bpm: 128, kit: 3, vol: 0.9 }, bank([
+    gridSteps({ name: 'INTRO', rows: [[0, 8], [], shaker, [], []] }, 5),
+    gridSteps({ name: 'BOSSA', rows: [[0, 3, 4, 7, 8, 11, 12, 15], [], shaker, [], []] }, 5),
+    [], [],
+  ]));
+  // Sections: lengths in bars, then per lane a value per section.
+  //                     INTRO  A  B  A  OUTRO
+  const arranger = b.add('arranger', 10, 190, {}, {
+    l: [4, 4, 4, 4, 4, 0, 0, 0],
+    c: [
+      [0, 1, 1, 1, 0, 0, 0, 0], // P1: drum pattern
+      [0, 0, 0, 0, 0, 0, 0, 0], // P2
+      [0, 1, 0, 1, 0, 0, 0, 0], // G1: tune A
+      [0, 0, 1, 0, 0, 0, 0, 0], // G2: tune B
+      [0.25, 0.25, 0.25, 0.25, 1, 0, 0, 0], // C1: reverb mix
+      [0, 0, 0, 0, 0, 0, 0, 0], // C2
+    ],
+  });
   const euclid = b.add('euclid', 186, 30, { steps: 16, hits: 5, rot: 6 });
   const rim = b.add('snare', 260, 30, { kit: 2, tune: 190, snap: 0.2, dec: 0.05 });
   // scale degrees in C major: 0 C, 1 D, 2 E, 3 F, 4 G, 5 A, 6 B, 7 C
-  const bassLine = b.add('melody', 10, 180, { adv: 1, chain: 4, scale: 0, root: 0, oct: 2, gate: 0.9 },
+  const bassLine = b.add('melody', 10, 320, { adv: 1, chain: 4, scale: 0, root: 0, oct: 2, gate: 0.9 },
     bank([bass(1, 5), bass(4, 1), bass(0, 4), bass(5, 2)]));
-  const tune = b.add('melody', 186, 110, { adv: 1, chain: 4, scale: 0, root: 0, oct: 4, gate: 0.8 }, bank([
+  const tuneA = b.add('melody', 186, 110, { adv: 1, chain: 4, scale: 0, root: 0, oct: 4, gate: 0.8 }, bank([
     phrase([[0, 5, 2], [3, 4, 2], [6, 3, 3], [10, 2, 2], [13, 1, 3]]),
     phrase([[0, 3, 8], [10, 6, 2], [13, 4, 3]]),
     phrase([[0, 2, 8], [10, 4, 2], [13, 6, 3]]),
     phrase([[0, 7, 5], [6, 5, 8]]),
   ]));
-  const bassVoice = b.add('synth', 186, 250, { wave: 2, cut: 0.3, res: 1, env: 0.2, dec: 0.4 });
-  const lead = b.add('synth', 356, 110, { wave: 3, cut: 0.5, res: 1, env: 0.15, dec: 0.6 });
-  const delay = b.add('delay', 430, 110, { time: 0.35, fb: 0.3, mix: 0.25 });
+  const tuneB = b.add('melody', 186, 250, { adv: 1, chain: 4, scale: 0, root: 0, oct: 4, gate: 0.8 }, bank([
+    phrase([[0, 3, 2], [2, 5, 2], [4, 7, 4], [10, 5, 2], [12, 3, 4]]),
+    phrase([[0, 6, 3], [4, 4, 2], [6, 3, 2], [8, 1, 6]]),
+    phrase([[0, 2, 2], [3, 4, 2], [6, 6, 4], [12, 7, 4]]),
+    phrase([[0, 5, 6], [8, 4, 2], [10, 2, 6]]),
+  ]));
+  const bassVoice = b.add('synth', 186, 390, { wave: 2, cut: 0.3, res: 1, env: 0.2, dec: 0.4 });
+  const leadA = b.add('synth', 356, 110, { wave: 3, cut: 0.5, res: 1, env: 0.15, dec: 0.6 });
+  const leadB = b.add('synth', 356, 250, { wave: 3, cut: 0.55, res: 1, env: 0.15, dec: 0.6 });
+  const vcaA = b.add('vca', 430, 110);
+  const vcaB = b.add('vca', 430, 250);
+  const delay = b.add('delay', 490, 110, { time: 0.05 + (0.95 * 3) / 6, fb: 0.3, mix: 0.25 });
   const mixer = b.add('mixer', 334, 30, { l0: 0.8, l1: 0.5, l2: 0.8, l3: 0.6 });
-  const reverb = b.add('reverb', 410, 30, { size: 0.5, mix: 0.25 });
+  const reverb = b.add('reverb', 410, 30, { size: 0.5, mix: 0.15 });
   const speaker = b.add('speaker', 470, 30);
-  b.wire(drums, 'sync', euclid, 'clk');
-  b.wire(drums, 'sync', bassLine, 'clk');
-  b.wire(drums, 'sync', tune, 'clk');
+  for (const m of [euclid, bassLine, tuneA, tuneB, arranger, delay]) b.wire(drums, 'sync', m, 'clk');
+  b.wire(arranger, 'o0', drums, 'pat');
+  b.wire(arranger, 'o2', vcaA, 'cv');
+  b.wire(arranger, 'o3', vcaB, 'cv');
+  b.wire(arranger, 'o4', reverb, 'cv');
   b.wire(euclid, 'out', rim, 'in');
   b.play(bassLine, bassVoice);
-  b.play(tune, lead);
-  b.wire(lead, 'out', delay, 'in');
+  b.play(tuneA, leadA);
+  b.play(tuneB, leadB);
+  b.wire(leadA, 'out', vcaA, 'in');
+  b.wire(leadB, 'out', vcaB, 'in');
+  b.wire(vcaA, 'out', delay, 'in');
+  b.wire(vcaB, 'out', delay, 'in');
   b.wire(drums, 'out', mixer, 'i0');
   b.wire(rim, 'out', mixer, 'i1');
   b.wire(bassVoice, 'out', mixer, 'i2');
@@ -240,7 +276,7 @@ function fmPiano() {
   const amp = b.add('env', 450, 100, { a: 0.05, d: 0.8, s: 0.2, r: 0.6 });
   const delay = b.add('delay', 584, 30, { time: 0.36, fb: 0.35, mix: 0.25 });
   const reverb = b.add('reverb', 644, 30, { size: 0.7, mix: 0.35 });
-  const speaker = b.add('speaker', 584, 100);
+  const speaker = b.add('speaker', 584, 110);
   b.wire(keys, 'pit', mod, 'cv');
   b.wire(keys, 'pit', carrier, 'cv');
   b.wire(keys, 'gate', bright, 'in');
@@ -289,8 +325,7 @@ function industrial() {
 }
 
 // A I-vi-IV-V progression of 7th chords, gently crushed, over a lazy beat. One melody
-// plays the roots; ATTEN shifts its pitch CV up by 3.5 and 10.5 semitones and QUANT
-// snaps that to F major, which lands on each chord's own third and seventh.
+// plays the roots; CHORD (DIA, in F) gives each root its own third and seventh.
 function lofiChords() {
   const b = new Builder();
   const clock = b.add('clock', 10, 30, { bpm: 78, swing: 0.3 });
@@ -315,14 +350,12 @@ function lofiChords() {
   });
   b.play(melody, synth);
   b.wire(wow, 'out', synth, 'cv');
-  for (const [i, semis] of [3.5, 10.5].entries()) {
-    const y = 240 + i * 80;
-    const shift = b.add('atten', 256, y, { amt: 1, ofs: semis / 12 });
-    const quant = b.add('quant', 314, y, { root: 5, scale: 0 });
-    const voice = b.add('synth', 386, y, { wave: 2, cut: 0.38, res: 2, env: 0.2, dec: 0.8 });
-    b.wire(melody, 'pit', shift, 'in');
-    b.wire(shift, 'out', quant, 'in');
-    b.wire(quant, 'out', voice, 'pit');
+  // CHORD stacks thirds in F major on each bass note: its 3rd and 7th play two more voices.
+  const chord = b.add('chord', 256, 240, { type: 7, key: 5 });
+  b.wire(melody, 'pit', chord, 'in');
+  for (const [i, out] of ['o1', 'o3'].entries()) {
+    const voice = b.add('synth', 386, 240 + i * 80, { wave: 2, cut: 0.38, res: 2, env: 0.2, dec: 0.8 });
+    b.wire(chord, out, voice, 'pit');
     b.wire(melody, 'gate', voice, 'gate');
     b.wire(wow, 'out', voice, 'cv');
     b.wire(voice, 'out', crush, 'in');

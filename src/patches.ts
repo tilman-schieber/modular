@@ -1,7 +1,7 @@
-import { beatSteps, MELODY_PRESETS, melodyState } from './modules';
+import { beatSteps, drumSteps, MELODY_PRESETS, melodyState } from './modules';
 
 export interface PatchData {
-  mods: { id: number; type: string; x: number; y: number; p: Record<string, number>; s?: unknown }[];
+  mods: { id: number; type: string; x: number; y: number; p: Record<string, number>; s?: unknown; cc?: Record<string, number> }[];
   cables: { a: number; ap: string; b: number; bp: string }[];
 }
 
@@ -24,6 +24,12 @@ class Builder {
   melody(x: number, y: number, preset: string, p: Record<string, number> = {}) {
     const pre = MELODY_PRESETS.find((m) => m.name === preset)!;
     return this.add('melody', x, y, { scale: pre.scale, ...p }, melodyState(preset));
+  }
+
+  // Pitch and gate from a MELODY or KEYS into a SYNTH.
+  play(src: number, synth: number) {
+    this.wire(src, 'pit', synth, 'pit');
+    this.wire(src, 'gate', synth, 'gate');
   }
 
   // A melody from scratch: rows per step (-1 = rest).
@@ -51,7 +57,7 @@ function groove() {
     b.wire(d, 'out', mixer, 'i' + i);
   });
   b.wire(mixer, 'out', speaker, 'in');
-  b.wire(melody, 'note', synth, 'in');
+  b.play(melody, synth);
   b.wire(lfo, 'out', synth, 'cv');
   b.wire(synth, 'out', delay, 'in');
   b.wire(delay, 'out', reverb, 'in');
@@ -80,7 +86,7 @@ function acid() {
   b.wire(kick, 'out', mixer, 'i0');
   b.wire(hat, 'out', mixer, 'i1');
   b.wire(clap, 'out', mixer, 'i2');
-  b.wire(melody, 'note', synth, 'in');
+  b.play(melody, synth);
   b.wire(lfo, 'out', synth, 'cv');
   b.wire(synth, 'out', delay, 'in');
   b.wire(delay, 'out', mixer, 'i3');
@@ -101,13 +107,9 @@ function voice() {
   const env = b.add('env', 256, 100, { a: 0.05, d: 0.55, s: 0.2, r: 0.5 });
   const lfo = b.add('lfo', 340, 100, { rate: 0.55, depth: 0.02 });
   const speaker = b.add('speaker', 450, 100);
-  // Play the same voice live from the computer keyboard.
-  const keys = b.add('keys', 82, 142);
   b.wire(clock, 'o16', melody, 'clk');
-  b.wire(melody, 'note', osc, 'in');
-  b.wire(melody, 'note', env, 'in');
-  b.wire(keys, 'note', osc, 'in');
-  b.wire(keys, 'note', env, 'in');
+  b.wire(melody, 'pit', osc, 'cv');
+  b.wire(melody, 'gate', env, 'in');
   b.wire(lfo, 'out', osc, 'cv');
   b.wire(osc, 'out', filter, 'in');
   b.wire(env, 'out', filter, 'cv');
@@ -123,8 +125,10 @@ function ambient() {
   const b = new Builder();
   const clock = b.add('clock', 10, 30, { bpm: 70 });
   const melody = b.melody(82, 30, 'DRONE', { oct: 3, gate: 1 });
-  const oscA = b.add('osc', 256, 30, { wave: 0, glide: 0.3 });
-  const oscB = b.add('osc', 256, 90, { wave: 2, oct: 1, glide: 0.3 });
+  const oscA = b.add('osc', 256, 30, { wave: 0 });
+  const oscB = b.add('osc', 256, 90, { wave: 2, oct: 1 });
+  // Glide: the pitch CV goes through a SLEW.
+  const slew = b.add('slew', 176, 200, { time: 0.9 });
   const noise = b.add('noise', 256, 150, { tone: 0.5, lvl: 0.12 });
   const drift = b.add('lfo', 176, 140, { rate: 0.15, depth: 0.015 });
   const mixer = b.add('mixer', 330, 40, { l0: 0.6, l1: 0.5, l2: 0.6 });
@@ -134,8 +138,9 @@ function ambient() {
   const delay = b.add('delay', 528, 40, { time: 0.8, fb: 0.6, mix: 0.4 });
   const speaker = b.add('speaker', 468, 110);
   b.wire(clock, 'o16', melody, 'clk');
-  b.wire(melody, 'note', oscA, 'in');
-  b.wire(melody, 'note', oscB, 'in');
+  b.wire(melody, 'pit', slew, 'in');
+  b.wire(slew, 'out', oscA, 'cv');
+  b.wire(slew, 'out', oscB, 'cv');
   b.wire(drift, 'out', oscB, 'cv');
   b.wire(oscA, 'out', mixer, 'i0');
   b.wire(oscB, 'out', mixer, 'i1');
@@ -170,7 +175,7 @@ function boomBap() {
   b.wire(kick, 'out', mixer, 'i0');
   b.wire(snare, 'out', mixer, 'i1');
   b.wire(hat, 'out', mixer, 'i2');
-  b.wire(melody, 'note', synth, 'in');
+  b.play(melody, synth);
   b.wire(synth, 'out', mixer, 'i3');
   b.wire(mixer, 'out', filter, 'in');
   b.wire(wobble, 'out', filter, 'cv');
@@ -189,7 +194,7 @@ function dubTechno() {
   const clap = b.add('clap', 256, 80, { kit: 2, tone: 2200, dec: 0.08 });
   const mixer = b.add('mixer', 378, 40, { l1: 0.5, l2: 0.35, l3: 0.7 });
   const speaker = b.add('speaker', 458, 60);
-  const melody = b.melody(82, 116, 'STABS', { scale: 1, root: 2, oct: 3, gate: 0.25, chord: 2 });
+  const melody = b.melody(82, 116, 'STABS', { scale: 1, root: 2, oct: 3, gate: 0.25 });
   const stab = b.add('synth', 256, 146, { wave: 0, cut: 0.38, res: 7, env: 0.45, dec: 0.12 });
   const lfo = b.add('lfo', 192, 226, { rate: 0.12, shape: 1, depth: 0.3 });
   const delay = b.add('delay', 334, 160, { time: 0.375, fb: 0.62, mix: 0.5 });
@@ -203,8 +208,18 @@ function dubTechno() {
   b.wire(kick, 'out', mixer, 'i0');
   b.wire(hat, 'out', mixer, 'i1');
   b.wire(clap, 'out', mixer, 'i2');
-  b.wire(melody, 'note', stab, 'in');
-  b.wire(melody, 'note', sub, 'in');
+  b.play(melody, stab);
+  b.play(melody, sub);
+  // The minor stab chord: two more voices, their pitch CV shifted up 3 and 7 semitones.
+  for (const [i, semis] of [3, 7].entries()) {
+    const shift = b.add('atten', 460, 160 + i * 60, { amt: 1, ofs: semis / 12 });
+    const voice = b.add('synth', 520, 146 + i * 80, { wave: 0, cut: 0.38, res: 7, env: 0.45, dec: 0.12 });
+    b.wire(melody, 'pit', shift, 'in');
+    b.wire(shift, 'out', voice, 'pit');
+    b.wire(melody, 'gate', voice, 'gate');
+    b.wire(lfo, 'out', voice, 'cv');
+    b.wire(voice, 'out', delay, 'in');
+  }
   b.wire(sub, 'out', mixer, 'i3');
   b.wire(lfo, 'out', stab, 'cv');
   b.wire(stab, 'out', delay, 'in');
@@ -231,7 +246,7 @@ function disco() {
     b.wire(d, 'out', mixer, 'i' + i);
   });
   b.wire(mixer, 'out', speaker, 'in');
-  b.wire(melody, 'note', synth, 'in');
+  b.play(melody, synth);
   b.wire(synth, 'out', delay, 'in');
   b.wire(delay, 'out', speaker, 'in');
   return b.data;
@@ -262,7 +277,7 @@ function euclidJam() {
   const speaker = b.add('speaker', 400, 110);
   b.wire(clock, 'o16', divider, 'in');
   b.wire(divider, 'd2', melody, 'clk');
-  b.wire(melody, 'note', synth, 'in');
+  b.play(melody, synth);
   b.wire(synth, 'out', mixer, 'i4');
   b.wire(mixer, 'out', reverb, 'in');
   b.wire(reverb, 'out', speaker, 'in');
@@ -290,7 +305,7 @@ function generative() {
   b.wire(clock, 'o16', euclid, 'clk');
   b.wire(chance, 'a', hat, 'in');
   b.wire(euclid, 'out', kick, 'in');
-  b.wire(melody, 'note', synth, 'in');
+  b.play(melody, synth);
   b.wire(snh, 'out', synth, 'cv');
   b.wire(wobble, 'out', delay, 'cv');
   b.wire(synth, 'out', delay, 'in');
@@ -307,9 +322,7 @@ function generative() {
 // Play it on KEYS too.
 function fmPiano() {
   const b = new Builder();
-  const clock = b.add('clock', 10, 30, { bpm: 84 });
-  const melody = b.melody(82, 30, 'ARP', { oct: 4, gate: 0.6, len: 12 });
-  const keys = b.add('keys', 82, 142, { oct: 4 });
+  const keys = b.add('keys', 82, 30, { oct: 4 });
   const mod = b.add('osc', 256, 30, { wave: 3, oct: 1 });
   const depth = b.add('vca', 330, 30);
   const atten = b.add('atten', 390, 30, { amt: 2.5 });
@@ -320,13 +333,10 @@ function fmPiano() {
   const delay = b.add('delay', 584, 30, { time: 0.36, fb: 0.35, mix: 0.25 });
   const reverb = b.add('reverb', 644, 30, { size: 0.7, mix: 0.35 });
   const speaker = b.add('speaker', 584, 100);
-  b.wire(clock, 'o16', melody, 'clk');
-  for (const src of [melody, keys]) {
-    b.wire(src, 'note', mod, 'in');
-    b.wire(src, 'note', carrier, 'in');
-    b.wire(src, 'note', bright, 'in');
-    b.wire(src, 'note', amp, 'in');
-  }
+  b.wire(keys, 'pit', mod, 'cv');
+  b.wire(keys, 'pit', carrier, 'cv');
+  b.wire(keys, 'gate', bright, 'in');
+  b.wire(keys, 'gate', amp, 'in');
   b.wire(mod, 'out', depth, 'in');
   b.wire(bright, 'out', depth, 'cv');
   b.wire(depth, 'out', atten, 'in');
@@ -362,7 +372,7 @@ function industrial() {
   b.wire(snare, 'out', crush, 'in');
   b.wire(crush, 'out', mixer, 'i1');
   b.wire(hat, 'out', mixer, 'i2');
-  b.wire(melody, 'note', synth, 'in');
+  b.play(melody, synth);
   b.wire(synth, 'out', fold, 'in');
   b.wire(fold, 'out', drive, 'in');
   b.wire(drive, 'out', mixer, 'i3');
@@ -370,7 +380,9 @@ function industrial() {
   return b.data;
 }
 
-// A I-vi-IV-V progression of 7th chords, gently crushed, over a lazy beat.
+// A I-vi-IV-V progression of 7th chords, gently crushed, over a lazy beat. One melody
+// plays the roots; ATTEN shifts its pitch CV up by 3.5 and 10.5 semitones and QUANT
+// snaps that to F major, which lands on each chord's own third and seventh.
 function lofiChords() {
   const b = new Builder();
   const clock = b.add('clock', 10, 30, { bpm: 78, swing: 0.3 });
@@ -382,7 +394,7 @@ function lofiChords() {
   const speaker = b.add('speaker', 458, 60);
   const _ = -1;
   const melody = b.notes(82, 116, [0, _, _, _, 5, _, _, _, 3, _, _, _, 4, _, _, _],
-    { scale: 0, root: 5, oct: 3, gate: 1, chord: 3 });
+    { scale: 0, root: 5, oct: 3, gate: 1 });
   const synth = b.add('synth', 256, 150, { wave: 2, cut: 0.38, res: 2, env: 0.2, dec: 0.8 });
   const crush = b.add('crush', 334, 160, { bits: 8, rate: 3, lvl: 0.8 });
   const reverb = b.add('reverb', 398, 160, { size: 0.6, mix: 0.35 });
@@ -393,13 +405,113 @@ function lofiChords() {
     b.wire(beats, 'o' + i, d, 'in');
     b.wire(d, 'out', mixer, 'i' + i);
   });
-  b.wire(melody, 'note', synth, 'in');
+  b.play(melody, synth);
   b.wire(wow, 'out', synth, 'cv');
+  for (const [i, semis] of [3.5, 10.5].entries()) {
+    const y = 240 + i * 80;
+    const shift = b.add('atten', 256, y, { amt: 1, ofs: semis / 12 });
+    const quant = b.add('quant', 314, y, { root: 5, scale: 0 });
+    const voice = b.add('synth', 386, y, { wave: 2, cut: 0.38, res: 2, env: 0.2, dec: 0.8 });
+    b.wire(melody, 'pit', shift, 'in');
+    b.wire(shift, 'out', quant, 'in');
+    b.wire(quant, 'out', voice, 'pit');
+    b.wire(melody, 'gate', voice, 'gate');
+    b.wire(wow, 'out', voice, 'cv');
+    b.wire(voice, 'out', crush, 'in');
+  }
   b.wire(synth, 'out', crush, 'in');
   b.wire(crush, 'out', reverb, 'in');
   b.wire(reverb, 'out', mixer, 'i3');
   b.wire(mixer, 'out', speaker, 'in');
   return b.data;
+}
+
+// The classic generative patch: random voltages from S&H, snapped to A minor pentatonic
+// by QUANT, play the OSC through its 1V/oct input. A bass SYNTH plays the same pitch
+// CV on the beat.
+function quantized() {
+  const b = new Builder();
+  const clock = b.add('clock', 10, 30, { bpm: 104 });
+  const snh = b.add('snh', 82, 30, { depth: 1 });
+  const chance = b.add('chance', 82, 96, { prob: 0.7 });
+  const kick = b.add('kick', 82, 160, { kit: 3 });
+  const quant = b.add('quant', 142, 30, { root: 9, scale: 2 });
+  const osc = b.add('osc', 216, 30, { wave: 1 });
+  const env = b.add('env', 216, 96, { a: 0, d: 0.45, s: 0.1, r: 0.45 });
+  const filter = b.add('filter', 290, 30, { cut: 0.4, res: 6 });
+  const synth = b.add('synth', 290, 96, { wave: 0, oct: -1, cut: 0.25, env: 0.5, dec: 0.4 });
+  const vca = b.add('vca', 350, 30);
+  const delay = b.add('delay', 410, 30, { time: 0.43, fb: 0.45, mix: 0.35 });
+  const reverb = b.add('reverb', 470, 30, { size: 0.7, mix: 0.3 });
+  const speaker = b.add('speaker', 530, 30);
+  b.wire(clock, 'o16', chance, 'in');
+  b.wire(chance, 'a', snh, 'trg');
+  b.wire(chance, 'a', env, 'in');
+  b.wire(snh, 'out', quant, 'in');
+  b.wire(quant, 'out', osc, 'cv');
+  b.wire(osc, 'out', filter, 'in');
+  b.wire(env, 'out', filter, 'cv');
+  b.wire(filter, 'out', vca, 'in');
+  b.wire(env, 'out', vca, 'cv');
+  b.wire(vca, 'out', delay, 'in');
+  b.wire(delay, 'out', reverb, 'in');
+  b.wire(reverb, 'out', speaker, 'in');
+  b.wire(clock, 'o4', synth, 'gate');
+  b.wire(quant, 'out', synth, 'pit');
+  b.wire(synth, 'out', speaker, 'in');
+  b.wire(clock, 'o4', kick, 'in');
+  b.wire(kick, 'out', speaker, 'in');
+  return b.data;
+}
+
+// Acid house in seven modules: one DRUM MACHINE plays the beat and clocks a MELODY
+// with accents and slides into a squelchy resonant SYNTH. A slow LFO sweeps the cutoff,
+// like a hand on the knob.
+function acidHouse() {
+  const b = new Builder();
+  const drums = b.add('drums', 10, 30, { bpm: 124, swing: 0.08, kit: 1 }, drumSteps('ACID'));
+  const melody = b.melody(186, 30, 'ACID', { oct: 2, gate: 0.5 });
+  const synth = b.add('synth', 356, 30, { wave: 0, cut: 0.18, res: 15, env: 0.75, dec: 0.22 });
+  const sweep = b.add('lfo', 356, 112, { rate: 0.22, shape: 1, depth: 0.45 });
+  const drive = b.add('drive', 430, 30, { drive: 0.45, tone: 0.7, lvl: 0.45 });
+  const delay = b.add('delay', 490, 30, { time: 0.363, fb: 0.35, mix: 0.2 });
+  const speaker = b.add('speaker', 550, 30);
+  b.wire(drums, 'sync', melody, 'clk');
+  b.play(melody, synth);
+  b.wire(sweep, 'out', synth, 'cv');
+  b.wire(synth, 'out', drive, 'in');
+  b.wire(drive, 'out', delay, 'in');
+  b.wire(delay, 'out', speaker, 'in');
+  b.wire(drums, 'out', speaker, 'in');
+  return b.data;
+}
+
+// Before pitch became a voltage, MELODY and KEYS sent NOTE cables. Rewire those as PIT
+// and GATE cables. Two of them into one voice would now add their pitches together, so
+// only the first source keeps its cables there; returns how many sources were unplugged.
+export function migrate(data: PatchData) {
+  const type = new Map(data.mods.map((m) => [m.id, m.type]));
+  const isNote = (c: PatchData['cables'][number]) => c.ap === 'note' && ['melody', 'keys'].includes(type.get(c.a) ?? '');
+  const pitchIn = (c: PatchData['cables'][number]) => {
+    const t = type.get(c.b);
+    return c.bp === 'in' && t === 'synth' ? 'pit' : c.bp === 'in' && t === 'osc' ? 'cv' : null;
+  };
+  const owner = new Map<string, number>(), losers = new Set<number>();
+  for (const c of data.cables.filter(isNote)) {
+    const jack = `${c.b}:${pitchIn(c)}`;
+    if (!pitchIn(c)) continue;
+    if (!owner.has(jack)) owner.set(jack, c.a);
+    else if (owner.get(jack) !== c.a) losers.add(c.a);
+  }
+  const cables = data.cables.flatMap((c) => {
+    if (!isNote(c)) return [c];
+    if (losers.has(c.a)) return [];
+    const pit = pitchIn(c);
+    if (pit === 'cv') return [{ ...c, ap: 'pit', bp: 'cv' }];
+    if (pit === 'pit') return [{ ...c, ap: 'pit', bp: 'pit' }, { ...c, ap: 'gate', bp: 'gate' }];
+    return [{ ...c, ap: 'gate' }];
+  });
+  return { data: { ...data, cables }, dropped: losers.size };
 }
 
 export const PATCHES: { name: string; build: () => PatchData }[] = [
@@ -415,5 +527,7 @@ export const PATCHES: { name: string; build: () => PatchData }[] = [
   { name: 'FM PIANO', build: fmPiano },
   { name: 'INDUSTRIAL', build: industrial },
   { name: 'LOFI CHORDS', build: lofiChords },
+  { name: 'QUANTIZED', build: quantized },
+  { name: 'ACID HOUSE', build: acidHouse },
   { name: 'EMPTY', build: () => ({ mods: [], cables: [] }) },
 ];

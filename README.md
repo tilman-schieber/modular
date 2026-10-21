@@ -5,9 +5,13 @@ with cables, press space.
 
 **Live:** https://gh.tschieber.de/modular/
 
-- Drum machine (808/909-style kits), step sequencers with accent and slide, chords
+- A one-module DRUM MACHINE (808/909/lo-fi kick, snare, hats, clap) with its own tempo,
+  or separate drum modules driven by a step sequencer
+- Pitch is a voltage (1 per octave) and gates are exactly timed triggers, as on a real
+  modular: sequencers and KEYS send PIT and GATE, QUANT snaps CV to a scale, SLEW glides
 - Synth voices, oscillators, noise, LFO, envelope, VCA, filter, delay, reverb, mixers
-- Play live from the computer keyboard or a MIDI keyboard
+- Play live from the computer keyboard or a MIDI keyboard (velocity, mod wheel, pitch bend, aftertouch, sustain)
+- MIDI clock in and out, and MIDI learn: Alt+click a knob, then move a control
 - Undo/redo, WAV recording, and share links that carry the whole patch
 
 ```sh

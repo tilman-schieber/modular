@@ -2,7 +2,7 @@ import { ac } from './audio';
 import { C, type Gfx } from './gfx';
 import type { Engine } from './engine';
 
-export type SigType = 'trig' | 'note' | 'audio' | 'cv';
+export type SigType = 'trig' | 'audio' | 'cv';
 export type Cat = 'util' | 'drum' | 'seq' | 'synth' | 'mod' | 'fx';
 
 // Category colours: `bar` is used for title bars and the matching toolbar menu.
@@ -15,13 +15,13 @@ export const CAT: Record<Cat, { name: string; bar: string; cap: string }> = {
   util: { name: 'OUTPUT', bar: C.slate, cap: C.silver },
 };
 
-export const TYPEC: Record<SigType, string> = { trig: C.yellow, note: C.sky, audio: C.red, cv: C.green };
+export const TYPEC: Record<SigType, string> = { trig: C.yellow, audio: C.red, cv: C.green };
 
-// Notes can also fire trigger inputs, and audio can drive CV inputs (for FM and
-// ring-mod sounds); everything else must match exactly.
-// CV cables are continuous control signals (roughly -1..1) that modulate knobs.
+// Audio can drive CV inputs (for FM and ring-mod sounds); everything else must match.
+// CV cables are continuous control signals: roughly -1..1 for modulation, or pitch
+// at 1 per octave. Trig cables carry gates and triggers as exactly timed events.
 export function compatible(out: SigType, inp: SigType) {
-  return out === inp || (out === 'note' && inp === 'trig') || (out === 'audio' && inp === 'cv');
+  return out === inp || (out === 'audio' && inp === 'cv');
 }
 
 // A CV input read from JS, for knobs that are used when scheduling rather than
@@ -42,15 +42,21 @@ export class CvTap {
   }
 }
 
-// An event on a trig/note cable: when it happens, how long it lasts, and optionally
-// a MIDI note, an accent, a slide (glide from the previous note without retriggering)
-// and how many notes sound together (for chords).
-// Live playing adds `hold` (sustain until a matching note-off) and `off` (the note-off itself).
+// A gate or trigger on a trig cable: when it opens and how long it stays open, plus
+// an accent and a slide (legato: the voice keeps sounding while the pitch CV glides).
+// Live playing adds `hold` (open until the gate-off), `off` (the gate-off itself)
+// and `vel` (MIDI velocity, 0..1). Pitch travels separately, as CV.
 export interface Ev {
-  t: number; dur: number; note?: number;
-  acc?: boolean; slide?: boolean; voices?: number;
-  hold?: boolean; off?: boolean;
+  t: number; dur: number;
+  acc?: boolean; slide?: boolean;
+  hold?: boolean; off?: boolean; vel?: number;
 }
+
+// Loudness for a velocity: soft notes stay audible, no velocity means full.
+export const velGain = (vel?: number) => (vel === undefined ? 1 : 0.25 + 0.75 * vel);
+
+// Pitch CV: 1 per octave, 0 is this MIDI note (C3, what OSC and SYNTH play with no pitch in).
+export const PITCH_REF = 48;
 
 export interface Port { id: string; label: string; type: SigType; dir: 'in' | 'out'; x: number; y: number }
 
@@ -73,6 +79,8 @@ export abstract class Mod {
   ports: Port[] = [];
   knobs: Knob[] = [];
   p: Record<string, number> = {};
+  // MIDI CC number mapped to each knob, by knob id.
+  cc: Record<string, number> = {};
 
   constructor(
     public eng: Engine, public type: string, public title: string,

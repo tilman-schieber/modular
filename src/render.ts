@@ -33,6 +33,8 @@ export function drawKnob(g: Gfx, m: Mod, k: Knob) {
   const a = (-135 + 270 * n) * (Math.PI / 180);
   g.line(cx, cy, cx + Math.round(Math.sin(a) * 4), cy - Math.round(Math.cos(a) * 4), C.black);
   g.textC(m.knobLabel(k), cx, k.y + 13, k.names ? cap : C.silver);
+  // A MIDI-mapped knob gets a small blue mark.
+  if (m.cc[k.id] !== undefined) g.rect(k.x + 10, k.y - 1, 2, 2, C.sky);
 }
 
 export function drawModule(g: Gfx, m: Mod, closeHover: boolean) {

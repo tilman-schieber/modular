@@ -1,7 +1,8 @@
 import { ac, cutHz, decay, noiseBuffer, noiseSrc } from './audio';
 import type { Engine } from './engine';
 import { C, type Gfx } from './gfx';
-import { CvTap, Mod, type Cat, type Drag, type Ev, type KnobDef, type SigType } from './mod';
+import { midi } from './midi';
+import { CvTap, Mod, PITCH_REF, velGain, type Cat, type Drag, type Ev, type KnobDef, type SigType } from './mod';
 import { drawButton } from './render';
 
 const now = () => performance.now();
@@ -49,42 +50,88 @@ function io(m: Mod, inType: SigType, inLabel = 'IN') {
 
 // ---------------------------------------------------------------- CLOCK
 
+// SYNC modes: run on the BPM knob, follow incoming MIDI clock, or run and send MIDI clock.
+const INT = 0, EXT = 1, OUT = 2;
+// Steps derived from incoming MIDI clock play this late, so they are never in the past.
+const MIDI_LATENCY = 0.03;
+
 export class Clock extends Mod {
   private next = 0;
   private n = 0;
   private beat = -1;
+  // Following MIDI clock (24 ticks per beat): ticks since start and a smoothed tick length.
+  private ticks = 0;
+  private lastTick = 0;
+  private tickLen = 60 / 120 / 24;
+  private unlisten: () => void;
 
   constructor(e: Engine) {
     super(e, 'clock', 'CLOCK', 'seq', 60, 68);
     this.knob({ id: 'bpm', label: 'BPM', x: 4, y: 32, min: 60, max: 200, def: 120, step: 1 });
     this.knob({ id: 'swing', label: 'SWG', x: 20, y: 32, min: 0, max: 0.5, def: 0, fmt: pct });
+    this.knob({ id: 'sync', label: 'SYN', x: 22, y: 51, min: 0, max: 2, def: INT, names: ['INT', 'EXT', 'OUT'] });
     this.port('o16', '16TH', 'trig', 'out', 47, 12);
     this.port('o4', 'BEAT', 'trig', 'out', 47, 32);
     this.port('cv', 'BPM', 'cv', 'in', 4, 51);
+    this.unlisten = midi.on((d, t) => this.midiIn(d, t));
   }
 
   private tap = new CvTap();
   audioIn() { return this.tap.in; }
 
-  // A CV of 1 adds 70 BPM.
-  private bpm() { return Math.min(300, Math.max(30, this.p.bpm + this.tap.read() * 70)); }
+  onParam(id: string, v: number) {
+    if (id === 'sync' && v !== INT) void midi.enable();
+  }
 
-  reset(t0: number) { this.next = t0; this.n = 0; this.beat = -1; }
+  // A CV of 1 adds 70 BPM.
+  private bpm() {
+    if (this.p.sync === EXT) return 60 / (24 * this.tickLen);
+    return Math.min(300, Math.max(30, this.p.bpm + this.tap.read() * 70));
+  }
+
+  reset(t0: number) {
+    this.next = t0; this.n = 0; this.beat = -1; this.ticks = 0;
+    // Engine.stop resets with t0 = 0.
+    if (this.p.sync === OUT) midi.send(t0 ? [0xfa] : [0xfc], t0 || undefined);
+  }
 
   schedule(until: number) {
+    if (this.p.sync === EXT) return;
     // Resync if we fell far behind (e.g. a backgrounded tab).
     if (this.next < ac.currentTime - 0.2) this.next = ac.currentTime + 0.02;
     while (this.next < until) {
       const dur = 15 / this.bpm();
-      const t = this.next + (this.n % 2 ? this.p.swing * dur : 0);
-      const n = this.n;
-      this.emit('o16', { t, dur });
-      if (n % 4 === 0) this.emit('o4', { t, dur: dur * 4 });
-      this.eng.at(t, () => (this.beat = n));
+      this.step(this.n, this.next + (this.n % 2 ? this.p.swing * dur : 0), dur);
+      // Six MIDI clock ticks per 16th, on the straight grid.
+      if (this.p.sync === OUT) for (let i = 0; i < 6; i++) midi.send([0xf8], this.next + (i * dur) / 6);
       this.n++;
       this.next += dur;
     }
   }
+
+  private step(n: number, t: number, dur: number) {
+    this.emit('o16', { t, dur });
+    if (n % 4 === 0) this.emit('o4', { t, dur: dur * 4 });
+    this.eng.at(t, () => (this.beat = n));
+  }
+
+  private midiIn(d: Uint8Array, t: number) {
+    if (this.p.sync !== EXT) return;
+    const st = d[0];
+    if (st === 0xfa || (st === 0xfb && !this.eng.running)) this.eng.start();
+    else if (st === 0xfc) this.eng.stop();
+    if (st !== 0xf8 || !this.eng.running) return;
+    const gap = t - this.lastTick;
+    if (gap > 0 && gap < 0.1) this.tickLen += (gap - this.tickLen) * 0.1;
+    this.lastTick = t;
+    const tick = this.ticks++;
+    if (tick % 6) return;
+    const n = tick / 6, dur = this.tickLen * 6;
+    const at = Math.max(t, ac.currentTime) + MIDI_LATENCY + (n % 2 ? this.p.swing * dur : 0);
+    this.step(n, at, dur);
+  }
+
+  destroy() { this.unlisten(); }
 
   drawBody(g: Gfx) {
     g.rect(3, 12, 39, 16, C.black);
@@ -112,60 +159,73 @@ export const BEAT_PRESETS: { name: string; rows: number[][] }[] = [
   { name: 'HALFTIME', rows: [[0, 3, 10], [8], [0, 4, 8, 12, 14], [8]] },
 ];
 
-// Five step strings: the four drum rows plus an (empty) accent row.
+interface GridPreset { name: string; rows: number[][] }
+
+// Step strings for a grid preset: one per row, plus the accent row.
+export function gridSteps(pre: GridPreset, rows: number) {
+  return Array.from({ length: rows + 1 }, (_, r) =>
+    Array.from({ length: 16 }, (_, i) => (pre.rows[r]?.includes(i) ? '1' : '0')).join(''));
+}
+
 export function beatSteps(name: string) {
-  const pre = BEAT_PRESETS.find((b) => b.name === name)!;
-  return [0, 1, 2, 3, 4].map((r) => Array.from({ length: 16 }, (_, i) => (pre.rows[r]?.includes(i) ? '1' : '0')).join(''));
+  return gridSteps(BEAT_PRESETS.find((b) => b.name === name)!, 4);
 }
 
 const ROW_COLS = [C.red, C.orange, C.yellow, C.lime];
-const ACC = 4; // index of the accent row
 
-export class Beats extends Mod {
-  steps: boolean[][] = [0, 1, 2, 3, 4].map(() => Array(16).fill(false));
+// A 16-step trigger grid with one row per sound and an accent row under them, plus
+// preset, random and clear buttons. Subclasses decide what a lit step does.
+abstract class StepGrid extends Mod {
+  steps: boolean[][];
   private pos = -1;
   private shown = -1;
   private preset = -1;
 
-  constructor(e: Engine) {
-    super(e, 'beats', 'BEATS', 'seq', 160, 80);
+  constructor(
+    e: Engine, type: string, title: string, w: number, h: number,
+    private rows: { name: string; col: string }[], private presets: GridPreset[],
+  ) {
+    super(e, type, title, 'seq', w, h);
+    this.steps = [...rows, null].map(() => Array(16).fill(false));
     this.port('clk', 'CLK', 'trig', 'in', 4, 12);
-    ROW_NAMES.forEach((_, r) => this.port('o' + r, '', 'trig', 'out', 147, 16 + r * 10));
-    this.knob({ id: 'len', label: 'LEN', x: 4, y: 31, min: 1, max: 16, def: 16, step: 1 });
   }
 
   static cellX(c: number) { return 26 + c * 7 + (c >> 2) * 2; }
 
+  private get acc() { return this.rows.length; }
+  // Where the preset bar and buttons sit, under the accent row.
+  protected get barY() { return 18 + (this.rows.length + 1) * 10; }
+
   private cellAt(lx: number, ly: number) {
     const r = Math.floor((ly - 16) / 10);
-    if (r < 0 || r > ACC || ly - 16 - r * 10 > 8) return null;
+    if (r < 0 || r > this.acc || ly - 16 - r * 10 > 8) return null;
     for (let c = 0; c < 16; c++) {
-      const x = Beats.cellX(c);
+      const x = StepGrid.cellX(c);
       if (lx >= x && lx < x + 7) return { r, c };
     }
     return null;
   }
 
-  reset() { this.pos = -1; this.shown = -1; }
+  reset(_t0: number) { this.pos = -1; this.shown = -1; }
 
-  onEvent(port: string, ev: Ev) {
-    if (port !== 'clk' || ev.off) return;
+  // Advance one step and call play for each lit row, with the step's accent.
+  protected step(ev: Ev, play: (row: number, ev: Ev) => void) {
     const s = (this.pos = (this.pos + 1) % this.p.len);
     this.eng.at(ev.t, () => (this.shown = s));
-    const out = { ...ev, acc: this.steps[ACC][s] };
-    for (let r = 0; r < ACC; r++) if (this.steps[r][s]) this.emit('o' + r, out);
+    const out = { ...ev, acc: this.steps[this.acc][s] };
+    for (let r = 0; r < this.acc; r++) if (this.steps[r][s]) play(r, out);
   }
 
   drawBody(g: Gfx) {
     const len = this.p.len;
     for (let c = 0; c < len; c++) {
-      g.rect(Beats.cellX(c), 13, 6, 2, c === this.shown ? C.lime : C.black);
+      g.rect(StepGrid.cellX(c), 13, 6, 2, c === this.shown ? C.lime : C.black);
     }
     this.steps.forEach((row, r) => {
-      const y = 16 + r * 10, col = r === ACC ? C.white : ROW_COLS[r];
-      g.text(r === ACC ? 'AC' : ROW_NAMES[r], 16, y + 2, col);
+      const y = 16 + r * 10, col = r === this.acc ? C.white : this.rows[r].col;
+      g.text(r === this.acc ? 'AC' : this.rows[r].name, 16, y + 2, col);
       row.forEach((on, c) => {
-        const x = Beats.cellX(c), cur = c === this.shown;
+        const x = StepGrid.cellX(c), cur = c === this.shown;
         if (c >= len) {
           // steps past the pattern length are inactive
           g.rect(x, y, 6, 8, on ? C.slate : C.black);
@@ -179,28 +239,31 @@ export class Beats extends Mod {
         }
       });
     });
-    drawPresetBar(g, 26, 68, this.preset < 0 ? 'PRESET' : BEAT_PRESETS[this.preset].name);
-    drawButton(g, 100, 68, 22, 'RND', C.yellow);
-    drawButton(g, 124, 68, 22, 'CLR', C.silver);
+    const y = this.barY;
+    drawPresetBar(g, 26, y, this.preset < 0 ? 'PRESET' : this.presets[this.preset].name);
+    drawButton(g, 100, y, 22, 'RND', C.yellow);
+    drawButton(g, 124, y, 22, 'CLR', C.silver);
   }
 
   press(lx: number, ly: number): Drag | null {
-    const dir = presetStep(lx, ly, 26, 68);
+    const y = this.barY;
+    const dir = presetStep(lx, ly, 26, y);
     if (dir) {
-      const n = BEAT_PRESETS.length;
+      const n = this.presets.length;
       this.preset = (((this.preset < 0 && dir < 0 ? 0 : this.preset) + dir) % n + n) % n;
-      this.load(beatSteps(BEAT_PRESETS[this.preset].name));
+      this.load(gridSteps(this.presets[this.preset], this.acc));
       this.eng.dirty = true;
       return noDrag;
     }
-    if (inBtn(lx, ly, 100, 68, 22)) {
+    if (inBtn(lx, ly, 100, y, 22)) {
+      // Kick, snare, hats, then everything else; the kick favours the downbeats.
       const density = [0.3, 0.15, 0.6, 0.12, 0.15];
       this.steps = this.steps.map((_, r) => Array.from({ length: 16 }, (_, c) =>
-        r === 0 && c % 4 === 0 ? Math.random() < 0.8 : Math.random() < density[r]));
+        r === 0 && c % 4 === 0 ? Math.random() < 0.8 : Math.random() < density[Math.min(r, 4)]));
       this.eng.dirty = true;
       return noDrag;
     }
-    if (inBtn(lx, ly, 124, 68, 22)) {
+    if (inBtn(lx, ly, 124, y, 22)) {
       this.steps = this.steps.map(() => Array(16).fill(false));
       this.eng.dirty = true;
       return noDrag;
@@ -224,6 +287,19 @@ export class Beats extends Mod {
     s.forEach((row, r) => {
       if (typeof row === 'string' && this.steps[r]) this.steps[r] = [...row.padEnd(16, '0')].slice(0, 16).map((ch) => ch === '1');
     });
+  }
+}
+
+// A trigger sequencer: one output per row, to patch into separate drum modules.
+export class Beats extends StepGrid {
+  constructor(e: Engine) {
+    super(e, 'beats', 'BEATS', 160, 80, ROW_NAMES.map((name, r) => ({ name, col: ROW_COLS[r] })), BEAT_PRESETS);
+    ROW_NAMES.forEach((_, r) => this.port('o' + r, '', 'trig', 'out', 147, 16 + r * 10));
+    this.knob({ id: 'len', label: 'LEN', x: 4, y: 31, min: 1, max: 16, def: 16, step: 1 });
+  }
+
+  onEvent(port: string, ev: Ev) {
+    if (port === 'clk' && !ev.off) this.step(ev, (r, out) => this.emit('o' + r, out));
   }
 }
 
@@ -552,6 +628,99 @@ export class Cowbell extends Drum {
   }
 }
 
+// ---------------------------------------------------------------- DRUM MACHINE
+
+const DM_ROWS = [
+  { name: 'BD', col: C.red }, { name: 'SD', col: C.orange }, { name: 'CH', col: C.yellow },
+  { name: 'OH', col: C.cyan }, { name: 'CP', col: C.lime },
+];
+// Mix level per row.
+const DM_LEVELS = [1, 0.8, 0.45, 0.4, 0.7];
+const DM_KITS = ['808', '909', 'LOFI'];
+
+// A few patterns with open hats, then the BEATS ones (whose hats become closed hats).
+export const DM_PRESETS: GridPreset[] = [
+  { name: 'ACID', rows: [[0, 4, 8, 12], [], [0, 1, 3, 4, 5, 7, 8, 9, 11, 12, 13, 15], [2, 6, 10, 14], [4, 12], [2, 6, 10, 14]] },
+  { name: 'JACK', rows: [[0, 4, 8, 12], [4, 12], [0, 2, 4, 6, 8, 10, 12, 14], [2, 6, 10, 14], [], [0, 8]] },
+  { name: 'OFFBEAT', rows: [[0, 4, 8, 12], [], [], [2, 6, 10, 14], [4, 12]] },
+  ...BEAT_PRESETS.map((b) => ({ name: b.name, rows: [b.rows[0], b.rows[1], b.rows[2], [], b.rows[3]] })),
+];
+
+export function drumSteps(name: string) {
+  return gridSteps(DM_PRESETS.find((p) => p.name === name)!, DM_ROWS.length);
+}
+
+// A complete drum machine in one module: a step grid playing its own kick, snare,
+// closed and open hat and clap, on its own tempo. Patch a clock into CLK to follow it
+// instead; 16TH sends its steps on, to drive a MELODY or another sequencer.
+export class DrumMachine extends StepGrid {
+  out = ac.createGain();
+  private voices: Drum[];
+  private next = 0;
+  private n = 0;
+
+  constructor(e: Engine) {
+    super(e, 'drums', 'DRUM MACHINE', 166, 110, DM_ROWS, DM_PRESETS);
+    this.voices = [new Kick(e), new Snare(e), new HiHat(e), new HiHat(e), new Clap(e)];
+    this.voices.forEach((v, r) => {
+      const g = ac.createGain();
+      g.gain.value = DM_LEVELS[r];
+      v.out.connect(g).connect(this.out);
+    });
+    this.port('out', 'OUT', 'audio', 'out', 151, 12);
+    this.port('sync', '16TH', 'trig', 'out', 151, 33);
+    const y = this.barY + 12;
+    [
+      { id: 'bpm', label: 'BPM', min: 60, max: 200, def: 124, step: 1 },
+      { id: 'swing', label: 'SWG', min: 0, max: 0.5, def: 0, fmt: pct },
+      { id: 'len', label: 'LEN', min: 1, max: 16, def: 16, step: 1 },
+      { id: 'kit', label: 'KIT', min: 0, max: 2, def: 1, names: DM_KITS },
+      { id: 'vol', label: 'VOL', min: 0, max: 1.5, def: 1, fmt: pct },
+    ].forEach((k, i) => this.knob({ ...k, x: 26 + i * 18, y }));
+  }
+
+  onParam(id: string, v: number) {
+    if (id === 'vol') this.out.gain.setTargetAtTime(v, ac.currentTime, 0.01);
+    if (id !== 'kit' || !this.voices) return;
+    this.voices.forEach((d, r) => {
+      const kit = Math.max(0, d.kits.findIndex((k) => k.name === DM_KITS[v]));
+      d.set('kit', kit);
+      for (const [k, val] of Object.entries(d.kits[kit].set)) d.set(k, val);
+      // the second hat is the open one
+      if (r === 3) d.set('dec', 0.35);
+    });
+  }
+
+  reset(t0: number) {
+    super.reset(t0);
+    this.next = t0;
+    this.n = 0;
+  }
+
+  // Runs on its own BPM unless a clock is patched into CLK.
+  schedule(until: number) {
+    if (this.eng.cablesAt(this, 'clk').length) return;
+    if (this.next < ac.currentTime - 0.2) this.next = ac.currentTime + 0.02;
+    while (this.next < until) {
+      const dur = 15 / this.p.bpm;
+      this.play({ t: this.next + (this.n % 2 ? this.p.swing * dur : 0), dur });
+      this.n++;
+      this.next += dur;
+    }
+  }
+
+  onEvent(port: string, ev: Ev) {
+    if (port === 'clk' && !ev.off) this.play(ev);
+  }
+
+  private play(ev: Ev) {
+    this.emit('sync', ev);
+    this.step(ev, (r, out) => this.voices[r].onEvent('in', out));
+  }
+
+  audioOut() { return this.out; }
+}
+
 // ---------------------------------------------------------------- MELODY
 
 const SCALE_NAMES = ['MAJ', 'MIN', 'PEN', 'BLU'];
@@ -577,13 +746,15 @@ export function melodyState(name: string) {
   return { n: pre.notes, a: bits(pre.acc), s: bits(pre.slide) };
 }
 
-// Chord shapes as stacked scale degrees.
-const CHORDS = [[0], [0, 4], [0, 2, 4], [0, 2, 4, 6]];
+// How fast a slide glides to its note (time constant, seconds).
+const SLIDE_TC = 0.025;
 
 export class Melody extends Mod {
   notes: number[] = Array(16).fill(-1);
   acc: boolean[] = Array(16).fill(false);
   slide: boolean[] = Array(16).fill(false);
+  pit = cvSource();
+  accCv = cvSource();
   private pos = -1;
   private shown = -1;
   private preset = -1;
@@ -591,14 +762,18 @@ export class Melody extends Mod {
   constructor(e: Engine) {
     super(e, 'melody', 'MELODY', 'seq', 160, 102);
     this.port('clk', 'CLK', 'trig', 'in', 4, 12);
-    this.port('note', 'OUT', 'note', 'out', 147, 12);
+    this.port('pit', 'PIT', 'cv', 'out', 147, 12);
+    this.port('gate', 'GAT', 'trig', 'out', 147, 33);
+    this.port('acc', 'ACC', 'cv', 'out', 147, 54);
     this.knob({ id: 'len', label: 'LEN', x: 4, y: 31, min: 1, max: 16, def: 16, step: 1 });
     this.knob({ id: 'root', label: 'KEY', x: 26, y: 80, min: 0, max: 11, def: 0, names: NOTE_NAMES });
     this.knob({ id: 'scale', label: 'SCL', x: 42, y: 80, min: 0, max: 3, def: 1, names: SCALE_NAMES });
     this.knob({ id: 'oct', label: 'OCT', x: 58, y: 80, min: 1, max: 5, def: 2, step: 1 });
     this.knob({ id: 'gate', label: 'GAT', x: 74, y: 80, min: 0.1, max: 1, def: 0.5, fmt: pct });
-    this.knob({ id: 'chord', label: 'CHD', x: 90, y: 80, min: 0, max: 3, def: 0, names: ['ONE', 'PWR', 'TRI', '7TH'] });
   }
+
+  audioOut(port: string) { return port === 'acc' ? this.accCv : this.pit; }
+  destroy() { this.pit.stop(); this.accCv.stop(); }
 
   private semi(r: number) {
     const sc = SCALES[this.p.scale];
@@ -609,7 +784,7 @@ export class Melody extends Mod {
 
   private colAt(lx: number) {
     for (let c = 0; c < 16; c++) {
-      const x = Beats.cellX(c);
+      const x = StepGrid.cellX(c);
       if (lx >= x && lx < x + 7) return c;
     }
     return -1;
@@ -639,24 +814,25 @@ export class Melody extends Mod {
     const next = (s + 1) % len;
     const tie = this.slide[next] && this.notes[next] >= 0;
     const dur = tie ? ev.dur * 1.05 : ev.dur * this.p.gate;
-    const shape = CHORDS[this.p.chord];
-    for (const o of shape) {
-      const note = 12 * (this.p.oct + 1) + this.p.root + this.semi(r + o);
-      this.emit('note', { t: ev.t, dur, note, acc: this.acc[s], slide: this.slide[s], voices: shape.length });
-    }
+    const note = 12 * (this.p.oct + 1) + this.p.root + this.semi(r);
+    const v = (note - PITCH_REF) / 12, acc = this.acc[s], slide = this.slide[s];
+    if (slide) this.pit.offset.setTargetAtTime(v, ev.t, SLIDE_TC);
+    else this.pit.offset.setValueAtTime(v, ev.t);
+    this.accCv.offset.setValueAtTime(acc ? 1 : 0, ev.t);
+    this.emit('gate', { t: ev.t, dur, acc, slide });
   }
 
   drawBody(g: Gfx) {
     const len = this.p.len;
     for (let c = 0; c < len; c++) {
-      g.rect(Beats.cellX(c), 13, 6, 2, c === this.shown ? C.lime : C.black);
+      g.rect(StepGrid.cellX(c), 13, 6, 2, c === this.shown ? C.lime : C.black);
     }
     const sl = SCALES[this.p.scale].length;
     for (let r = 0; r < 8; r++) {
       const y = this.rowY(r);
       g.text(NOTE_NAMES[(this.p.root + this.semi(r)) % 12], 16, y, r % sl === 0 ? C.yellow : C.slate);
       for (let c = 0; c < 16; c++) {
-        const x = Beats.cellX(c), cur = c === this.shown;
+        const x = StepGrid.cellX(c), cur = c === this.shown;
         if (c >= len) g.rect(x, y, 6, 5, this.notes[c] === r ? C.slate : C.black);
         else if (this.notes[c] === r) {
           g.rect(x, y, 6, 5, cur ? C.white : C.yellow);
@@ -670,7 +846,7 @@ export class Melody extends Mod {
     g.text('AC', 16, 65, C.white);
     g.text('SL', 16, 70, C.sky);
     for (let c = 0; c < 16; c++) {
-      const x = Beats.cellX(c), off = c >= len ? C.black : C.ink;
+      const x = StepGrid.cellX(c), off = c >= len ? C.black : C.ink;
       g.rect(x, 66, 6, 4, this.acc[c] ? C.white : off);
       g.rect(x, 71, 6, 4, this.slide[c] ? C.sky : off);
     }
@@ -750,35 +926,100 @@ const KEYMAP: Record<string, number> = {
 const WHITE = [0, 2, 4, 5, 7, 9, 11];
 const BLACK = [[1, 0], [3, 1], [6, 3], [8, 4], [10, 5]]; // semitone, white key it sits after
 
+// Pitch bend output: full bend is +-2 semitones in pitch CV (1 per octave).
+const BEND_RANGE = 2 / 12;
+
+function cvSource() {
+  const s = ac.createConstantSource();
+  s.offset.value = 0;
+  s.start();
+  return s;
+}
+
+// Monophonic, like a keyboard on a modular: the newest key held sets the pitch and
+// retriggers the gate; letting it go glides back to a key still held, without a new
+// gate. The gate closes when the last key is up (and the sustain pedal, if down, is up).
 export class Keys extends Mod {
-  private held = new Set<number>();
+  private held: number[] = []; // in the order they went down
   private byCode = new Map<string, number>();
-  private midi: MIDIAccess | null = null;
   private flash = 0;
+  private pedal = false;
+  private gateOpen = false;
+  pit = cvSource();
+  vel = cvSource();
+  mod = cvSource();
+  bend = cvSource();
+  touch = cvSource();
+  private unlisten: () => void;
 
   constructor(e: Engine) {
-    super(e, 'keys', 'KEYS', 'seq', 122, 60);
-    this.port('note', 'OUT', 'note', 'out', 107, 12);
+    super(e, 'keys', 'KEYS', 'seq', 152, 60);
+    this.port('pit', 'PIT', 'cv', 'out', 107, 12);
+    this.port('gate', 'GAT', 'trig', 'out', 122, 12);
+    this.port('vel', 'VEL', 'cv', 'out', 137, 12);
+    this.port('mod', 'MOD', 'cv', 'out', 107, 33);
+    this.port('bend', 'BND', 'cv', 'out', 122, 33);
+    this.port('touch', 'AT', 'cv', 'out', 137, 33);
     this.knob({ id: 'oct', label: 'OCT', x: 4, y: 38, min: 0, max: 6, def: 3, step: 1 });
+    this.unlisten = midi.on((d, t) => this.midiIn(d, t));
   }
 
   private base() { return 12 * (this.p.oct + 1); }
 
-  noteOn(n: number) {
-    if (this.held.has(n)) return;
-    this.held.add(n);
+  private setPitch(n: number, t: number) { this.pit.offset.setValueAtTime((n - PITCH_REF) / 12, t); }
+
+  noteOn(n: number, vel?: number, t = ac.currentTime + 0.005) {
+    if (this.held.includes(n)) return;
+    this.held.push(n);
     this.flash = now();
-    this.emit('note', { t: ac.currentTime + 0.005, dur: 0, note: n, hold: true });
+    this.setPitch(n, t);
+    this.vel.offset.setValueAtTime(vel ?? 1, t);
+    this.gateOpen = true;
+    this.emit('gate', { t, dur: 0, hold: true, vel });
   }
 
-  noteOff(n: number) {
-    if (!this.held.delete(n)) return;
-    this.emit('note', { t: ac.currentTime + 0.005, dur: 0, note: n, off: true });
+  noteOff(n: number, t = ac.currentTime + 0.005) {
+    const i = this.held.indexOf(n);
+    if (i < 0) return;
+    this.held.splice(i, 1);
+    const top = this.held[this.held.length - 1];
+    if (top !== undefined) { if (i === this.held.length) this.setPitch(top, t); return; }
+    if (!this.pedal) this.closeGate(t);
+  }
+
+  private closeGate(t: number) {
+    if (!this.gateOpen) return;
+    this.gateOpen = false;
+    this.emit('gate', { t, dur: 0, off: true });
+  }
+
+  private setPedal(down: boolean, t: number) {
+    this.pedal = down;
+    if (!down && !this.held.length) this.closeGate(t);
   }
 
   allOff() {
-    for (const n of [...this.held]) this.noteOff(n);
+    this.held = [];
+    this.pedal = false;
+    this.closeGate(ac.currentTime + 0.005);
     this.byCode.clear();
+  }
+
+  private midiIn(d: Uint8Array, t: number) {
+    const [st, d1 = 0, d2 = 0] = d, cmd = st & 0xf0;
+    const at = Math.max(t, ac.currentTime) + 0.005;
+    const glide = (p: AudioParam, v: number) => p.setTargetAtTime(v, at, 0.01);
+    if (cmd === 0x90 && d2 > 0) this.noteOn(d1, d2 / 127, at);
+    else if (cmd === 0x80 || cmd === 0x90) this.noteOff(d1, at);
+    else if (cmd === 0xb0 && d1 === 1) glide(this.mod.offset, d2 / 127);
+    else if (cmd === 0xb0 && d1 === 64) this.setPedal(d2 >= 64, at);
+    else if (cmd === 0xe0) glide(this.bend.offset, ((((d2 << 7) | d1) - 8192) / 8192) * BEND_RANGE);
+    else if (cmd === 0xd0) glide(this.touch.offset, d1 / 127);
+    else if (cmd === 0xa0) glide(this.touch.offset, d2 / 127);
+  }
+
+  audioOut(port: string) {
+    return ({ pit: this.pit, vel: this.vel, mod: this.mod, bend: this.bend, touch: this.touch } as Record<string, AudioNode>)[port] ?? null;
   }
 
   // Computer keyboard; returns whether the key was used.
@@ -800,25 +1041,6 @@ export class Keys extends Mod {
     return true;
   }
 
-  private enableMidi() {
-    if (this.midi || !navigator.requestMIDIAccess) return;
-    navigator.requestMIDIAccess().then((access) => {
-      this.midi = access;
-      const listen = () => {
-        for (const input of access.inputs.values()) {
-          input.onmidimessage = (msg) => {
-            const [st, d1, d2] = msg.data ?? [];
-            const cmd = st & 0xf0;
-            if (cmd === 0x90 && d2 > 0) this.noteOn(d1);
-            else if (cmd === 0x80 || cmd === 0x90) this.noteOff(d1);
-          };
-        }
-      };
-      listen();
-      access.onstatechange = listen;
-    }).catch(() => { /* permission denied or no MIDI */ });
-  }
-
   private keyAt(lx: number, ly: number) {
     if (ly < 12 || ly >= 34 || lx < 4 || lx >= 102) return -1;
     const oct = Math.floor((lx - 4) / 49), ox = 4 + oct * 49;
@@ -836,24 +1058,24 @@ export class Keys extends Mod {
     for (let oct = 0; oct < 2; oct++) {
       const ox = 4 + oct * 49;
       WHITE.forEach((semi, i) => {
-        const down = this.held.has(base + oct * 12 + semi);
+        const down = this.held.includes(base + oct * 12 + semi);
         g.rect(ox + i * 7, 12, 6, 22, down ? C.yellow : C.white);
         g.rect(ox + i * 7, 33, 6, 1, C.silver);
         if (semi === 0) g.textC(String(this.p.oct + oct), ox + i * 7 + 3, 27, C.silver);
       });
       for (const [semi, after] of BLACK) {
-        const down = this.held.has(base + oct * 12 + semi);
+        const down = this.held.includes(base + oct * 12 + semi);
         g.rect(ox + after * 7 + 5, 12, 5, 13, down ? C.yellow : C.black);
       }
     }
-    drawButton(g, 20, 40, 22, 'MIDI', this.midi ? C.lime : C.silver);
+    drawButton(g, 20, 40, 22, 'MIDI', midi.enabled ? C.lime : C.silver);
     led(g, 47, 42, now() - this.flash < 90, C.yellow);
     g.text('PLAY: A-K', 56, 40, C.slate);
     g.text('OCT: Z X', 56, 47, C.slate);
   }
 
   press(lx: number, ly: number): Drag | null {
-    if (inBtn(lx, ly, 20, 40, 22)) { this.enableMidi(); return noDrag; }
+    if (inBtn(lx, ly, 20, 40, 22)) { void midi.enable(); return noDrag; }
     let n = this.keyAt(lx, ly);
     if (n < 0) return null;
     this.noteOn(n);
@@ -872,7 +1094,8 @@ export class Keys extends Mod {
 
   destroy() {
     this.allOff();
-    if (this.midi) for (const input of this.midi.inputs.values()) input.onmidimessage = null;
+    this.unlisten();
+    for (const s of [this.pit, this.vel, this.mod, this.bend, this.touch]) s.stop();
   }
 }
 
@@ -880,9 +1103,12 @@ export class Keys extends Mod {
 
 const WAVES: OscillatorType[] = ['sawtooth', 'square', 'triangle', 'sine'];
 
+// A one-oscillator voice with its own filter and envelopes: give it a pitch CV and gates.
+// Each gate starts a voice; the pitch CV moves every sounding voice, sample-accurately.
 export class Synth extends Mod {
   out = ac.createGain();
   cv = ac.createGain();
+  pitch = ac.createGain();
 
   constructor(e: Engine) {
     super(e, 'synth', 'SYNTH', 'synth', 64, 74);
@@ -897,48 +1123,44 @@ export class Synth extends Mod {
       { id: 'dec', label: 'DEC', min: 0.05, max: 1.5, def: 0.3, fmt: ms },
     ], 33, 18);
     this.cv.gain.value = CV_CENTS;
-    this.port('in', 'NOTE', 'note', 'in', 4, 53);
-    this.port('cv', 'CUT', 'cv', 'in', 27, 53);
+    // 1 per octave, like OSC.
+    this.pitch.gain.value = 1200;
+    this.port('pit', 'PIT', 'cv', 'in', 4, 53);
+    this.port('gate', 'GAT', 'trig', 'in', 19, 53);
+    this.port('cv', 'CUT', 'cv', 'in', 34, 53);
     this.port('out', 'OUT', 'audio', 'out', 51, 53);
   }
 
-  audioIn() { return this.cv; }
+  audioIn(port: string) { return port === 'pit' ? this.pitch : this.cv; }
   audioOut() { return this.out; }
 
-  // Voices of the chord that started most recently, and the one before it (for slides).
-  private chord: Voice[] = [];
-  private chordT = -1;
-  private prev: Voice[] = [];
-  // Live notes held until their note-off.
-  private live = new Map<number, Voice>();
+  // The voice started last (a slide carries it on), and the one a live gate is holding.
+  private last: Voice | null = null;
+  private live: Voice | null = null;
 
   onEvent(_port: string, ev: Ev) {
-    const note = ev.note ?? 48;
     if (ev.off) {
-      const v = this.live.get(note);
-      if (v) { release(v, ev.t); this.live.delete(note); }
+      if (this.live) { release(this.live, ev.t); this.live = null; }
       return;
     }
     const { wave, oct, cut, res, env, dec } = this.p;
     const t = ev.t, dur = ev.hold ? HOLD : Math.max(0.02, ev.dur);
-    if (t !== this.chordT) { this.prev = this.chord; this.chord = []; this.chordT = t; }
-    const f = 440 * 2 ** ((note - 69) / 12 + oct);
-    const peak = (0.35 * (ev.acc ? 1.4 : 1)) / Math.sqrt(ev.voices ?? 1);
+    const peak = 0.35 * (ev.acc ? 1.4 : 1) * velGain(ev.vel);
 
-    // Slide: bend the still-sounding voice to the new pitch without a new attack.
-    const old = this.prev[this.chord.length];
+    // Slide: keep the still-sounding voice going, with no new attack; the pitch CV glides.
+    const old = this.last;
     if (ev.slide && old && old.end > t) {
-      old.o.frequency.setTargetAtTime(f, t, 0.025);
       old.g.gain.cancelScheduledValues(t);
       old.g.gain.setValueAtTime(peak, t);
       hold(old, t + dur, peak);
-      this.chord.push(old);
       return;
     }
+    // A new live gate takes over from the one being held.
+    if (this.live) { release(this.live, t); this.live = null; }
 
     const o = ac.createOscillator(), fl = ac.createBiquadFilter(), g = ac.createGain();
     o.type = WAVES[wave];
-    o.frequency.value = f;
+    o.frequency.value = 440 * 2 ** ((PITCH_REF - 69) / 12 + oct);
     fl.type = 'lowpass';
     fl.Q.value = res;
     const base = cutHz(cut), amt = Math.min(1, env + (ev.acc ? 0.35 : 0));
@@ -947,13 +1169,17 @@ export class Synth extends Mod {
     g.gain.setValueAtTime(0, t);
     g.gain.linearRampToValueAtTime(peak, t + 0.004);
     o.connect(fl).connect(g).connect(this.out);
+    this.pitch.connect(o.detune);
     this.cv.connect(fl.detune);
-    o.onended = () => this.cv.disconnect(fl.detune);
+    o.onended = () => {
+      this.pitch.disconnect(o.detune);
+      this.cv.disconnect(fl.detune);
+    };
     o.start(t);
     const v: Voice = { o, g, end: 0 };
     hold(v, t + dur, peak);
-    this.chord.push(v);
-    if (ev.hold) this.live.set(note, v);
+    this.last = v;
+    if (ev.hold) this.live = v;
   }
 }
 
@@ -1199,57 +1425,110 @@ export class Speaker extends Mod {
 // frequency, so the timbre stays the same up and down the keyboard.
 const FM_DEPTH = 4;
 
+// 2^x for x in -1..1, read through a WaveShaper: pitch CV / 8 in, frequency ratio out.
+const EXP_RANGE = 8;
+const expCurve = (() => {
+  const n = 4097, c = new Float32Array(n);
+  for (let i = 0; i < n; i++) c[i] = 2 ** (((i / (n - 1)) * 2 - 1) * EXP_RANGE);
+  return c;
+})();
+
 export class Osc extends Mod {
   o = ac.createOscillator();
   out = ac.createGain();
-  cv = ac.createGain();
+  pitch = ac.createGain();
+  cents = ac.createGain();
   fm = ac.createGain();
-  private note = 48;
+  // FM depth follows the pitch CV, so the timbre stays the same up and down the keyboard.
+  private fmDepth = ac.createGain();
 
   constructor(e: Engine) {
     super(e, 'osc', 'OSC', 'synth', 64, 52);
     this.o.connect(this.out);
     this.out.gain.value = 0.3;
-    // A CV of 1 bends the pitch by one octave, like 1V/oct.
-    this.cv.gain.value = 1200;
-    this.cv.connect(this.o.detune);
+    // A CV of 1 raises the pitch by one octave, like 1V/oct.
+    this.cents.gain.value = 1200;
+    this.pitch.connect(this.cents).connect(this.o.detune);
+    const pre = ac.createGain(), exp = ac.createWaveShaper();
+    pre.gain.value = 1 / EXP_RANGE;
+    exp.curve = expCurve;
+    this.pitch.connect(pre).connect(exp).connect(this.fmDepth).connect(this.fm.gain);
+    // Without a pitch CV the WaveShaper still outputs 2^0 = 1.
+    this.fm.gain.value = 0;
     this.fm.connect(this.o.frequency);
     this.o.start();
     this.knobRow([
       { id: 'wave', label: 'WAV', min: 0, max: 3, def: 0, names: ['SAW', 'SQR', 'TRI', 'SIN'] },
       { id: 'oct', label: 'OCT', min: -2, max: 2, def: 0, step: 1, fmt: (v) => (v > 0 ? '+' : '') + v },
-      { id: 'glide', label: 'GLD', min: 0, max: 0.5, def: 0, fmt: ms },
+      { id: 'fine', label: 'FIN', min: -1, max: 1, def: 0, fmt: (v) => (v > 0 ? '+' : '') + Math.round(v * 100) + 'CT' },
     ], 13);
-    this.port('in', 'NOTE', 'note', 'in', 5, 32);
-    this.port('cv', 'PIT', 'cv', 'in', 20, 32);
-    this.port('fm', 'FM', 'cv', 'in', 35, 32);
+    this.port('cv', 'PIT', 'cv', 'in', 5, 32);
+    this.port('fm', 'FM', 'cv', 'in', 20, 32);
     this.port('out', 'OUT', 'audio', 'out', 51, 32);
   }
 
-  private freq() { return 440 * 2 ** ((this.note - 69) / 12 + this.p.oct); }
-
-  private setFreq(t: number, glide: number) {
-    const f = this.freq();
-    for (const [param, v] of [[this.o.frequency, f], [this.fm.gain, f * FM_DEPTH]] as const) {
-      if (glide > 0) param.setTargetAtTime(v, t, glide / 3);
-      else param.setValueAtTime(v, t);
+  onParam(id: string, v: number) {
+    const t = ac.currentTime;
+    if (id === 'wave') this.o.type = WAVES[v];
+    if (id === 'fine') this.o.detune.setTargetAtTime(v * 100, t, 0.01);
+    if (id === 'oct') {
+      const f = 440 * 2 ** ((PITCH_REF - 69) / 12 + v);
+      this.o.frequency.setValueAtTime(f, t);
+      this.fmDepth.gain.setValueAtTime(f * FM_DEPTH, t);
     }
   }
 
-  onParam(id: string, v: number) {
-    if (id === 'wave') this.o.type = WAVES[v];
-    if (id === 'oct') this.setFreq(ac.currentTime, 0);
-  }
-
-  onEvent(_port: string, ev: Ev) {
-    if (ev.note === undefined || ev.off) return;
-    this.note = ev.note;
-    this.setFreq(ev.t, ev.slide ? Math.max(this.p.glide, 0.06) : this.p.glide);
-  }
-
-  audioIn(port: string) { return port === 'fm' ? this.fm : this.cv; }
+  audioIn(port: string) { return port === 'fm' ? this.fm : this.pitch; }
   audioOut() { return this.out; }
   destroy() { this.o.stop(); }
+}
+
+// Slew limiter: smooths a CV, for portamento on pitch or softening stepped modulation.
+const SLEW_PROCESSOR = `
+class Slew extends AudioWorkletProcessor {
+  static get parameterDescriptors() { return [{ name: 'time', defaultValue: 0, minValue: 0, automationRate: 'k-rate' }]; }
+  constructor() { super(); this.y = 0; }
+  process(inputs, outputs, params) {
+    const i = inputs[0][0], o = outputs[0][0];
+    if (!o) return true;
+    const tm = params.time[0], k = tm > 0 ? 1 - Math.exp(-1 / (tm * sampleRate)) : 1;
+    for (let s = 0; s < o.length; s++) {
+      this.y += ((i ? i[s] : 0) - this.y) * k;
+      o[s] = this.y;
+    }
+    return true;
+  }
+}
+registerProcessor('slew', Slew);
+`;
+
+export class Slew extends Mod {
+  in = ac.createGain();
+  out = ac.createGain();
+  private node: AudioWorkletNode | null = null;
+
+  constructor(e: Engine) {
+    super(e, 'slew', 'SLEW', 'mod', 50, 52);
+    this.in.connect(this.out);
+    this.knob({ id: 'time', label: 'TIM', x: 4, y: 13, min: 0, max: 1, def: 0.1, fmt: ms });
+    this.port('in', 'IN', 'cv', 'in', 4, 32);
+    this.port('out', 'OUT', 'cv', 'out', 37, 32);
+    void worklet(SLEW_PROCESSOR).then(() => {
+      this.node = new AudioWorkletNode(ac, 'slew', { outputChannelCount: [1] });
+      this.in.disconnect(this.out);
+      this.in.connect(this.node).connect(this.out);
+      this.onParam('time', this.p.time);
+    });
+  }
+
+  onParam(id: string, v: number) {
+    // The time constant: about a third of the time it takes to arrive.
+    if (id === 'time') this.node?.parameters.get('time')!.setValueAtTime(v / 3, ac.currentTime);
+  }
+
+  audioIn() { return this.in; }
+  audioOut() { return this.out; }
+  destroy() { this.node?.disconnect(); }
 }
 
 export class Noise extends Mod {
@@ -1285,6 +1564,17 @@ export class Noise extends Mod {
 }
 
 // ---------------------------------------------------------------- MODULATION
+
+// Loads an AudioWorklet processor from source, once.
+const worklets = new Map<string, Promise<void>>();
+function worklet(code: string) {
+  let p = worklets.get(code);
+  if (!p) {
+    p = ac.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
+    worklets.set(code, p);
+  }
+  return p;
+}
 
 const lfoHz = (v: number) => 0.05 * 2 ** (v * 9);
 
@@ -1364,8 +1654,8 @@ export class Envelope extends Mod {
     const dur = ev.hold ? HOLD : ev.dur;
     // A slide keeps the gate open: no new attack, just a later release.
     if (!ev.slide) {
-      lvl.setTargetAtTime(ev.acc ? 1.3 : 1, t, a / 4);
-      lvl.setTargetAtTime(s, t + a, d / 4);
+      lvl.setTargetAtTime((ev.acc ? 1.3 : 1) * velGain(ev.vel), t, a / 4);
+      lvl.setTargetAtTime(s * velGain(ev.vel), t + a, d / 4);
     }
     lvl.setTargetAtTime(0, t + Math.max(a, dur), r / 4);
     if (!ev.slide) this.eng.at(t, () => (this.flash = now()));
@@ -1588,6 +1878,130 @@ export class Atten extends Mod {
   destroy() { this.ofs.stop(); }
 }
 
+// ---------------------------------------------------------------- PITCH CV
+
+const pitchName = (n: number) => NOTE_NAMES[((n % 12) + 12) % 12] + Math.floor(n / 12 - 1);
+
+// Snaps a pitch CV (1 per octave) to the nearest semitone allowed by a 12-bit mask
+// (bit 0 = C), sample by sample.
+const QUANT_PROCESSOR = `
+class Quant extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.mask = 0xfff; this.last = NaN; this.held = 0;
+    this.port.onmessage = (e) => { this.mask = e.data; this.last = NaN; };
+  }
+  snap(v) {
+    const semi = v * 12, base = Math.round(semi);
+    let best = base, bd = Infinity;
+    for (let d = -6; d <= 6; d++) {
+      const n = base + d;
+      if (!((this.mask >> (((n % 12) + 12) % 12)) & 1)) continue;
+      const dist = Math.abs(n - semi);
+      if (dist < bd) { bd = dist; best = n; }
+    }
+    return best / 12;
+  }
+  process(inputs, outputs) {
+    const i = inputs[0][0], o = outputs[0][0];
+    if (!o) return true;
+    for (let s = 0; s < o.length; s++) {
+      const v = i ? i[s] : 0;
+      if (v !== this.last) { this.last = v; this.held = this.snap(v); }
+      o[s] = this.held;
+    }
+    return true;
+  }
+}
+registerProcessor('quant', Quant);
+`;
+
+const QSCALE_NAMES = [...SCALE_NAMES, 'CHR'];
+const QSCALES = [...SCALES, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]];
+
+// Quantizer: pitch CV in, the nearest note of a scale out. KEY and SCL pick the scale;
+// clicking the keys toggles single notes for a custom one.
+export class Quant extends Mod {
+  in = ac.createGain();
+  out = ac.createGain();
+  mask = 0;
+  private node: AudioWorkletNode | null = null;
+  private tap = new CvTap();
+
+  constructor(e: Engine) {
+    super(e, 'quant', 'QUANT', 'mod', 64, 66);
+    // Unquantized until the worklet has loaded.
+    this.in.connect(this.out);
+    this.out.connect(this.tap.in);
+    this.knobRow([
+      { id: 'root', label: 'KEY', min: 0, max: 11, def: 0, names: NOTE_NAMES },
+      { id: 'scale', label: 'SCL', min: 0, max: 4, def: 0, names: QSCALE_NAMES },
+    ], 30, 18);
+    this.port('in', 'IN', 'cv', 'in', 5, 48);
+    this.port('out', 'OUT', 'cv', 'out', 51, 48);
+    void worklet(QUANT_PROCESSOR).then(() => {
+      this.node = new AudioWorkletNode(ac, 'quant', { outputChannelCount: [1] });
+      this.in.disconnect(this.out);
+      this.in.connect(this.node).connect(this.out);
+      this.send();
+    });
+  }
+
+  private send() { this.node?.port.postMessage(this.mask); }
+
+  onParam(id: string) {
+    if (id !== 'root' && id !== 'scale') return;
+    const root = this.p.root ?? 0;
+    this.mask = QSCALES[this.p.scale ?? 0].reduce((m, s) => m | (1 << ((s + root) % 12)), 0);
+    this.send();
+  }
+
+  private keyAt(lx: number, ly: number) {
+    if (ly < 13 || ly >= 27 || lx < 4 || lx >= 60) return -1;
+    if (ly < 21) {
+      for (const [semi, after] of BLACK) {
+        const x = 4 + after * 8 + 6;
+        if (lx >= x && lx < x + 5) return semi;
+      }
+    }
+    return WHITE[Math.floor((lx - 4) / 8)];
+  }
+
+  drawBody(g: Gfx) {
+    const live = this.eng.cablesAt(this, 'in').length > 0;
+    const n = PITCH_REF + Math.round(this.tap.read() * 12), cur = live ? ((n % 12) + 12) % 12 : -1;
+    const on = (semi: number) => (this.mask >> semi) & 1;
+    WHITE.forEach((semi, i) => {
+      const x = 4 + i * 8;
+      g.rect(x, 13, 7, 14, semi === cur ? C.yellow : C.white);
+      if (on(semi)) g.rect(x + 1, 24, 5, 2, C.green);
+    });
+    for (const [semi, after] of BLACK) {
+      const x = 4 + after * 8 + 6;
+      g.rect(x, 13, 5, 8, semi === cur ? C.yellow : C.black);
+      if (on(semi)) g.rect(x + 1, 18, 3, 2, C.lime);
+    }
+    g.rect(17, 49, 30, 9, C.black);
+    if (live) g.textC(pitchName(n), 32, 51, C.lime);
+  }
+
+  press(lx: number, ly: number): Drag | null {
+    const semi = this.keyAt(lx, ly);
+    if (semi < 0) return null;
+    this.mask ^= 1 << semi;
+    this.send();
+    this.eng.dirty = true;
+    return noDrag;
+  }
+
+  save() { return this.mask; }
+  load(s: unknown) { if (typeof s === 'number') { this.mask = s & 0xfff; this.send(); } }
+
+  audioIn() { return this.in; }
+  audioOut() { return this.out; }
+  destroy() { this.node?.disconnect(); }
+}
+
 // ---------------------------------------------------------------- DIRT
 
 export class Drive extends Mod {
@@ -1678,7 +2092,6 @@ class Crush extends AudioWorkletProcessor {
 }
 registerProcessor('crush', Crush);
 `;
-let crushReady: Promise<void> | null = null;
 
 export class Crush extends Mod {
   in = ac.createGain();
@@ -1695,8 +2108,7 @@ export class Crush extends Mod {
       { id: 'lvl', label: 'LVL', min: 0, max: 1, def: 0.7, fmt: pct },
     ], 13);
     io(this, 'audio');
-    crushReady ??= ac.audioWorklet.addModule(URL.createObjectURL(new Blob([CRUSH_PROCESSOR], { type: 'text/javascript' })));
-    void crushReady.then(() => {
+    void worklet(CRUSH_PROCESSOR).then(() => {
       this.node = new AudioWorkletNode(ac, 'crush', { outputChannelCount: [2] });
       this.in.disconnect(this.out);
       this.in.connect(this.node).connect(this.out);
@@ -1722,6 +2134,7 @@ export interface Kind { type: string; label: string; cat: Cat; make: (e: Engine)
 
 export const KINDS: Kind[] = [
   { type: 'clock', label: 'CLOCK', cat: 'seq', make: (e) => new Clock(e) },
+  { type: 'drums', label: 'DRUM MACHINE', cat: 'seq', make: (e) => new DrumMachine(e) },
   { type: 'beats', label: 'BEATS', cat: 'seq', make: (e) => new Beats(e) },
   { type: 'melody', label: 'MELODY', cat: 'seq', make: (e) => new Melody(e) },
   { type: 'keys', label: 'KEYS', cat: 'seq', make: (e) => new Keys(e) },
@@ -1741,6 +2154,8 @@ export const KINDS: Kind[] = [
   { type: 'vca', label: 'VCA', cat: 'mod', make: (e) => new Vca(e) },
   { type: 'snh', label: 'S&H', cat: 'mod', make: (e) => new SampleHold(e) },
   { type: 'atten', label: 'ATTEN', cat: 'mod', make: (e) => new Atten(e) },
+  { type: 'quant', label: 'QUANT', cat: 'mod', make: (e) => new Quant(e) },
+  { type: 'slew', label: 'SLEW', cat: 'mod', make: (e) => new Slew(e) },
   { type: 'filter', label: 'FILTER', cat: 'fx', make: (e) => new Filter(e) },
   { type: 'delay', label: 'DELAY', cat: 'fx', make: (e) => new Delay(e) },
   { type: 'reverb', label: 'REVERB', cat: 'fx', make: (e) => new Reverb(e) },

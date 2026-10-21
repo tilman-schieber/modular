@@ -2,9 +2,10 @@ import { ac } from './audio';
 import { Engine, type Cable } from './engine';
 import { C, Gfx, textWidth } from './gfx';
 import { CAT, TYPEC, compatible, type Cat, type Drag, type Knob, type Mod, type Port } from './mod';
-import { KINDS, Keys } from './modules';
-import { PATCHES, type PatchData } from './patches';
+import { KINDS, Keys, type Kind } from './modules';
+import { PATCHES, migrate, type PatchData } from './patches';
 import { cablePoints, drawButton, drawCable, drawModule, plug } from './render';
+import { midi } from './midi';
 import { Recorder } from './rec';
 import { decodePatch, encodePatch, hashCode } from './share';
 
@@ -33,6 +34,8 @@ let selCable: Cable | null = null;
 let wires = 0; // 0 shown, 1 dimmed, 2 hidden
 let clipboard: PatchData | null = null;
 let namePrompt: { text: string; done: (name: string) => void } | null = null;
+// The knob waiting for a MIDI control to be moved (Alt+click a knob to map it).
+let learn: { m: Mod; kn: Knob } | null = null;
 
 function showToast(text: string) {
   toast = { text, until: performance.now() + 2500 };
@@ -76,6 +79,8 @@ interface Btn {
 let bar: Btn[] = [];
 let barH = 13;
 let openMenu: string | null = null;
+// The module picker that opens when a fresh cable is dropped on empty ground.
+let popup: { x: number; y: number; from: { m: Mod; p: Port }; wx: number; wy: number; items: MenuItem[] } | null = null;
 // Bar height in field pixels, for keeping modules out from under it.
 const barWorld = () => Math.ceil((barH * uiScale) / scale);
 
@@ -147,17 +152,23 @@ function layoutBar() {
 const MENU_ROW = 10;
 const openBtn = () => bar.find((b) => b.label === openMenu && b.menu);
 
-function menuRect(b: Btn) {
+// The open dropdown: a toolbar menu, or the module picker.
+function activeMenu() {
+  if (popup) {
+    const items = popup.items, w = Math.max(...items.map((m) => textWidth(m.label) + 12)), h = items.length * MENU_ROW + 2;
+    return { x: Math.max(0, Math.min(popup.x, UW - w - 2)), y: Math.max(barH, Math.min(popup.y, UH - h - 2)), w, h, items };
+  }
+  const b = openBtn();
+  if (!b) return null;
   const w = Math.max(b.w, ...b.menu!.map((m) => textWidth(m.label) + 12));
-  return { x: b.x, y: b.y + 10, w, h: b.menu!.length * MENU_ROW + 2 };
+  return { x: b.x, y: b.y + 10, w, h: b.menu!.length * MENU_ROW + 2, items: b.menu! };
 }
 
 function menuItemAt(x: number, y: number) {
-  const b = openBtn();
-  if (!b) return null;
-  const r = menuRect(b);
+  const r = activeMenu();
+  if (!r) return null;
   if (x < r.x || x >= r.x + r.w || y < r.y + 1 || y >= r.y + r.h - 1) return null;
-  return b.menu![Math.floor((y - r.y - 1) / MENU_ROW)] ?? null;
+  return r.items[Math.floor((y - r.y - 1) / MENU_ROW)] ?? null;
 }
 
 function drawBar() {
@@ -182,13 +193,13 @@ function drawBar() {
       else for (let i = 0; i < 3; i++) ui.rect(b.x + 4 + i, b.y + 2 + i, 1, 5 - i * 2, C.ink);
     }
   }
-  const b = openBtn();
-  if (b) {
-    const r = menuRect(b), hi = menuItemAt(ux, uy);
+  const r = activeMenu();
+  if (r) {
+    const hi = menuItemAt(ux, uy);
     ui.rect(r.x + 2, r.y + 2, r.w, r.h, C.black);
     ui.rect(r.x, r.y, r.w, r.h, C.black);
     ui.rect(r.x + 1, r.y + 1, r.w - 2, r.h - 2, C.dark);
-    b.menu!.forEach((m, i) => {
+    r.items.forEach((m, i) => {
       const y = r.y + 1 + i * MENU_ROW;
       if (m.header) {
         ui.rect(r.x + 1, y, r.w - 2, MENU_ROW, C.ink);
@@ -293,7 +304,7 @@ type Mode =
     group: { m: Mod; ox: number; oy: number }[]; // other selected modules, relative to m
   }
   | { k: 'box'; x0: number; y0: number }
-  | { k: 'cable'; m: Mod; p: Port }
+  | { k: 'cable'; m: Mod; p: Port; picked: boolean } // picked: lifted off a jack rather than started fresh
   | { k: 'knob'; m: Mod; kn: Knob; sy: number; sv: number }
   | { k: 'drag'; m: Mod; d: Drag };
 
@@ -343,9 +354,10 @@ canvas.addEventListener('pointerdown', (e) => {
     if (e.button === 2) h.item.del!();
     return;
   }
-  if (openMenu || (h.k === 'bar' && h.b.menu)) {
+  if (openMenu || popup || (h.k === 'bar' && h.b.menu)) {
     const was = openMenu;
     openMenu = null;
+    popup = null;
     if (h.k === 'menu') {
       if (h.item.spawn) spawn(h.item.spawn);
       else h.item.act?.();
@@ -382,13 +394,14 @@ canvas.addEventListener('pointerdown', (e) => {
         // Pick up the most recent cable by its plug and carry it from the other end.
         const c = plugged[plugged.length - 1];
         eng.disconnect(c);
-        mode = { k: 'cable', m: c.a, p: c.a.ports.find((p) => p.id === c.ap)! };
+        mode = { k: 'cable', m: c.a, p: c.a.ports.find((p) => p.id === c.ap)!, picked: true };
       } else {
-        mode = { k: 'cable', m: h.m, p: h.p };
+        mode = { k: 'cable', m: h.m, p: h.p, picked: false };
       }
       return;
     }
     case 'knob': {
+      if (e.altKey) { midiLearn(h.m, h.kn); return; }
       toFront(h.m);
       const t = performance.now();
       if (lastKnob.kn === h.kn && t - lastKnob.t < 300) h.m.setKnob(h.kn, h.kn.def);
@@ -445,10 +458,13 @@ canvas.addEventListener('pointermove', (e) => {
 
 function endPointer() {
   if (mode.k === 'cable') {
-    const t = dropTarget(mode, mx + camX, my + camY);
+    const wx = mx + camX, wy = my + camY;
+    const t = dropTarget(mode, wx, wy);
     if (t) {
       if (mode.p.dir === 'out') eng.connect(mode.m, mode.p.id, t.m, t.p.id);
       else eng.connect(t.m, t.p.id, mode.m, mode.p.id);
+    } else if (!mode.picked && !modAt(wx, wy) && uy >= barH) {
+      openPicker({ m: mode.m, p: mode.p }, wx, wy);
     }
   }
   if (mode.k === 'move' && mode.spawned && (!mode.moved || uy < barH)) placeInView(mode.m);
@@ -530,7 +546,7 @@ addEventListener('keydown', (e) => {
     void ac.resume();
     togglePlay();
   }
-  if (e.code === 'Escape') { openMenu = null; selected.clear(); selCable = null; }
+  if (e.code === 'Escape') { openMenu = null; popup = null; learn = null; selected.clear(); selCable = null; }
   if (e.code === 'Delete' || e.code === 'Backspace') {
     const h = hitTest();
     if (selCable) eng.disconnect(selCable);
@@ -551,6 +567,90 @@ function promptKey(e: KeyboardEvent) {
     if (p.text.trim()) p.done(p.text.trim());
   } else if (e.key === 'Backspace') p.text = p.text.slice(0, -1);
   else if (e.key.length === 1 && /[a-z0-9 #!?.,:+\-_]/i.test(e.key) && p.text.length < 18) p.text += e.key.toUpperCase();
+}
+
+// ---------------------------------------------------------------- MIDI learn
+
+// Alt+click a knob, then move a knob or fader on a MIDI controller. Alt+click a mapped
+// knob to unmap it. One controller may drive several knobs.
+function midiLearn(m: Mod, kn: Knob) {
+  if (m.cc[kn.id] !== undefined) {
+    delete m.cc[kn.id];
+    learn = null;
+    showToast('MIDI MAPPING REMOVED');
+    checkpoint();
+    return;
+  }
+  learn = { m, kn };
+  void midi.enable().then((ok) => {
+    if (!ok) { learn = null; showToast('NO MIDI - CHECK BROWSER PERMISSION'); return; }
+    showToast('MOVE A MIDI CONTROL - ESC CANCELS');
+  });
+}
+
+let ccTimer = 0;
+midi.on((d) => {
+  if ((d[0] & 0xf0) !== 0xb0) return;
+  const cc = d[1], v = d[2] / 127;
+  if (learn && eng.mods.includes(learn.m)) {
+    learn.m.cc[learn.kn.id] = cc;
+    showToast(`${learn.m.title} ${learn.kn.label || 'KNOB'} ON CC ${cc}`);
+    learn = null;
+  }
+  for (const m of eng.mods) {
+    for (const k of m.knobs) if (m.cc[k.id] === cc) m.setKnob(k, k.min + v * (k.max - k.min));
+  }
+  // A twist of a controller is one undo step.
+  clearTimeout(ccTimer);
+  ccTimer = window.setTimeout(checkpoint, 500);
+});
+
+// ---------------------------------------------------------------- module picker
+
+// Each kind's jacks, read once from a throwaway instance.
+const kindPorts = new Map<string, Port[]>();
+function portsOf(kind: Kind) {
+  let ps = kindPorts.get(kind.type);
+  if (!ps) {
+    const m = kind.make(eng);
+    ps = m.ports;
+    m.destroy();
+    kindPorts.set(kind.type, ps);
+  }
+  return ps;
+}
+
+// Every module with a jack the cable fits, preferring jacks of the same signal type
+// (so an audio cable offers effects and mixers, not every CV input).
+function openPicker(from: { m: Mod; p: Port }, wx: number, wy: number) {
+  const fits = KINDS.flatMap((kind) => {
+    const ok = portsOf(kind).filter((p) => canPlug(from.p, p));
+    const p = ok.find((p) => p.type === from.p.type) ?? ok[0];
+    return p ? [{ kind, p }] : [];
+  });
+  const exact = fits.filter((f) => f.p.type === from.p.type);
+  const list = exact.length ? exact : fits;
+  if (!list.length) return;
+  const header: MenuItem = { label: from.p.dir === 'out' ? 'SEND TO...' : 'TAKE FROM...', col: C.ink, text: C.slate, header: true };
+  popup = {
+    x: ux, y: uy, from, wx, wy,
+    items: [header, ...list.map(({ kind, p }) => ({
+      label: kind.label, col: CAT[kind.cat].bar, text: C.white,
+      act: () => spawnConnected(kind, p, from, wx, wy),
+    }))],
+  };
+}
+
+// Place the new module so the chosen jack sits where the cable was dropped.
+function spawnConnected(kind: Kind, port: Port, from: { m: Mod; p: Port }, wx: number, wy: number) {
+  const m = kind.make(eng);
+  m.x = Math.round(wx - port.x - 4);
+  m.y = Math.round(wy - port.y - 4);
+  eng.add(m);
+  if (from.p.dir === 'out') eng.connect(from.m, from.p.id, m, port.id);
+  else eng.connect(m, port.id, from.m, from.p.id);
+  selected.clear();
+  selected.add(m);
 }
 
 // ---------------------------------------------------------------- copy & paste
@@ -592,7 +692,10 @@ addEventListener('resize', resize);
 
 function serialize(): PatchData {
   return {
-    mods: eng.mods.map((m) => ({ id: m.id, type: m.type, x: m.x, y: m.y, p: m.p, s: m.save() })),
+    mods: eng.mods.map((m) => ({
+      id: m.id, type: m.type, x: m.x, y: m.y, p: m.p, s: m.save(),
+      ...(Object.keys(m.cc).length ? { cc: { ...m.cc } } : {}),
+    })),
     cables: eng.cables.map((c) => ({ a: c.a.id, ap: c.ap, b: c.b.id, bp: c.bp })),
   };
 }
@@ -605,7 +708,9 @@ function loadPatch(data: PatchData) {
 }
 
 // Adds a patch's modules and cables to the field, shifted by dx/dy.
-function addPatch(data: PatchData, dx: number, dy: number) {
+function addPatch(old: PatchData, dx: number, dy: number) {
+  const { data, dropped } = migrate(old);
+  if (dropped) showToast('KEYS AND MELODY SHARED A VOICE - UNPLUGGED ONE, PATCH IT TO ITS OWN');
   const byId = new Map<number, Mod>();
   for (const d of data.mods) {
     const kind = KINDS.find((k) => k.type === d.type);
@@ -615,6 +720,7 @@ function addPatch(data: PatchData, dx: number, dy: number) {
     m.y = d.y + dy;
     for (const [k, v] of Object.entries(d.p ?? {})) if (k in m.p && typeof v === 'number') m.set(k, v);
     if (d.s !== undefined) m.load(d.s);
+    for (const [k, v] of Object.entries(d.cc ?? {})) if (k in m.p && typeof v === 'number') m.cc[k] = v;
     eng.add(m);
     byId.set(d.id, m);
   }
@@ -831,13 +937,15 @@ function drawTooltip(x: number, y: number, s: string) {
   g.text(s, x + 2, y + 1, C.ink);
 }
 
-const PORT_KIND = { audio: 'AUDIO', note: 'NOTES', trig: 'TRIGGER', cv: 'CV' };
+const PORT_KIND = { audio: 'AUDIO', trig: 'GATE', cv: 'CV' };
 
 const TIPS = [
   'DRAG JACK TO JACK TO PATCH - RIGHT CLICK A JACK OR CABLE TO UNPLUG - WHEEL TO ZOOM',
+  'DROP A CABLE ON EMPTY GROUND TO ADD A MODULE THAT TAKES IT',
   'CLICK A CABLE AND PRESS DEL TO REMOVE IT - WIRES BUTTON DIMS OR HIDES CABLES',
   'SHIFT+CLICK OR SHIFT+DRAG TO SELECT SEVERAL MODULES - DRAG ONE TO MOVE THEM ALL',
   'CTRL+D DUPLICATE - CTRL+C / CTRL+V COPY AND PASTE - CTRL+Z UNDO - CTRL+S SAVE',
+  'ALT+CLICK A KNOB, THEN MOVE A MIDI CONTROL TO MAP IT - ALT+CLICK AGAIN TO UNMAP',
 ];
 
 function drawPrompt(text: string, blink: boolean) {
@@ -890,6 +998,11 @@ function frame() {
     if (w > 1 && hh > 1) g.frame(x, y, w, hh, C.yellow);
   }
 
+  if (popup) {
+    const [x0, y0] = jackPos(popup.from.m, popup.from.p);
+    drawCable(g, x0, y0, popup.wx, popup.wy, TYPEC[popup.from.p.type], false);
+  }
+
   if (mode.k === 'cable') {
     const from = mode;
     // Blink every jack that would accept this cable.
@@ -906,7 +1019,11 @@ function frame() {
 
   // Tooltips: knob values and port kinds.
   const tip = mode.k === 'knob' ? { m: mode.m, kn: mode.kn } : h.k === 'knob' ? h : null;
-  if (tip) drawTooltip(tip.m.x + tip.kn.x + 5, tip.m.y + tip.kn.y - 10, tip.m.knobText(tip.kn));
+  if (learn && blink) g.frame(learn.m.x + learn.kn.x - 2, learn.m.y + learn.kn.y - 2, 15, 15, C.sky);
+  if (tip) {
+    const cc = tip.m.cc[tip.kn.id];
+    drawTooltip(tip.m.x + tip.kn.x + 5, tip.m.y + tip.kn.y - 10, tip.m.knobText(tip.kn) + (cc === undefined ? '' : ` CC${cc}`));
+  }
   else if (h.k === 'port') {
     drawTooltip(h.m.x + h.p.x + 4, h.m.y + h.p.y - 10, `${PORT_KIND[h.p.type]} ${h.p.dir === 'in' ? 'IN' : 'OUT'}`);
   }
@@ -921,7 +1038,7 @@ function frame() {
     ui.rect(x, barH + 6, w, 9, C.yellow);
     ui.text(toast.text, x + 5, barH + 8, C.ink);
   }
-  if (!everPlayed && blink && !openMenu) ui.textC('PRESS SPACE TO PLAY', Math.floor(UW / 2), UH - 16, C.yellow);
+  if (!everPlayed && blink && !openMenu && !popup) ui.textC('PRESS SPACE TO PLAY', Math.floor(UW / 2), UH - 16, C.yellow);
   ui.text(TIPS[Math.floor(t / 7000) % TIPS.length], 3, UH - 7, C.slate);
   if (namePrompt) drawPrompt(namePrompt.text, blink);
 

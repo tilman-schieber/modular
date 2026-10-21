@@ -1,8 +1,9 @@
 import type { PatchData } from './patches';
 
 // Share links carry the whole patch in the URL hash: #p=<base64url(deflate(json))>.
-// Mods are stored as [type, x, y, params, state]; cables refer to mods by index.
-type Packed = { v: 1; m: [string, number, number, Record<string, number>, unknown][]; c: [number, string, number, string][] };
+// Mods are stored as [type, x, y, params, state, midi cc map?]; cables refer to mods by index.
+type PackedMod = [string, number, number, Record<string, number>, unknown, Record<string, number>?];
+type Packed = { v: 1; m: PackedMod[]; c: [number, string, number, string][] };
 
 function pack(data: PatchData): Packed {
   const index = new Map(data.mods.map((m, i) => [m.id, i]));
@@ -10,14 +11,14 @@ function pack(data: PatchData): Packed {
     Object.fromEntries(Object.entries(p).map(([k, v]) => [k, Math.round(v * 1000) / 1000]));
   return {
     v: 1,
-    m: data.mods.map((m) => [m.type, m.x, m.y, round(m.p), m.s ?? null]),
+    m: data.mods.map((m): PackedMod => (m.cc ? [m.type, m.x, m.y, round(m.p), m.s ?? null, m.cc] : [m.type, m.x, m.y, round(m.p), m.s ?? null])),
     c: data.cables.map((c) => [index.get(c.a)!, c.ap, index.get(c.b)!, c.bp]),
   };
 }
 
 function unpack(p: Packed): PatchData {
   return {
-    mods: p.m.map(([type, x, y, params, s], i) => ({ id: i + 1, type, x, y, p: params, s: s ?? undefined })),
+    mods: p.m.map(([type, x, y, params, s, cc], i) => ({ id: i + 1, type, x, y, p: params, s: s ?? undefined, cc })),
     cables: p.c.map(([a, ap, b, bp]) => ({ a: a + 1, ap, b: b + 1, bp })),
   };
 }

@@ -58,10 +58,11 @@ export const velGain = (vel?: number) => (vel === undefined ? 1 : 0.25 + 0.75 * 
 // Pitch CV: 1 per octave, 0 is this MIDI note (C3, what OSC and SYNTH play with no pitch in).
 export const PITCH_REF = 48;
 
-export interface Port { id: string; label: string; type: SigType; dir: 'in' | 'out'; x: number; y: number }
+// `adv` jacks and knobs only show in a module's advanced layout.
+export interface Port { id: string; label: string; type: SigType; dir: 'in' | 'out'; x: number; y: number; adv?: boolean }
 
 export interface Knob {
-  id: string; label: string; x: number; y: number;
+  id: string; label: string; x: number; y: number; adv?: boolean;
   min: number; max: number; def: number;
   step?: number;
   names?: string[];
@@ -76,9 +77,17 @@ export abstract class Mod {
   id = 0;
   x = 0;
   y = 0;
+  // The jacks and knobs showing in the current layout.
   ports: Port[] = [];
   knobs: Knob[] = [];
   p: Record<string, number> = {};
+  // Modules with an advanced (or "big") layout get a +/- toggle in the title bar;
+  // advName is its tooltip. The layout is the `adv` param, so it saves like a knob.
+  advName = '';
+  private sizes: [number, number][] = [];
+  private allPorts: Port[] = [];
+  private allKnobs: Knob[] = [];
+  private building = false;
   // MIDI CC number mapped to each knob, by knob id.
   cc: Record<string, number> = {};
 
@@ -88,15 +97,57 @@ export abstract class Mod {
   ) {}
 
   port(id: string, label: string, type: SigType, dir: 'in' | 'out', x: number, y: number) {
-    this.ports.push({ id, label, type, dir, x, y });
+    this.allPorts.push({ id, label, type, dir, x, y, adv: this.building });
+    this.refresh();
   }
 
   knob(k: Knob) {
     if (k.names) { k.min = 0; k.max = k.names.length - 1; k.step = 1; }
-    this.knobs.push(k);
+    k.adv = this.building;
+    this.allKnobs.push(k);
+    this.refresh();
     this.p[k.id] = k.def;
     this.onParam(k.id, k.def);
   }
+
+  get isAdv() { return this.p.adv === 1; }
+
+  // Give the module an advanced layout of size w x h, named `name` on its toggle.
+  protected advanced(name: string, w: number, h: number) {
+    this.advName = name;
+    this.sizes = [[this.w, this.h], [w, h]];
+    this.p.adv = 0;
+  }
+
+  // Jacks and knobs added inside fn only show in the advanced layout.
+  protected advOnly(fn: () => void) {
+    this.building = true;
+    fn();
+    this.building = false;
+  }
+
+  protected portById(id: string) { return this.allPorts.find((p) => p.id === id)!; }
+  protected knobById(id: string) { return this.allKnobs.find((k) => k.id === id)!; }
+
+  private refresh() {
+    const shown = (x: { adv?: boolean }) => !x.adv || this.isAdv;
+    this.ports = this.allPorts.filter(shown);
+    this.knobs = this.allKnobs.filter(shown);
+  }
+
+  // Switch layouts; cables on jacks that disappear are unplugged.
+  private applyLayout() {
+    [this.w, this.h] = this.sizes[this.isAdv ? 1 : 0];
+    this.refresh();
+    this.layout(this.isAdv);
+    const has = (id: string, dir: 'in' | 'out') => this.ports.some((p) => p.id === id && p.dir === dir);
+    for (const c of [...this.eng.cables]) {
+      if ((c.a === this && !has(c.ap, 'out')) || (c.b === this && !has(c.bp, 'in'))) this.eng.disconnect(c);
+    }
+  }
+
+  // Move jacks and knobs that sit elsewhere in the advanced layout.
+  protected layout(_adv: boolean) {}
 
   // Lay out knobs in a centered row with a fixed pitch.
   knobRow(defs: KnobDef[], y: number, pitch = 15) {
@@ -107,6 +158,7 @@ export abstract class Mod {
 
   set(id: string, v: number) {
     this.p[id] = v;
+    if (id === 'adv' && this.advName) this.applyLayout();
     this.onParam(id, v);
     this.eng.dirty = true;
   }
@@ -139,6 +191,8 @@ export abstract class Mod {
   audioOut(_port: string): AudioNode | null { return null; }
   drawBody(_g: Gfx) {}
   press(_lx: number, _ly: number): Drag | null { return null; }
+  // Shift+click on the module body; return true if used (otherwise it toggles selection).
+  pressShift(_lx: number, _ly: number) { return false; }
   save(): unknown { return undefined; }
   load(_s: unknown) {}
   destroy() {}

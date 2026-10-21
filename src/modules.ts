@@ -54,6 +54,9 @@ function io(m: Mod, inType: SigType, inLabel = 'IN') {
 const INT = 0, EXT = 1, OUT = 2;
 // Steps derived from incoming MIDI clock play this late, so they are never in the past.
 const MIDI_LATENCY = 0.03;
+// The advanced DIV output's rates.
+const DIVS = ['1/32', '1/8T', '1/8', '1/2', '1BAR', '2BAR'];
+const DIV_EVERY: Record<string, number> = { '1/8': 2, '1/2': 8, '1BAR': 16, '2BAR': 32 };
 
 export class Clock extends Mod {
   private next = 0;
@@ -64,17 +67,30 @@ export class Clock extends Mod {
   private lastTick = 0;
   private tickLen = 60 / 120 / 24;
   private unlisten: () => void;
+  // Advanced: tap tempo, and the step length when following CLK IN.
+  private taps: number[] = [];
+  private extDur = 0;
 
   constructor(e: Engine) {
     super(e, 'clock', 'CLOCK', 'seq', 60, 68);
+    this.advanced('ADVANCED', 92, 68);
     this.knob({ id: 'bpm', label: 'BPM', x: 4, y: 32, min: 60, max: 200, def: 120, step: 1 });
     this.knob({ id: 'swing', label: 'SWG', x: 20, y: 32, min: 0, max: 0.5, def: 0, fmt: pct });
     this.knob({ id: 'sync', label: 'SYN', x: 22, y: 51, min: 0, max: 2, def: INT, names: ['INT', 'EXT', 'OUT'] });
     this.port('o16', '16TH', 'trig', 'out', 47, 12);
     this.port('o4', 'BEAT', 'trig', 'out', 47, 32);
     this.port('cv', 'BPM', 'cv', 'in', 4, 51);
+    this.advOnly(() => {
+      this.port('clk', 'CLK', 'trig', 'in', 62, 32);
+      this.port('rst', 'RST', 'trig', 'out', 77, 32);
+      this.knob({ id: 'div', label: 'DIV', x: 62, y: 51, min: 0, max: DIVS.length - 1, def: 2, names: DIVS });
+      this.port('div', 'DIV', 'trig', 'out', 77, 51);
+    });
     this.unlisten = midi.on((d, t) => this.midiIn(d, t));
   }
+
+  // Advanced: with a cable in CLK, every trigger there is one 16th step.
+  private following() { return this.isAdv && this.eng.cablesAt(this, 'clk').length > 0; }
 
   private tap = new CvTap();
   audioIn() { return this.tap.in; }
@@ -85,6 +101,7 @@ export class Clock extends Mod {
 
   // A CV of 1 adds 70 BPM.
   private bpm() {
+    if (this.following()) return this.extDur ? 15 / this.extDur : this.p.bpm;
     if (this.p.sync === EXT) return 60 / (24 * this.tickLen);
     return Math.min(300, Math.max(30, this.p.bpm + this.tap.read() * 70));
   }
@@ -93,10 +110,17 @@ export class Clock extends Mod {
     this.next = t0; this.n = 0; this.beat = -1; this.ticks = 0;
     // Engine.stop resets with t0 = 0.
     if (this.p.sync === OUT) midi.send(t0 ? [0xfa] : [0xfc], t0 || undefined);
+    if (t0 && this.isAdv) this.emit('rst', { t: t0, dur: 0.01 });
+  }
+
+  onEvent(port: string, ev: Ev) {
+    if (port !== 'clk' || ev.off || !this.isAdv) return;
+    this.extDur = ev.dur;
+    this.step(this.n++, ev.t, ev.dur);
   }
 
   schedule(until: number) {
-    if (this.p.sync === EXT) return;
+    if (this.p.sync === EXT || this.following()) return;
     // Resync if we fell far behind (e.g. a backgrounded tab).
     if (this.next < ac.currentTime - 0.2) this.next = ac.currentTime + 0.02;
     while (this.next < until) {
@@ -112,7 +136,33 @@ export class Clock extends Mod {
   private step(n: number, t: number, dur: number) {
     this.emit('o16', { t, dur });
     if (n % 4 === 0) this.emit('o4', { t, dur: dur * 4 });
+    if (this.isAdv) this.divide(n, t, dur);
     this.eng.at(t, () => (this.beat = n));
+  }
+
+  private divide(n: number, t: number, dur: number) {
+    const d = DIVS[this.p.div];
+    if (d === '1/32') {
+      this.emit('div', { t, dur: dur / 2 });
+      this.emit('div', { t: t + dur / 2, dur: dur / 2 });
+    } else if (d === '1/8T') {
+      // three to the beat
+      if (n % 4 === 0) for (let k = 0; k < 3; k++) this.emit('div', { t: t + (k * 4 * dur) / 3, dur: (4 * dur) / 3 });
+    } else if (n % DIV_EVERY[d] === 0) {
+      this.emit('div', { t, dur: dur * DIV_EVERY[d] });
+    }
+  }
+
+  // Tap tempo: the average of the last few taps, if they come quickly enough.
+  press(lx: number, ly: number): Drag | null {
+    if (!this.isAdv || !inBtn(lx, ly, 62, 12, 26)) return null;
+    const t = performance.now();
+    this.taps = [...this.taps.filter((x) => t - x < 2000), t].slice(-5);
+    if (this.taps.length > 1) {
+      const gap = (this.taps[this.taps.length - 1] - this.taps[0]) / (this.taps.length - 1);
+      this.set('bpm', Math.min(200, Math.max(60, Math.round(60000 / gap))));
+    }
+    return noDrag;
   }
 
   private midiIn(d: Uint8Array, t: number) {
@@ -139,14 +189,13 @@ export class Clock extends Mod {
     const q = this.beat < 0 ? -1 : (this.beat >> 2) % 4;
     for (let i = 0; i < 4; i++) g.rect(30 + i * 3, 15, 2, 2, q === i ? C.lime : C.dark);
     led(g, 34, 21, this.beat >= 0 && this.beat % 4 === 0 && this.eng.running, C.lime);
+    if (this.isAdv) drawButton(g, 62, 12, 26, 'TAP', now() - (this.taps[this.taps.length - 1] ?? -1e9) < 120 ? C.white : C.yellow);
   }
 }
 
-// ---------------------------------------------------------------- BEATS
+// ---------------------------------------------------------------- TRIG SEQ
 
-const ROW_NAMES = ['BD', 'SD', 'HH', 'CP'];
-
-// Drum patterns as step lists per row: BD, SD, HH, CP.
+// Rhythm presets as step lists per row; in drum terms the rows are kick, snare, hat, clap.
 export const BEAT_PRESETS: { name: string; rows: number[][] }[] = [
   { name: 'HOUSE', rows: [[0, 4, 8, 12], [], [2, 6, 10, 14], [4, 12]] },
   { name: 'TECHNO', rows: [[0, 4, 8, 12], [], [2, 3, 6, 7, 10, 11, 14, 15], [4, 12]] },
@@ -158,6 +207,105 @@ export const BEAT_PRESETS: { name: string; rows: number[][] }[] = [
   { name: 'DEMBOW', rows: [[0, 4, 8, 12], [3, 6, 11, 14], [0, 2, 4, 6, 8, 10, 12, 14], []] },
   { name: 'HALFTIME', rows: [[0, 3, 10], [8], [0, 4, 8, 12, 14], [8]] },
 ];
+
+// ---------------------------------------------------------------- PATTERNS
+
+const cellX = (c: number) => 26 + c * 7 + (c >> 2) * 2;
+const CHAINS = ['A', 'AB', 'ABC', 'ABCD'];
+
+// One sequencer pattern: its steps, plus per step a chance (in quarters, 4 = always)
+// and a ratchet count (hits within the step).
+interface Pat<T> { d: T; pr: number[]; rt: number[] }
+
+const digits = (str: string | undefined, def: number) =>
+  Array.from({ length: 16 }, (_, i) => { const n = Number(str?.[i]); return n >= 1 && n <= 4 ? n : def; });
+
+// Four patterns A-D. The advanced layout edits all of them, plays chance and ratchets
+// and can chain the first CHN patterns; the simple layout plays the one last edited.
+class Bank<T> {
+  pats: Pat<T>[];
+  edit = 0;
+  private pass = -1;
+
+  constructor(make: () => T) {
+    this.pats = [0, 1, 2, 3].map(() => ({ d: make(), pr: Array(16).fill(4), rt: Array(16).fill(1) }));
+  }
+
+  get cur() { return this.pats[this.edit]; }
+
+  reset() { this.pass = -1; }
+  // Call on step 0 of every pass.
+  wrap() { this.pass++; }
+
+  // The pattern playing this pass.
+  playing(chain: number, adv: boolean) {
+    return adv && chain > 1 ? this.pass % chain : this.edit;
+  }
+
+  // How many times step s of pattern i fires this time (0 when its chance says no).
+  hits(i: number, s: number, adv: boolean) {
+    if (!adv) return 1;
+    const p = this.pats[i];
+    return Math.random() * 4 < p.pr[s] ? p.rt[s] : 0;
+  }
+
+  copy(from: number, to: number) {
+    this.pats[to] = JSON.parse(JSON.stringify(this.pats[from]));
+  }
+
+  // Only pattern A in use, without chance or ratchets: saved in the older, shorter form.
+  plain(empty: (d: T) => boolean) {
+    return this.edit === 0 && this.pats.every((p, i) =>
+      (i === 0 || empty(p.d)) && p.pr.every((v) => v === 4) && p.rt.every((v) => v === 1));
+  }
+
+  save(out: (d: T) => unknown) {
+    return { pats: this.pats.map((p) => out(p.d)), pr: this.pats.map((p) => p.pr.join('')), rt: this.pats.map((p) => p.rt.join('')), e: this.edit };
+  }
+
+  // Returns false for the older, single-pattern form.
+  load(s: unknown, parse: (x: unknown) => T) {
+    const st = s as { pats?: unknown[]; pr?: string[]; rt?: string[]; e?: number } | null;
+    if (!st || !Array.isArray(st.pats)) return false;
+    this.pats.forEach((p, i) => {
+      p.d = parse(st.pats![i]);
+      p.pr = digits(st.pr?.[i], 4);
+      p.rt = digits(st.rt?.[i], 1);
+    });
+    this.edit = Math.min(3, Math.max(0, Math.round(st.e ?? 0)));
+    return true;
+  }
+}
+
+// Per-step values as bars (empty at the default), h pixels tall.
+function drawBars(g: Gfx, y: number, h: number, vals: number[], def: number, col: string, len: number, shown: number) {
+  vals.forEach((v, c) => {
+    const x = cellX(c);
+    g.rect(x, y, 6, h, c >= len ? C.black : c === shown ? C.slate : C.ink);
+    if (v === def) return;
+    const bh = Math.max(1, Math.round((v / 4) * h));
+    g.rect(x, y + h - bh, 6, bh, col);
+  });
+}
+
+// Clicking a bar steps it: chance 100 > 75 > 50 > 25%, ratchets 1 > 2 > 3 > 4.
+const nextChance = (v: number) => (v === 1 ? 4 : v - 1);
+const nextRatchet = (v: number) => (v % 4) + 1;
+
+// Pattern buttons A-D (the edited one lit, a dot on the one playing) and the chain.
+function drawPatRow(g: Gfx, y: number, edit: number, playing: number, chain: number) {
+  'ABCD'.split('').forEach((ch, i) => {
+    drawButton(g, 26 + i * 12, y, 11, ch, i === edit ? C.yellow : C.silver);
+    if (i === playing) g.rect(26 + i * 12 + 8, y + 2, 2, 2, C.green);
+  });
+  drawButton(g, 76, y, 36, 'CHN:' + CHAINS[chain - 1], C.cyan);
+  g.text('SHIFT=COPY', 116, y + 2, C.slate);
+}
+
+function patRowHit(lx: number, ly: number, y: number): number | 'chain' | null {
+  for (let i = 0; i < 4; i++) if (inBtn(lx, ly, 26 + i * 12, y, 11)) return i;
+  return inBtn(lx, ly, 76, y, 36) ? 'chain' : null;
+}
 
 interface GridPreset { name: string; rows: number[][] }
 
@@ -174,58 +322,84 @@ export function beatSteps(name: string) {
 const ROW_COLS = [C.red, C.orange, C.yellow, C.lime];
 
 // A 16-step trigger grid with one row per sound and an accent row under them, plus
-// preset, random and clear buttons. Subclasses decide what a lit step does.
+// preset, random and clear buttons. Advanced adds a reset input, chance and ratchet
+// rows, and patterns A-D. Subclasses decide what a lit step does.
 abstract class StepGrid extends Mod {
-  steps: boolean[][];
+  bank: Bank<boolean[][]>;
+  private rows: { name: string; col: string }[];
+  private presets: GridPreset[];
   private pos = -1;
   private shown = -1;
+  private shownPat = 0;
   private preset = -1;
+  private resetAt = Infinity;
 
   constructor(
     e: Engine, type: string, title: string, w: number, h: number,
-    private rows: { name: string; col: string }[], private presets: GridPreset[],
+    rows: { name: string; col: string }[], presets: GridPreset[],
   ) {
     super(e, type, title, 'seq', w, h);
-    this.steps = [...rows, null].map(() => Array(16).fill(false));
+    this.rows = rows;
+    this.presets = presets;
+    this.bank = new Bank(() => this.parse(null));
+    this.advanced('ADVANCED', w, h + 31);
+    this.p.chain = 1;
     this.port('clk', 'CLK', 'trig', 'in', 4, 12);
+    this.advOnly(() => this.port('rst', 'RST', 'trig', 'in', 4, 52));
   }
 
-  static cellX(c: number) { return 26 + c * 7 + (c >> 2) * 2; }
+  // The pattern being edited.
+  get steps() { return this.bank.cur.d; }
+  set steps(v: boolean[][]) { this.bank.cur.d = v; }
 
   private get acc() { return this.rows.length; }
-  // Where the preset bar and buttons sit, under the accent row.
-  protected get barY() { return 18 + (this.rows.length + 1) * 10; }
+  // Where the preset bar and buttons sit, under the last row.
+  protected get barY() { return 18 + (this.rows.length + (this.isAdv ? 3 : 1)) * 10; }
 
   private cellAt(lx: number, ly: number) {
     const r = Math.floor((ly - 16) / 10);
-    if (r < 0 || r > this.acc || ly - 16 - r * 10 > 8) return null;
+    if (r < 0 || r > this.acc + (this.isAdv ? 2 : 0) || ly - 16 - r * 10 > 8) return null;
     for (let c = 0; c < 16; c++) {
-      const x = StepGrid.cellX(c);
+      const x = cellX(c);
       if (lx >= x && lx < x + 7) return { r, c };
     }
     return null;
   }
 
-  reset(_t0: number) { this.pos = -1; this.shown = -1; }
+  reset(_t0: number) { this.pos = -1; this.shown = -1; this.bank.reset(); this.resetAt = Infinity; }
 
-  // Advance one step and call play for each lit row, with the step's accent.
+  onEvent(port: string, ev: Ev) {
+    if (ev.off) return;
+    if (port === 'rst') this.resetAt = ev.t;
+    if (port === 'clk') this.clock(ev);
+  }
+
+  protected abstract clock(ev: Ev): void;
+
+  // Advance one step and call play for each lit row (per ratchet hit), with the step's accent.
   protected step(ev: Ev, play: (row: number, ev: Ev) => void) {
+    if (ev.t >= this.resetAt - 0.001) { this.pos = -1; this.bank.reset(); this.resetAt = Infinity; }
     const s = (this.pos = (this.pos + 1) % this.p.len);
-    this.eng.at(ev.t, () => (this.shown = s));
-    const out = { ...ev, acc: this.steps[this.acc][s] };
-    for (let r = 0; r < this.acc; r++) if (this.steps[r][s]) play(r, out);
+    if (s === 0) this.bank.wrap();
+    const i = this.bank.playing(this.p.chain, this.isAdv), pat = this.bank.pats[i].d;
+    this.eng.at(ev.t, () => { this.shown = s; this.shownPat = i; });
+    const n = this.bank.hits(i, s, this.isAdv), acc = pat[this.acc][s];
+    for (let k = 0; k < n; k++) {
+      const hit = { ...ev, t: ev.t + (k * ev.dur) / n, dur: ev.dur / n, acc };
+      for (let r = 0; r < this.acc; r++) if (pat[r][s]) play(r, hit);
+    }
   }
 
   drawBody(g: Gfx) {
-    const len = this.p.len;
+    const len = this.p.len, shown = this.shownPat === this.bank.edit ? this.shown : -1;
     for (let c = 0; c < len; c++) {
-      g.rect(StepGrid.cellX(c), 13, 6, 2, c === this.shown ? C.lime : C.black);
+      g.rect(cellX(c), 13, 6, 2, c === shown ? C.lime : C.black);
     }
     this.steps.forEach((row, r) => {
       const y = 16 + r * 10, col = r === this.acc ? C.white : this.rows[r].col;
       g.text(r === this.acc ? 'AC' : this.rows[r].name, 16, y + 2, col);
       row.forEach((on, c) => {
-        const x = StepGrid.cellX(c), cur = c === this.shown;
+        const x = cellX(c), cur = c === shown;
         if (c >= len) {
           // steps past the pattern length are inactive
           g.rect(x, y, 6, 8, on ? C.slate : C.black);
@@ -240,6 +414,14 @@ abstract class StepGrid extends Mod {
       });
     });
     const y = this.barY;
+    if (this.isAdv) {
+      const py = 16 + (this.acc + 1) * 10;
+      g.text('PR', 16, py + 2, C.lime);
+      g.text('RT', 16, py + 12, C.cyan);
+      drawBars(g, py, 8, this.bank.cur.pr, 4, C.lime, len, shown);
+      drawBars(g, py + 10, 8, this.bank.cur.rt, 1, C.cyan, len, shown);
+      drawPatRow(g, y + 11, this.bank.edit, this.eng.running ? this.shownPat : -1, this.p.chain);
+    }
     drawPresetBar(g, 26, y, this.preset < 0 ? 'PRESET' : this.presets[this.preset].name);
     drawButton(g, 100, y, 22, 'RND', C.yellow);
     drawButton(g, 124, y, 22, 'CLR', C.silver);
@@ -251,7 +433,7 @@ abstract class StepGrid extends Mod {
     if (dir) {
       const n = this.presets.length;
       this.preset = (((this.preset < 0 && dir < 0 ? 0 : this.preset) + dir) % n + n) % n;
-      this.load(gridSteps(this.presets[this.preset], this.acc));
+      this.steps = this.parse(gridSteps(this.presets[this.preset], this.acc));
       this.eng.dirty = true;
       return noDrag;
     }
@@ -264,15 +446,33 @@ abstract class StepGrid extends Mod {
       return noDrag;
     }
     if (inBtn(lx, ly, 124, y, 22)) {
-      this.steps = this.steps.map(() => Array(16).fill(false));
+      this.steps = this.parse(null);
       this.eng.dirty = true;
       return noDrag;
     }
+    if (this.isAdv) {
+      const hit = patRowHit(lx, ly, y + 11);
+      if (hit === 'chain') this.set('chain', (this.p.chain % 4) + 1);
+      else if (hit !== null) { this.bank.edit = hit; this.eng.dirty = true; }
+      if (hit !== null) return noDrag;
+    }
     const first = this.cellAt(lx, ly);
     if (!first) return null;
+    if (first.r > this.acc) {
+      // chance or ratchet row: step the value, then paint it along a drag
+      const vals = first.r === this.acc + 1 ? this.bank.cur.pr : this.bank.cur.rt;
+      const val = (first.r === this.acc + 1 ? nextChance : nextRatchet)(vals[first.c]);
+      const apply = (cell: { r: number; c: number } | null) => {
+        if (cell?.r !== first.r) return;
+        vals[cell.c] = val;
+        this.eng.dirty = true;
+      };
+      apply(first);
+      return { move: (x, y) => apply(this.cellAt(x, y)) };
+    }
     const val = !this.steps[first.r][first.c];
     const apply = (cell: { r: number; c: number } | null) => {
-      if (!cell) return;
+      if (!cell || cell.r > this.acc) return;
       this.steps[cell.r][cell.c] = val;
       this.eng.dirty = true;
     };
@@ -280,27 +480,47 @@ abstract class StepGrid extends Mod {
     return { move: (x, y) => apply(this.cellAt(x, y)) };
   }
 
-  save() { return this.steps.map((row) => row.map((b) => (b ? 1 : 0)).join('')); }
+  // Shift+click a pattern button: copy the edited pattern there and edit the copy.
+  pressShift(lx: number, ly: number) {
+    const hit = this.isAdv ? patRowHit(lx, ly, this.barY + 11) : null;
+    if (typeof hit !== 'number') return false;
+    this.bank.copy(this.bank.edit, hit);
+    this.bank.edit = hit;
+    this.eng.dirty = true;
+    return true;
+  }
+
+  // Step strings (one per row) to steps; anything else gives an empty pattern.
+  private parse(x: unknown) {
+    const rows = Array.from({ length: this.acc + 1 }, () => Array(16).fill(false) as boolean[]);
+    if (Array.isArray(x)) x.forEach((row, r) => {
+      if (typeof row === 'string' && rows[r]) rows[r] = [...row.padEnd(16, '0')].slice(0, 16).map((ch) => ch === '1');
+    });
+    return rows;
+  }
+
+  save() {
+    const out = (d: boolean[][]) => d.map((row) => row.map((b) => (b ? 1 : 0)).join(''));
+    const empty = (d: boolean[][]) => d.every((row) => row.every((b) => !b));
+    return this.bank.plain(empty) ? out(this.bank.pats[0].d) : this.bank.save(out);
+  }
 
   load(s: unknown) {
-    if (!Array.isArray(s)) return;
-    s.forEach((row, r) => {
-      if (typeof row === 'string' && this.steps[r]) this.steps[r] = [...row.padEnd(16, '0')].slice(0, 16).map((ch) => ch === '1');
-    });
+    if (!this.bank.load(s, (x) => this.parse(x))) this.bank.pats[0].d = this.parse(s);
   }
 }
 
-// A trigger sequencer: one output per row, to patch into separate drum modules.
+// A trigger sequencer: four numbered rows, each with its own output, for drums,
+// envelopes or anything else that takes triggers. (Its type is still 'beats', the
+// name it had when its rows were drums.)
 export class Beats extends StepGrid {
   constructor(e: Engine) {
-    super(e, 'beats', 'BEATS', 160, 80, ROW_NAMES.map((name, r) => ({ name, col: ROW_COLS[r] })), BEAT_PRESETS);
-    ROW_NAMES.forEach((_, r) => this.port('o' + r, '', 'trig', 'out', 147, 16 + r * 10));
+    super(e, 'beats', 'TRIG SEQ', 160, 80, ROW_COLS.map((col, r) => ({ name: String(r + 1), col })), BEAT_PRESETS);
+    ROW_COLS.forEach((_, r) => this.port('o' + r, '', 'trig', 'out', 147, 16 + r * 10));
     this.knob({ id: 'len', label: 'LEN', x: 4, y: 31, min: 1, max: 16, def: 16, step: 1 });
   }
 
-  onEvent(port: string, ev: Ev) {
-    if (port === 'clk' && !ev.off) this.step(ev, (r, out) => this.emit('o' + r, out));
-  }
+  protected clock(ev: Ev) { this.step(ev, (r, out) => this.emit('o' + r, out)); }
 }
 
 // ---------------------------------------------------------------- DRUMS
@@ -638,7 +858,7 @@ const DM_ROWS = [
 const DM_LEVELS = [1, 0.8, 0.45, 0.4, 0.7];
 const DM_KITS = ['808', '909', 'LOFI'];
 
-// A few patterns with open hats, then the BEATS ones (whose hats become closed hats).
+// A few patterns with open hats, then the TRIG SEQ ones (whose hats become closed hats).
 export const DM_PRESETS: GridPreset[] = [
   { name: 'ACID', rows: [[0, 4, 8, 12], [], [0, 1, 3, 4, 5, 7, 8, 9, 11, 12, 13, 15], [2, 6, 10, 14], [4, 12], [2, 6, 10, 14]] },
   { name: 'JACK', rows: [[0, 4, 8, 12], [4, 12], [0, 2, 4, 6, 8, 10, 12, 14], [2, 6, 10, 14], [], [0, 8]] },
@@ -709,8 +929,10 @@ export class DrumMachine extends StepGrid {
     }
   }
 
-  onEvent(port: string, ev: Ev) {
-    if (port === 'clk' && !ev.off) this.play(ev);
+  protected clock(ev: Ev) { this.play(ev); }
+
+  protected layout(adv: boolean) {
+    for (const id of ['bpm', 'swing', 'len', 'kit', 'vol']) this.knobById(id).y = this.barY + (adv ? 23 : 12);
   }
 
   private play(ev: Ev) {
@@ -749,18 +971,22 @@ export function melodyState(name: string) {
 // How fast a slide glides to its note (time constant, seconds).
 const SLIDE_TC = 0.025;
 
+interface MelPat { n: number[]; a: boolean[]; s: boolean[] }
+
 export class Melody extends Mod {
-  notes: number[] = Array(16).fill(-1);
-  acc: boolean[] = Array(16).fill(false);
-  slide: boolean[] = Array(16).fill(false);
+  bank = new Bank<MelPat>(() => Melody.parse(null));
   pit = cvSource();
   accCv = cvSource();
   private pos = -1;
   private shown = -1;
+  private shownPat = 0;
   private preset = -1;
+  private resetAt = Infinity;
 
   constructor(e: Engine) {
     super(e, 'melody', 'MELODY', 'seq', 160, 102);
+    this.advanced('ADVANCED', 160, 123);
+    this.p.chain = 1;
     this.port('clk', 'CLK', 'trig', 'in', 4, 12);
     this.port('pit', 'PIT', 'cv', 'out', 147, 12);
     this.port('gate', 'GAT', 'trig', 'out', 147, 33);
@@ -770,6 +996,19 @@ export class Melody extends Mod {
     this.knob({ id: 'scale', label: 'SCL', x: 42, y: 80, min: 0, max: 3, def: 1, names: SCALE_NAMES });
     this.knob({ id: 'oct', label: 'OCT', x: 58, y: 80, min: 1, max: 5, def: 2, step: 1 });
     this.knob({ id: 'gate', label: 'GAT', x: 74, y: 80, min: 0.1, max: 1, def: 0.5, fmt: pct });
+    this.advOnly(() => this.port('rst', 'RST', 'trig', 'in', 4, 52));
+  }
+
+  // The pattern being edited.
+  get notes() { return this.bank.cur.d.n; }
+  get acc() { return this.bank.cur.d.a; }
+  get slide() { return this.bank.cur.d.s; }
+
+  // The advanced layout adds the chance and ratchet rows, pushing the controls down.
+  private get dy() { return this.isAdv ? 10 : 0; }
+
+  protected layout() {
+    for (const id of ['root', 'scale', 'oct', 'gate']) this.knobById(id).y = 80 + this.dy;
   }
 
   audioOut(port: string) { return port === 'acc' ? this.accCv : this.pit; }
@@ -784,55 +1023,65 @@ export class Melody extends Mod {
 
   private colAt(lx: number) {
     for (let c = 0; c < 16; c++) {
-      const x = StepGrid.cellX(c);
+      const x = cellX(c);
       if (lx >= x && lx < x + 7) return c;
     }
     return -1;
   }
 
-  // A note cell, or a cell in the accent ('a') / slide ('s') rows.
-  private cellAt(lx: number, ly: number): { r: number | 'a' | 's'; c: number } | null {
+  // A note cell, or a cell in the accent / slide (and chance / ratchet) rows.
+  private cellAt(lx: number, ly: number): { r: number | 'a' | 's' | 'p' | 't'; c: number } | null {
     const c = this.colAt(lx);
     if (c < 0) return null;
-    if (ly >= 66 && ly < 70) return { r: 'a', c };
-    if (ly >= 71 && ly < 75) return { r: 's', c };
+    if (ly >= 66 && ly < 71) return { r: 'a', c };
+    if (ly >= 71 && ly < 76) return { r: 's', c };
+    if (this.isAdv && ly >= 76 && ly < 81) return { r: 'p', c };
+    if (this.isAdv && ly >= 81 && ly < 86) return { r: 't', c };
     const r = 7 - Math.floor((ly - 16) / 6);
     if (r < 0 || r > 7 || ly < 16) return null;
     return { r, c };
   }
 
-  reset() { this.pos = -1; this.shown = -1; }
+  reset() { this.pos = -1; this.shown = -1; this.bank.reset(); this.resetAt = Infinity; }
 
   onEvent(port: string, ev: Ev) {
-    if (port !== 'clk' || ev.off) return;
+    if (ev.off) return;
+    if (port === 'rst') { this.resetAt = ev.t; return; }
+    if (port !== 'clk') return;
+    if (ev.t >= this.resetAt - 0.001) { this.pos = -1; this.bank.reset(); this.resetAt = Infinity; }
     const len = this.p.len;
     const s = (this.pos = (this.pos + 1) % len);
-    this.eng.at(ev.t, () => (this.shown = s));
-    const r = this.notes[s];
-    if (r < 0) return;
+    if (s === 0) this.bank.wrap();
+    const i = this.bank.playing(this.p.chain, this.isAdv), pat = this.bank.pats[i].d;
+    this.eng.at(ev.t, () => { this.shown = s; this.shownPat = i; });
+    const r = pat.n[s], hits = r < 0 ? 0 : this.bank.hits(i, s, this.isAdv);
+    if (!hits) return;
     // A slide on the next step keeps this note held so the synth can glide into it.
     const next = (s + 1) % len;
-    const tie = this.slide[next] && this.notes[next] >= 0;
-    const dur = tie ? ev.dur * 1.05 : ev.dur * this.p.gate;
+    const tie = pat.s[next] && pat.n[next] >= 0;
     const note = 12 * (this.p.oct + 1) + this.p.root + this.semi(r);
-    const v = (note - PITCH_REF) / 12, acc = this.acc[s], slide = this.slide[s];
+    const v = (note - PITCH_REF) / 12, acc = pat.a[s], slide = pat.s[s];
     if (slide) this.pit.offset.setTargetAtTime(v, ev.t, SLIDE_TC);
     else this.pit.offset.setValueAtTime(v, ev.t);
     this.accCv.offset.setValueAtTime(acc ? 1 : 0, ev.t);
-    this.emit('gate', { t: ev.t, dur, acc, slide });
+    const each = ev.dur / hits;
+    for (let k = 0; k < hits; k++) {
+      const dur = k === hits - 1 && tie ? each * 1.05 : each * this.p.gate;
+      this.emit('gate', { t: ev.t + k * each, dur, acc, slide: k === 0 && slide });
+    }
   }
 
   drawBody(g: Gfx) {
-    const len = this.p.len;
+    const len = this.p.len, dy = this.dy, shown = this.shownPat === this.bank.edit ? this.shown : -1;
     for (let c = 0; c < len; c++) {
-      g.rect(StepGrid.cellX(c), 13, 6, 2, c === this.shown ? C.lime : C.black);
+      g.rect(cellX(c), 13, 6, 2, c === shown ? C.lime : C.black);
     }
     const sl = SCALES[this.p.scale].length;
     for (let r = 0; r < 8; r++) {
       const y = this.rowY(r);
       g.text(NOTE_NAMES[(this.p.root + this.semi(r)) % 12], 16, y, r % sl === 0 ? C.yellow : C.slate);
       for (let c = 0; c < 16; c++) {
-        const x = StepGrid.cellX(c), cur = c === this.shown;
+        const x = cellX(c), cur = c === shown;
         if (c >= len) g.rect(x, y, 6, 5, this.notes[c] === r ? C.slate : C.black);
         else if (this.notes[c] === r) {
           g.rect(x, y, 6, 5, cur ? C.white : C.yellow);
@@ -846,72 +1095,109 @@ export class Melody extends Mod {
     g.text('AC', 16, 65, C.white);
     g.text('SL', 16, 70, C.sky);
     for (let c = 0; c < 16; c++) {
-      const x = StepGrid.cellX(c), off = c >= len ? C.black : C.ink;
+      const x = cellX(c), off = c >= len ? C.black : C.ink;
       g.rect(x, 66, 6, 4, this.acc[c] ? C.white : off);
       g.rect(x, 71, 6, 4, this.slide[c] ? C.sky : off);
     }
-    drawPresetBar(g, 104, 79, this.preset < 0 ? 'PRESET' : MELODY_PRESETS[this.preset].name, 54);
-    drawButton(g, 104, 90, 25, 'RND', C.yellow);
-    drawButton(g, 131, 90, 25, 'CLR', C.silver);
+    if (this.isAdv) {
+      g.text('PR', 16, 75, C.lime);
+      g.text('RT', 16, 80, C.cyan);
+      drawBars(g, 76, 4, this.bank.cur.pr, 4, C.lime, len, shown);
+      drawBars(g, 81, 4, this.bank.cur.rt, 1, C.cyan, len, shown);
+      drawPatRow(g, 111, this.bank.edit, this.eng.running ? this.shownPat : -1, this.p.chain);
+    }
+    drawPresetBar(g, 104, 79 + dy, this.preset < 0 ? 'PRESET' : MELODY_PRESETS[this.preset].name, 54);
+    drawButton(g, 104, 90 + dy, 25, 'RND', C.yellow);
+    drawButton(g, 131, 90 + dy, 25, 'CLR', C.silver);
   }
 
   press(lx: number, ly: number): Drag | null {
-    const dir = presetStep(lx, ly, 104, 79, 54);
+    const dy = this.dy, d = this.bank.cur.d;
+    const dir = presetStep(lx, ly, 104, 79 + dy, 54);
     if (dir) {
       const n = MELODY_PRESETS.length;
       this.preset = (((this.preset < 0 && dir < 0 ? 0 : this.preset) + dir) % n + n) % n;
       const pre = MELODY_PRESETS[this.preset];
-      this.load(melodyState(pre.name));
+      this.bank.cur.d = Melody.parse(melodyState(pre.name));
       this.set('scale', pre.scale);
       return noDrag;
     }
-    if (inBtn(lx, ly, 104, 90, 25)) {
-      this.notes = this.notes.map(() => (Math.random() < 0.7 ? Math.floor(Math.random() ** 1.6 * 8) : -1));
-      this.acc = this.acc.map(() => Math.random() < 0.2);
-      this.slide = this.slide.map(() => Math.random() < 0.15);
+    if (inBtn(lx, ly, 104, 90 + dy, 25)) {
+      d.n = d.n.map(() => (Math.random() < 0.7 ? Math.floor(Math.random() ** 1.6 * 8) : -1));
+      d.a = d.a.map(() => Math.random() < 0.2);
+      d.s = d.s.map(() => Math.random() < 0.15);
       this.eng.dirty = true;
       return noDrag;
     }
-    if (inBtn(lx, ly, 131, 90, 25)) {
-      this.notes.fill(-1);
-      this.acc.fill(false);
-      this.slide.fill(false);
+    if (inBtn(lx, ly, 131, 90 + dy, 25)) {
+      this.bank.cur.d = Melody.parse(null);
       this.eng.dirty = true;
       return noDrag;
+    }
+    if (this.isAdv) {
+      const hit = patRowHit(lx, ly, 111);
+      if (hit === 'chain') this.set('chain', (this.p.chain % 4) + 1);
+      else if (hit !== null) { this.bank.edit = hit; this.eng.dirty = true; }
+      if (hit !== null) return noDrag;
     }
     const first = this.cellAt(lx, ly);
     if (!first) return null;
+    if (first.r === 'p' || first.r === 't') {
+      // chance or ratchet row: step the value, then paint it along a drag
+      const vals = first.r === 'p' ? this.bank.cur.pr : this.bank.cur.rt;
+      const val = (first.r === 'p' ? nextChance : nextRatchet)(vals[first.c]);
+      const apply = (c: number) => { if (c >= 0) { vals[c] = val; this.eng.dirty = true; } };
+      apply(first.c);
+      return { move: (x) => apply(this.colAt(x)) };
+    }
     if (first.r === 'a' || first.r === 's') {
-      const row = first.r === 'a' ? this.acc : this.slide;
+      const row = first.r === 'a' ? d.a : d.s;
       const val = !row[first.c];
       const apply = (c: number) => { if (c >= 0) { row[c] = val; this.eng.dirty = true; } };
       apply(first.c);
       return { move: (x) => apply(this.colAt(x)) };
     }
-    const erase = this.notes[first.c] === first.r;
-    const apply = (cell: { r: number | 'a' | 's'; c: number } | null) => {
+    const erase = d.n[first.c] === first.r;
+    const apply = (cell: { r: number | string; c: number } | null) => {
       if (!cell || typeof cell.r !== 'number') return;
-      this.notes[cell.c] = erase ? -1 : cell.r;
+      d.n[cell.c] = erase ? -1 : cell.r;
       this.eng.dirty = true;
     };
     apply(first);
     return { move: (x, y) => apply(this.cellAt(x, y)) };
   }
 
+  // Shift+click a pattern button: copy the edited pattern there and edit the copy.
+  pressShift(lx: number, ly: number) {
+    const hit = this.isAdv ? patRowHit(lx, ly, 111) : null;
+    if (typeof hit !== 'number') return false;
+    this.bank.copy(this.bank.edit, hit);
+    this.bank.edit = hit;
+    this.eng.dirty = true;
+    return true;
+  }
+
+  // A saved pattern { n, a, s } (or, from older patches, just the notes array).
+  static parse(x: unknown): MelPat {
+    const st = (Array.isArray(x) ? { n: x } : x ?? {}) as { n?: unknown[]; a?: string; s?: string };
+    const n = Array.isArray(st.n) ? st.n : [];
+    const bits = (b?: string) => Array.from({ length: 16 }, (_, i) => b?.[i] === '1');
+    return {
+      n: Array.from({ length: 16 }, (_, i) => (typeof n[i] === 'number' ? (n[i] as number) : -1)),
+      a: bits(st.a),
+      s: bits(st.s),
+    };
+  }
+
   save() {
     const bits = (b: boolean[]) => b.map((x) => (x ? '1' : '0')).join('');
-    return { n: this.notes, a: bits(this.acc), s: bits(this.slide) };
+    const out = (d: MelPat) => ({ n: d.n, a: bits(d.a), s: bits(d.s) });
+    const empty = (d: MelPat) => d.n.every((v) => v < 0) && !d.a.includes(true) && !d.s.includes(true);
+    return this.bank.plain(empty) ? out(this.bank.pats[0].d) : this.bank.save(out);
   }
 
   load(s: unknown) {
-    // Older patches stored just the notes array.
-    const st = (Array.isArray(s) ? { n: s } : s) as { n?: unknown[]; a?: string; s?: string } | null;
-    if (!st) return;
-    const n = Array.isArray(st.n) ? st.n : [];
-    this.notes = Array.from({ length: 16 }, (_, i) => (typeof n[i] === 'number' ? (n[i] as number) : -1));
-    const bits = (x?: string) => Array.from({ length: 16 }, (_, i) => x?.[i] === '1');
-    this.acc = bits(st.a);
-    this.slide = bits(st.s);
+    if (!this.bank.load(s, Melody.parse)) this.bank.pats[0].d = Melody.parse(s);
   }
 }
 
@@ -1205,57 +1491,54 @@ function release(v: Voice, t: number) {
 
 // ---------------------------------------------------------------- MIXER
 
+// Four channels with levels; BIG makes it eight, each with stereo pan.
 export class Mixer extends Mod {
-  ins = [0, 1, 2, 3].map(() => ac.createGain());
-  out = ac.createGain();
-
-  constructor(e: Engine) {
-    super(e, 'mixer', 'MIXER', 'util', 64, 66);
-    this.ins.forEach((g, c) => {
-      g.connect(this.out);
-      this.port('i' + c, String(c + 1), 'audio', 'in', 5 + c * 15, 13);
-      this.knob({ id: 'l' + c, label: '', x: 4 + c * 15, y: 30, min: 0, max: 1, def: 0.8, fmt: pct });
-    });
-    this.knob({ id: 'vol', label: 'VOL', x: 4, y: 47, min: 0, max: 1.5, def: 1, fmt: pct });
-    this.port('out', 'OUT', 'audio', 'out', 51, 46);
-  }
-
-  onParam(id: string, v: number) {
-    const g = id === 'vol' ? this.out : this.ins[Number(id.slice(1))];
-    g.gain.setTargetAtTime(v, ac.currentTime, 0.01);
-  }
-
-  audioIn(port: string) { return this.ins[Number(port.slice(1))]; }
-  audioOut() { return this.out; }
-}
-
-// Eight channels, each with level and stereo pan, plus a master volume.
-export class BigMixer extends Mod {
   ins = Array.from({ length: 8 }, () => ac.createGain());
   pans = this.ins.map((g) => g.connect(ac.createStereoPanner()) as StereoPannerNode);
   out = ac.createGain();
 
   constructor(e: Engine) {
-    super(e, 'mixer8', 'BIG MIXER', 'util', 142, 84);
+    super(e, 'mixer', 'MIXER', 'util', 64, 66);
+    this.advanced('BIG', 142, 84);
     const panFmt = (v: number) => (Math.abs(v) < 0.02 ? 'C' : (v < 0 ? 'L' : 'R') + Math.round(Math.abs(v) * 100));
     this.ins.forEach((_, c) => {
       this.pans[c].connect(this.out);
-      this.port('i' + c, String(c + 1), 'audio', 'in', 19 + c * 15, 13);
-      this.knob({ id: 'l' + c, label: '', x: 18 + c * 15, y: 30, min: 0, max: 1, def: 0.8, fmt: pct });
-      this.knob({ id: 'p' + c, label: '', x: 18 + c * 15, y: 45, min: -1, max: 1, def: 0, fmt: panFmt });
+      const add = () => {
+        this.port('i' + c, String(c + 1), 'audio', 'in', 0, 13);
+        this.knob({ id: 'l' + c, label: '', x: 0, y: 30, min: 0, max: 1, def: 0.8, fmt: pct });
+      };
+      if (c < 4) add(); else this.advOnly(add);
     });
-    this.knob({ id: 'vol', label: 'VOL', x: 18, y: 62, min: 0, max: 1.5, def: 1, fmt: pct });
-    this.port('out', 'OUT', 'audio', 'out', 129, 62);
+    this.advOnly(() => this.ins.forEach((_, c) =>
+      this.knob({ id: 'p' + c, label: '', x: 0, y: 45, min: -1, max: 1, def: 0, fmt: panFmt })));
+    this.knob({ id: 'vol', label: 'VOL', x: 0, y: 0, min: 0, max: 1.5, def: 1, fmt: pct });
+    this.port('out', 'OUT', 'audio', 'out', 0, 0);
+    this.layout(false);
+  }
+
+  // Big: a LVL / PAN label column on the left, the master row at the bottom.
+  protected layout(big: boolean) {
+    const x0 = big ? 18 : 4;
+    this.ins.forEach((_, c) => {
+      this.portById('i' + c).x = x0 + 1 + c * 15;
+      this.knobById('l' + c).x = x0 + c * 15;
+      this.knobById('p' + c).x = x0 + c * 15;
+      // Panning only applies in the big layout.
+      this.pans[c].pan.setTargetAtTime(big ? this.p['p' + c] : 0, ac.currentTime, 0.01);
+    });
+    Object.assign(this.knobById('vol'), big ? { x: 18, y: 62 } : { x: 4, y: 47 });
+    Object.assign(this.portById('out'), big ? { x: 129, y: 62 } : { x: 51, y: 46 });
   }
 
   onParam(id: string, v: number) {
     const t = ac.currentTime, c = Number(id.slice(1));
     if (id === 'vol') this.out.gain.setTargetAtTime(v, t, 0.01);
     else if (id[0] === 'l') this.ins[c].gain.setTargetAtTime(v, t, 0.01);
-    else this.pans[c].pan.setTargetAtTime(v, t, 0.01);
+    else if (id[0] === 'p' && this.isAdv) this.pans[c].pan.setTargetAtTime(v, t, 0.01);
   }
 
   drawBody(g: Gfx) {
+    if (!this.isAdv) return;
     g.text('LVL', 3, 33, C.silver);
     g.text('PAN', 3, 48, C.silver);
   }
@@ -2002,6 +2285,329 @@ export class Quant extends Mod {
   destroy() { this.node?.disconnect(); }
 }
 
+// ---------------------------------------------------------------- TURING
+
+// A Turing machine: a 16-bit shift register that loops its last LEN bits. CHG is the
+// chance that a bit flips as it comes round, so 0 locks a loop and 100% is all random.
+// OUT is the low 8 bits as a voltage (0..RNG octaves of pitch, ready for QUANT); GATE
+// fires on steps whose newest bit is 1.
+export class Turing extends Mod {
+  out = cvSource();
+  reg = Math.floor(Math.random() * 0x10000);
+  private shown = this.reg;
+
+  constructor(e: Engine) {
+    super(e, 'turing', 'TURING', 'seq', 64, 66);
+    this.knobRow([
+      { id: 'chg', label: 'CHG', min: 0, max: 1, def: 0.1, fmt: pct },
+      { id: 'len', label: 'LEN', min: 2, max: 16, def: 8, step: 1 },
+      { id: 'rng', label: 'RNG', min: 0, max: 2, def: 1, fmt: (v) => v.toFixed(2) + 'OCT' },
+    ], 22, 18);
+    this.port('clk', 'CLK', 'trig', 'in', 5, 45);
+    this.port('out', 'OUT', 'cv', 'out', 36, 45);
+    this.port('gate', 'GAT', 'trig', 'out', 51, 45);
+  }
+
+  onEvent(_port: string, ev: Ev) {
+    if (ev.off) return;
+    let bit = (this.reg >> (this.p.len - 1)) & 1;
+    if (Math.random() < this.p.chg) bit ^= 1;
+    const reg = (this.reg = ((this.reg << 1) | bit) & 0xffff);
+    this.out.offset.setValueAtTime(((reg & 0xff) / 255) * this.p.rng, ev.t);
+    if (bit) this.emit('gate', ev);
+    this.eng.at(ev.t, () => (this.shown = reg));
+  }
+
+  drawBody(g: Gfx) {
+    // The register, newest bit on the right; bits outside the loop are dim.
+    for (let i = 0; i < 16; i++) {
+      const on = (this.shown >> (15 - i)) & 1, inLoop = 15 - i < this.p.len;
+      g.rect(4 + i * 3 + (i >> 2), 13, 2, 4, on ? (inLoop ? C.yellow : C.slate) : C.black);
+    }
+  }
+
+  save() { return this.reg; }
+  load(s: unknown) { if (typeof s === 'number') this.reg = this.shown = s & 0xffff; }
+
+  audioOut() { return this.out; }
+  destroy() { this.out.stop(); }
+}
+
+// ---------------------------------------------------------------- LOGIC
+
+interface Span { t: number; end: number } // end is Infinity while a live gate is held
+
+// Gate logic, built for triggers and short gates. AND fires when a gate starts while the
+// other input is open (or both start together), lasting while both are open. OR fires on
+// every gate of either (gates that start together count once). XOR fires on a gate that
+// starts while the other input is closed.
+// Gates arrive one at a time while the clock schedules a step, so they are collected
+// and judged together once that scheduling pass is done.
+export class Logic extends Mod {
+  private open: (Span | null)[] = [null, null];
+  private pending: { i: number; ev: Ev }[] = [];
+  private held = new Set<string>(); // outputs holding a live gate open
+
+  constructor(e: Engine) {
+    super(e, 'logic', 'LOGIC', 'seq', 64, 52);
+    this.port('and', 'AND', 'trig', 'out', 22, 12);
+    this.port('or', 'OR', 'trig', 'out', 37, 12);
+    this.port('xor', 'XOR', 'trig', 'out', 51, 12);
+    this.port('a', 'A', 'trig', 'in', 5, 32);
+    this.port('b', 'B', 'trig', 'in', 20, 32);
+  }
+
+  reset() { this.open = [null, null]; this.pending = []; this.held.clear(); }
+
+  onEvent(port: string, ev: Ev) {
+    this.pending.push({ i: port === 'a' ? 0 : 1, ev });
+    if (this.pending.length === 1) queueMicrotask(() => this.judge());
+  }
+
+  private judge() {
+    const evs = this.pending.sort((x, y) => x.ev.t - y.ev.t);
+    this.pending = [];
+    for (let k = 0; k < evs.length;) {
+      const t = evs[k].ev.t, started = [false, false];
+      let acc = false;
+      for (; k < evs.length && evs[k].ev.t - t < 0.001; k++) {
+        const { i, ev } = evs[k];
+        if (ev.off) { if (this.open[i]) this.open[i]!.end = ev.t; continue; }
+        this.open[i] = { t: ev.t, end: ev.hold ? Infinity : ev.t + ev.dur };
+        started[i] = true;
+        acc ||= !!ev.acc;
+      }
+      const on = (i: number) => !!this.open[i] && this.open[i]!.t <= t && this.open[i]!.end > t;
+      const end = (i: number) => (on(i) ? this.open[i]!.end : t);
+      if (started[0] || started[1]) {
+        const starters = [0, 1].filter((i) => started[i]);
+        this.gate('or', t, Math.max(...starters.map(end)), acc);
+        if (on(0) && on(1)) this.gate('and', t, Math.min(end(0), end(1)), acc);
+        if (on(0) !== on(1)) this.gate('xor', t, end(on(0) ? 0 : 1), acc);
+      }
+      // Live gates that were held open close when their condition ends.
+      const still = { and: on(0) && on(1), or: on(0) || on(1), xor: on(0) !== on(1) };
+      for (const out of [...this.held]) {
+        if (!still[out as keyof typeof still]) { this.held.delete(out); this.emit(out, { t, dur: 0, off: true }); }
+      }
+    }
+  }
+
+  private gate(out: string, t: number, end: number, acc: boolean) {
+    if (end === Infinity) { this.held.add(out); this.emit(out, { t, dur: 0, hold: true, acc }); }
+    else this.emit(out, { t, dur: Math.max(0.005, end - t), acc });
+  }
+}
+
+// ---------------------------------------------------------------- SEQ SWITCH
+
+// Sequential switch: each trigger passes the next input (of STP) to the output. RST
+// goes back to input 1. Works for CV and audio alike.
+export class SeqSwitch extends Mod {
+  ins = [0, 1, 2, 3].map(() => ac.createGain());
+  out = ac.createGain();
+  private pos = 0;
+  private shown = 0;
+
+  constructor(e: Engine) {
+    super(e, 'seqsw', 'SEQ SW', 'mod', 64, 66);
+    this.ins.forEach((g, i) => {
+      g.gain.value = i === 0 ? 1 : 0;
+      g.connect(this.out);
+      this.port('i' + i, String(i + 1), 'cv', 'in', 5 + i * 15, 13);
+    });
+    this.knob({ id: 'steps', label: 'STP', x: 4, y: 32, min: 2, max: 4, def: 4, step: 1 });
+    this.port('trg', 'TRG', 'trig', 'in', 5, 51);
+    this.port('rst', 'RST', 'trig', 'in', 20, 51);
+    // Audio-typed, so it can feed both CV and audio inputs.
+    this.port('out', 'OUT', 'audio', 'out', 51, 51);
+  }
+
+  private select(i: number, t: number) {
+    this.pos = i;
+    this.ins.forEach((g, k) => g.gain.setTargetAtTime(k === i ? 1 : 0, t, 0.002));
+    this.eng.at(t, () => (this.shown = i));
+  }
+
+  reset() { this.select(0, ac.currentTime); }
+
+  onEvent(port: string, ev: Ev) {
+    if (ev.off) return;
+    this.select(port === 'rst' ? 0 : (this.pos + 1) % this.p.steps, ev.t);
+  }
+
+  drawBody(g: Gfx) {
+    const i = this.shown;
+    g.frame(4 + i * 15, 12, 11, 11, C.lime);
+    for (let k = 0; k < this.p.steps; k++) g.rect(23 + k * 8, 36, 5, 3, k === i ? C.lime : C.black);
+  }
+
+  audioIn(port: string) { return this.ins[Number(port.slice(1))]; }
+  audioOut() { return this.out; }
+}
+
+// ---------------------------------------------------------------- CV MIX
+
+// Three CVs, each scaled (and flipped) by its knob, plus an offset.
+export class CvMix extends Mod {
+  ins = [0, 1, 2].map(() => ac.createGain());
+  ofs = cvSource();
+  out = ac.createGain();
+
+  constructor(e: Engine) {
+    super(e, 'cvmix', 'CV MIX', 'mod', 64, 52);
+    for (const g of this.ins) g.connect(this.out);
+    this.ofs.connect(this.out);
+    const amt = (v: number) => 'X' + v.toFixed(2);
+    this.knobRow([
+      { id: 'a0', label: '1', min: -1, max: 1, def: 1, fmt: amt },
+      { id: 'a1', label: '2', min: -1, max: 1, def: 1, fmt: amt },
+      { id: 'a2', label: '3', min: -1, max: 1, def: 1, fmt: amt },
+      { id: 'ofs', label: 'OFS', min: -1, max: 1, def: 0, fmt: (v) => (v > 0 ? '+' : '') + v.toFixed(2) },
+    ], 13);
+    this.ins.forEach((_, i) => this.port('i' + i, '', 'cv', 'in', 5 + i * 15, 32));
+    this.port('out', 'OUT', 'cv', 'out', 51, 32);
+  }
+
+  onParam(id: string, v: number) {
+    const t = ac.currentTime;
+    if (id === 'ofs') this.ofs.offset.setTargetAtTime(v, t, 0.01);
+    else this.ins[Number(id.slice(1))].gain.setTargetAtTime(v, t, 0.01);
+  }
+
+  audioIn(port: string) { return this.ins[Number(port.slice(1))]; }
+  audioOut() { return this.out; }
+  destroy() { this.ofs.stop(); }
+}
+
+// ---------------------------------------------------------------- RING MOD
+
+// Multiplies IN by CAR (the carrier): metallic, bell-like sidebands. MIX blends in the dry IN.
+export class Ring extends Mod {
+  in = ac.createGain();
+  car = ac.createGain();
+  vca = ac.createGain();
+  dry = ac.createGain();
+  wet = ac.createGain();
+  out = ac.createGain();
+
+  constructor(e: Engine) {
+    super(e, 'ring', 'RING', 'fx', 50, 52);
+    this.vca.gain.value = 0;
+    this.in.connect(this.vca).connect(this.wet).connect(this.out);
+    this.car.connect(this.vca.gain);
+    this.in.connect(this.dry).connect(this.out);
+    this.knob({ id: 'mix', label: 'MIX', x: 4, y: 13, min: 0, max: 1, def: 1, fmt: pct });
+    this.port('in', 'IN', 'audio', 'in', 4, 32);
+    this.port('car', 'CAR', 'cv', 'in', 20, 32);
+    this.port('out', 'OUT', 'audio', 'out', 37, 32);
+  }
+
+  onParam(_id: string, v: number) {
+    // The product is quieter than its inputs, so the wet side gets a lift.
+    this.wet.gain.setTargetAtTime(v * 2, ac.currentTime, 0.02);
+    this.dry.gain.setTargetAtTime(1 - v, ac.currentTime, 0.02);
+  }
+
+  audioIn(port: string) { return port === 'car' ? this.car : this.in; }
+  audioOut() { return this.out; }
+}
+
+// ---------------------------------------------------------------- SCOPE
+
+// Window lengths for TIM, in seconds.
+const scopeSec = (v: number) => 0.002 * 300 ** v;
+
+// The pitch of a signal by autocorrelation, or 0 if it has none (silence, or a CV
+// that steps or drifts rather than oscillates).
+function detectPitch(raw: Float32Array, rate: number) {
+  let mean = 0;
+  for (const v of raw) mean += v;
+  mean /= raw.length;
+  const buf = raw.map((v) => v - mean);
+  let rms = 0, crossings = 0;
+  for (let i = 0; i < buf.length; i++) {
+    rms += buf[i] * buf[i];
+    if (i && buf[i - 1] < 0 && buf[i] >= 0) crossings++;
+  }
+  if (Math.sqrt(rms / buf.length) < 0.01 || crossings < 4) return 0;
+  const n = buf.length >> 1, minLag = Math.floor(rate / 2000), maxLag = Math.floor(rate / 30);
+  let best = 0, bestLag = 0, prev = 1, rising = false;
+  for (let lag = minLag; lag < Math.min(maxLag, n); lag++) {
+    let sum = 0, e0 = 0, e1 = 0;
+    // every other sample is plenty, and keeps this cheap
+    for (let i = 0; i < n; i += 2) { sum += buf[i] * buf[i + lag]; e0 += buf[i] * buf[i]; e1 += buf[i + lag] * buf[i + lag]; }
+    const r = sum / Math.sqrt(e0 * e1 || 1);
+    // the first strong peak after the correlation has dipped
+    if (r > prev && prev < 0.5) rising = true;
+    if (rising && r > best) { best = r; bestLag = lag; }
+    if (rising && r < prev && best > 0.9) break;
+    prev = r;
+  }
+  return best > 0.8 ? rate / bestLag : 0;
+}
+
+// Two-trace oscilloscope with a tuner on input A. At AMP X1 the screen spans -1..1.
+export class Scope extends Mod {
+  ins = [ac.createGain(), ac.createGain()];
+  ans = [ac.createAnalyser(), ac.createAnalyser()];
+  private bufs = [new Float32Array(32768), new Float32Array(32768)];
+  private frame = 0;
+  private hz = 0;
+
+  constructor(e: Engine) {
+    super(e, 'scope', 'SCOPE', 'util', 100, 70);
+    this.ins.forEach((g, i) => {
+      this.ans[i].fftSize = 32768;
+      g.connect(this.ans[i]);
+    });
+    this.port('a', 'A', 'cv', 'in', 4, 51);
+    this.port('b', 'B', 'cv', 'in', 19, 51);
+    this.knob({ id: 'tim', label: 'TIM', x: 34, y: 50, min: 0, max: 1, def: 0.4, fmt: (v) => ms(scopeSec(v)) });
+    this.knob({ id: 'amp', label: 'AMP', x: 49, y: 50, min: 0.25, max: 4, def: 1, fmt: (v) => 'X' + v.toFixed(2) });
+  }
+
+  drawBody(g: Gfx) {
+    const x0 = 3, y0 = 12, w = 94, h = 36, mid = y0 + h / 2;
+    g.rect(x0, y0, w, h, C.black);
+    for (let x = x0 + 4; x < x0 + w; x += 8) g.px(x, mid, C.dark);
+    const span = Math.min(16384, Math.floor(scopeSec(this.p.tim) * ac.sampleRate));
+    const live = [0, 1].map((i) => this.eng.cablesAt(this, i ? 'b' : 'a').length > 0);
+    live.forEach((on, i) => { if (on) this.ans[i].getFloatTimeDomainData(this.bufs[i]); });
+    // Hold the picture still on a rising zero crossing of A (or B).
+    const ref = this.bufs[live[0] ? 0 : 1], len = ref.length;
+    let start = len - span;
+    if (live[0] || live[1]) {
+      for (let i = len - span - 1; i > Math.max(1, len - 2 * span); i--) {
+        if (ref[i - 1] < 0 && ref[i] >= 0) { start = i; break; }
+      }
+    }
+    [C.lime, C.sky].forEach((col, i) => {
+      if (!live[i]) return;
+      const b = this.bufs[i];
+      let py = NaN;
+      for (let x = 0; x < w; x++) {
+        const v = b[Math.min(len - 1, start + Math.floor((x * span) / w))] * this.p.amp;
+        const y = Math.round(mid - Math.max(-1, Math.min(1, v)) * (h / 2 - 1));
+        const y1 = Number.isNaN(py) ? y : py;
+        g.rect(x0 + x, Math.min(y, y1), 1, Math.abs(y - y1) + 1, col);
+        py = y;
+      }
+    });
+    // tuner on A, a few times a second
+    if (live[0] && this.frame++ % 10 === 0) this.hz = detectPitch(this.bufs[0].subarray(len - 4096), ac.sampleRate);
+    if (!live[0]) this.hz = 0;
+    g.rect(66, 51, 31, 9, C.black);
+    if (this.hz) {
+      const n = 69 + 12 * Math.log2(this.hz / 440), near = Math.round(n), cents = Math.round((n - near) * 100);
+      g.text(NOTE_NAMES[((near % 12) + 12) % 12] + Math.floor(near / 12 - 1), 68, 53, Math.abs(cents) < 5 ? C.lime : C.yellow);
+      g.text((cents >= 0 ? '+' : '') + cents, 84, 53, C.silver);
+    }
+  }
+
+  audioIn(port: string) { return this.ins[port === 'b' ? 1 : 0]; }
+}
+
 // ---------------------------------------------------------------- DIRT
 
 export class Drive extends Mod {
@@ -2135,12 +2741,14 @@ export interface Kind { type: string; label: string; cat: Cat; make: (e: Engine)
 export const KINDS: Kind[] = [
   { type: 'clock', label: 'CLOCK', cat: 'seq', make: (e) => new Clock(e) },
   { type: 'drums', label: 'DRUM MACHINE', cat: 'seq', make: (e) => new DrumMachine(e) },
-  { type: 'beats', label: 'BEATS', cat: 'seq', make: (e) => new Beats(e) },
+  { type: 'beats', label: 'TRIG SEQ', cat: 'seq', make: (e) => new Beats(e) },
   { type: 'melody', label: 'MELODY', cat: 'seq', make: (e) => new Melody(e) },
   { type: 'keys', label: 'KEYS', cat: 'seq', make: (e) => new Keys(e) },
   { type: 'divider', label: 'DIVIDER', cat: 'seq', make: (e) => new Divider(e) },
   { type: 'euclid', label: 'EUCLID', cat: 'seq', make: (e) => new Euclid(e) },
   { type: 'chance', label: 'CHANCE', cat: 'seq', make: (e) => new Chance(e) },
+  { type: 'turing', label: 'TURING', cat: 'seq', make: (e) => new Turing(e) },
+  { type: 'logic', label: 'LOGIC', cat: 'seq', make: (e) => new Logic(e) },
   { type: 'kick', label: 'KICK', cat: 'drum', make: (e) => new Kick(e) },
   { type: 'snare', label: 'SNARE', cat: 'drum', make: (e) => new Snare(e) },
   { type: 'hihat', label: 'HIHAT', cat: 'drum', make: (e) => new HiHat(e) },
@@ -2156,13 +2764,16 @@ export const KINDS: Kind[] = [
   { type: 'atten', label: 'ATTEN', cat: 'mod', make: (e) => new Atten(e) },
   { type: 'quant', label: 'QUANT', cat: 'mod', make: (e) => new Quant(e) },
   { type: 'slew', label: 'SLEW', cat: 'mod', make: (e) => new Slew(e) },
+  { type: 'cvmix', label: 'CV MIX', cat: 'mod', make: (e) => new CvMix(e) },
+  { type: 'seqsw', label: 'SEQ SW', cat: 'mod', make: (e) => new SeqSwitch(e) },
   { type: 'filter', label: 'FILTER', cat: 'fx', make: (e) => new Filter(e) },
   { type: 'delay', label: 'DELAY', cat: 'fx', make: (e) => new Delay(e) },
   { type: 'reverb', label: 'REVERB', cat: 'fx', make: (e) => new Reverb(e) },
   { type: 'drive', label: 'DRIVE', cat: 'fx', make: (e) => new Drive(e) },
   { type: 'fold', label: 'FOLD', cat: 'fx', make: (e) => new Fold(e) },
   { type: 'crush', label: 'CRUSH', cat: 'fx', make: (e) => new Crush(e) },
+  { type: 'ring', label: 'RING', cat: 'fx', make: (e) => new Ring(e) },
   { type: 'mixer', label: 'MIXER', cat: 'util', make: (e) => new Mixer(e) },
-  { type: 'mixer8', label: 'BIG MIXER', cat: 'util', make: (e) => new BigMixer(e) },
+  { type: 'scope', label: 'SCOPE', cat: 'util', make: (e) => new Scope(e) },
   { type: 'speaker', label: 'SPEAKER', cat: 'util', make: (e) => new Speaker(e) },
 ];

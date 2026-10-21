@@ -37,7 +37,7 @@ export function drawKnob(g: Gfx, m: Mod, k: Knob) {
   if (m.cc[k.id] !== undefined) g.rect(k.x + 10, k.y - 1, 2, 2, C.sky);
 }
 
-export function drawModule(g: Gfx, m: Mod, closeHover: boolean) {
+export function drawModule(g: Gfx, m: Mod, closeHover: boolean, advHover = false) {
   const { w, h } = m;
   const bar = CAT[m.cat].bar;
   g.rect(2, 2, w, h, C.black); // drop shadow
@@ -50,6 +50,13 @@ export function drawModule(g: Gfx, m: Mod, closeHover: boolean) {
   g.rect(1, 1, w - 2, 1, C.white);
   g.rect(1, 10, w - 2, 1, C.black);
   g.text(m.title, 4, 3, C.white);
+  // advanced-layout toggle: "+" opens it, "-" closes it
+  if (m.advName) {
+    const ax = w - 17;
+    g.rect(ax, 2, 7, 7, advHover ? C.white : C.ink);
+    g.rect(ax + 1, 5, 5, 1, advHover ? C.ink : C.white);
+    if (!m.isAdv) g.rect(ax + 3, 3, 1, 5, advHover ? C.ink : C.white);
+  }
   // close "x"
   const xc = closeHover ? C.white : C.ink;
   for (let i = 0; i < 5; i++) {

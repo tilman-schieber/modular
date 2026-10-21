@@ -5,6 +5,7 @@ import { CAT, TYPEC, compatible, type Cat, type Drag, type Knob, type Mod, type 
 import { KINDS, Keys, type Kind } from './modules';
 import { PATCHES, migrate, type PatchData } from './patches';
 import { cablePoints, drawButton, drawCable, drawModule, plug } from './render';
+import { BAR_HELP, CABLE_HELP, HELP, MODULE_HOW, jackHelp, knobHelp } from './help';
 import { midi } from './midi';
 import { Recorder } from './rec';
 import { decodePatch, encodePatch, hashCode } from './share';
@@ -36,6 +37,13 @@ let clipboard: PatchData | null = null;
 let namePrompt: { text: string; done: (name: string) => void } | null = null;
 // The knob waiting for a MIDI control to be moved (Alt+click a knob to map it).
 let learn: { m: Mod; kn: Knob } | null = null;
+// Help mode (the HELP button or ?): hovering anything explains it.
+let helpMode = false;
+
+function toggleHelp() {
+  helpMode = !helpMode;
+  if (helpMode) showToast('HELP MODE - HOVER ANYTHING - ? OR ESC TO LEAVE');
+}
 
 function showToast(text: string) {
   toast = { text, until: performance.now() + 2500 };
@@ -135,6 +143,7 @@ function layoutBar() {
     { label: 'WIRES', col: [C.silver, C.slate, C.dark][wires], text: wires === 2 ? C.silver : C.ink, hi: C.white, act: cycleWires },
     { label: 'SHARE', col: C.silver, text: C.ink, hi: C.white, act: () => void share() },
     { label: 'CLEAR', col: C.silver, text: C.ink, hi: C.white, act: () => eng.clear() },
+    { label: 'HELP', col: helpMode ? C.yellow : C.silver, text: C.ink, hi: C.white, act: toggleHelp },
   ];
   bar = [];
   let x = 2, y = 2;
@@ -144,7 +153,7 @@ function layoutBar() {
     bar.push({ ...it, x, y, w });
     x += w + 2;
     // Small gaps separate transport, patches, modules and the rest.
-    if (it.act === toggleRec || it.label === 'PATCHES' || it.label === CAT.util.name) x += 6;
+    if (it.act === toggleRec || it.label === 'PATCHES' || it.label === CAT.util.name || it.label === 'CLEAR') x += 6;
   }
   barH = y + 12;
 }
@@ -219,6 +228,7 @@ type Hit =
   | { k: 'bar'; b: Btn }
   | { k: 'menu'; item: MenuItem }
   | { k: 'close'; m: Mod }
+  | { k: 'adv'; m: Mod }
   | { k: 'port'; m: Mod; p: Port }
   | { k: 'knob'; m: Mod; kn: Knob }
   | { k: 'cable'; c: Cable }
@@ -245,6 +255,7 @@ function hitTest(): Hit {
   if (m) {
     const lx = wx - m.x, ly = wy - m.y;
     if (lx >= m.w - 9 && lx < m.w - 2 && ly >= 1 && ly < 9) return { k: 'close', m };
+    if (m.advName && lx >= m.w - 18 && lx < m.w - 9 && ly >= 1 && ly < 9) return { k: 'adv', m };
     const p = m.ports.find((p) => Math.abs(lx - (p.x + 4)) <= 5 && Math.abs(ly - (p.y + 4)) <= 5);
     if (p) return { k: 'port', m, p };
     const kn = m.knobs.find((k) => lx >= k.x - 1 && lx < k.x + 12 && ly >= k.y - 1 && ly < k.y + 12);
@@ -379,6 +390,9 @@ canvas.addEventListener('pointerdown', (e) => {
       h.b.act?.();
       return;
     }
+    case 'adv':
+      h.m.set('adv', h.m.isAdv ? 0 : 1);
+      return;
     case 'close':
       eng.remove(h.m);
       selected.delete(h.m);
@@ -411,6 +425,7 @@ canvas.addEventListener('pointerdown', (e) => {
     }
     case 'body': {
       if (e.shiftKey) {
+        if (h.m.pressShift(h.lx, h.ly)) return;
         if (!selected.delete(h.m)) selected.add(h.m);
         return;
       }
@@ -546,7 +561,8 @@ addEventListener('keydown', (e) => {
     void ac.resume();
     togglePlay();
   }
-  if (e.code === 'Escape') { openMenu = null; popup = null; learn = null; selected.clear(); selCable = null; }
+  if (e.key === '?' || e.code === 'F1') { e.preventDefault(); toggleHelp(); return; }
+  if (e.code === 'Escape') { openMenu = null; popup = null; learn = null; helpMode = false; selected.clear(); selCable = null; }
   if (e.code === 'Delete' || e.code === 'Backspace') {
     const h = hitTest();
     if (selCable) eng.disconnect(selCable);
@@ -829,6 +845,7 @@ function fitView() {
 let undoStack: string[] = [];
 let redoStack: string[] = [];
 let current = '';
+let currentKey = '';
 
 function snap() {
   const d = serialize();
@@ -836,18 +853,27 @@ function snap() {
   return JSON.stringify(d);
 }
 
+// What counts as a change: state that modules change by themselves while playing
+// (TURING's register) doesn't.
+function changeKey(s: string) {
+  const d = JSON.parse(s) as PatchData;
+  return JSON.stringify(d.mods.map((m) => (m.type === 'turing' ? { ...m, s: null } : m)).concat(d.cables as never[]));
+}
+
 function checkpoint() {
-  const s = snap();
-  if (s === current) return;
+  const s = snap(), key = changeKey(s);
+  if (key === currentKey) { current = s; return; }
   if (current) undoStack.push(current);
   if (undoStack.length > 100) undoStack.shift();
   current = s;
+  currentKey = key;
   redoStack = [];
 }
 
 function restoreSnap(s: string) {
   loadPatch(JSON.parse(s));
   current = snap();
+  currentKey = changeKey(current);
 }
 
 function undo() {
@@ -946,7 +972,70 @@ const TIPS = [
   'SHIFT+CLICK OR SHIFT+DRAG TO SELECT SEVERAL MODULES - DRAG ONE TO MOVE THEM ALL',
   'CTRL+D DUPLICATE - CTRL+C / CTRL+V COPY AND PASTE - CTRL+Z UNDO - CTRL+S SAVE',
   'ALT+CLICK A KNOB, THEN MOVE A MIDI CONTROL TO MAP IT - ALT+CLICK AGAIN TO UNMAP',
+  'THE + IN A MODULE TITLE OPENS ITS ADVANCED LAYOUT - MIXER GOES BIG',
+  'PRESS ? (OR THE HELP BUTTON) AND HOVER ANYTHING TO SEE WHAT IT DOES',
 ];
+
+// ---------------------------------------------------------------- help panel
+
+const HELP_W = 184;
+
+function wrap(text: string, width: number) {
+  const max = Math.floor((width + 1) / 4), lines: string[] = [];
+  let line = '';
+  for (const word of text.split(' ')) {
+    if (line && (line + ' ' + word).length > max) { lines.push(line); line = word; }
+    else line = line ? line + ' ' + word : word;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+interface HelpCard { title: string; col: string; text: string; part?: { title: string; text: string }; foot?: string }
+
+// What help explains for the thing under the pointer (in help mode), or null.
+function helpFor(h: Hit): HelpCard | null {
+  const mod = (m: Mod) => ({ title: m.title, col: CAT[m.cat].bar, text: HELP[m.type]?.text ?? '' });
+  switch (h.k) {
+    case 'bar': {
+      const label = h.b.act === toggleRec ? 'REC' : h.b.label.trim();
+      return { title: label, col: h.b.col, text: BAR_HELP[label] ?? '' };
+    }
+    case 'port': return { ...mod(h.m), part: jackHelp(h.m.type, h.p) };
+    case 'knob': return { ...mod(h.m), part: knobHelp(h.m.type, h.kn) };
+    case 'body': case 'close': case 'adv': return { ...mod(h.m), foot: MODULE_HOW };
+    case 'cable': return { title: 'CABLE', col: TYPEC[h.c.type], text: CABLE_HELP[h.c.type] };
+    default: return null;
+  }
+}
+
+// A card at (x, y), kept on screen; `left` is where to go instead if it won't fit right.
+function drawHelp(card: HelpCard, x: number, y: number, left = x) {
+  const pad = 4, w = HELP_W, body = wrap(card.text, w - pad * 2);
+  const part = card.part ? wrap(card.part.text, w - pad * 2) : [];
+  const foot = card.foot ? wrap(card.foot, w - pad * 2) : [];
+  const h = 14 + body.length * 7 + (card.part ? 12 + part.length * 7 : 0) + (foot.length ? 4 + foot.length * 7 : 0) + 3;
+  if (x + w > UW - 2) x = Math.max(2, left - w);
+  y = Math.max(barH + 2, Math.min(y, UH - h - 10));
+  ui.rect(x + 2, y + 2, w, h, C.black);
+  ui.rect(x, y, w, h, C.black);
+  ui.rect(x + 1, y + 1, w - 2, h - 2, C.dark);
+  ui.rect(x + 1, y + 1, w - 2, 9, card.col);
+  ui.text(card.title, x + pad, y + 3, C.white);
+  let ty = y + 14;
+  for (const l of body) { ui.text(l, x + pad, ty, C.white); ty += 7; }
+  if (card.part) {
+    ty += 3;
+    ui.rect(x + pad, ty - 2, w - pad * 2, 1, C.slate);
+    ui.text(card.part.title, x + pad, ty + 1, C.yellow);
+    ty += 9;
+    for (const l of part) { ui.text(l, x + pad, ty, C.silver); ty += 7; }
+  }
+  if (foot.length) {
+    ty += 4;
+    for (const l of foot) { ui.text(l, x + pad, ty, C.slate); ty += 7; }
+  }
+}
 
 function drawPrompt(text: string, blink: boolean) {
   const w = 120, h = 34, x = Math.floor((UW - w) / 2), y = Math.floor((UH - h) / 2);
@@ -973,7 +1062,7 @@ function frame() {
   for (const m of eng.mods) {
     g.ox = m.x - camX;
     g.oy = m.y - camY;
-    drawModule(g, m, h.k === 'close' && h.m === m);
+    drawModule(g, m, h.k === 'close' && h.m === m, h.k === 'adv' && h.m === m);
     if (selected.has(m)) g.frame(-2, -2, m.w + 4, m.h + 4, C.yellow);
   }
   g.ox = -camX;
@@ -1024,6 +1113,7 @@ function frame() {
     const cc = tip.m.cc[tip.kn.id];
     drawTooltip(tip.m.x + tip.kn.x + 5, tip.m.y + tip.kn.y - 10, tip.m.knobText(tip.kn) + (cc === undefined ? '' : ` CC${cc}`));
   }
+  else if (h.k === 'adv') drawTooltip(h.m.x + h.m.w - 13, h.m.y - 10, h.m.isAdv ? 'SIMPLE' : h.m.advName);
   else if (h.k === 'port') {
     drawTooltip(h.m.x + h.p.x + 4, h.m.y + h.p.y - 10, `${PORT_KIND[h.p.type]} ${h.p.dir === 'in' ? 'IN' : 'OUT'}`);
   }
@@ -1039,14 +1129,27 @@ function frame() {
     ui.text(toast.text, x + 5, barH + 8, C.ink);
   }
   if (!everPlayed && blink && !openMenu && !popup) ui.textC('PRESS SPACE TO PLAY', Math.floor(UW / 2), UH - 16, C.yellow);
-  ui.text(TIPS[Math.floor(t / 7000) % TIPS.length], 3, UH - 7, C.slate);
+  ui.text(helpMode ? 'HELP MODE - HOVER ANYTHING - ? OR ESC TO LEAVE' : TIPS[Math.floor(t / 7000) % TIPS.length], 3, UH - 7, helpMode ? C.yellow : C.slate);
+  // Hovering a module in a menu describes it, next to the menu.
+  const am = activeMenu(), item = menuItemAt(ux, uy);
+  if (am && item) {
+    const kind = item.spawn ? KINDS.find((k) => k.type === item.spawn) : null;
+    if (kind && HELP[kind.type]) {
+      const iy = am.y + 1 + am.items.indexOf(item) * MENU_ROW;
+      drawHelp({ title: kind.label, col: CAT[kind.cat].bar, text: HELP[kind.type].text }, am.x + am.w + 4, iy, am.x - 4);
+    }
+  } else if (helpMode && mode.k === 'none') {
+    const card = helpFor(h);
+    if (card) drawHelp(card, ux + 10, uy + 10, ux - 6);
+  }
   if (namePrompt) drawPrompt(namePrompt.text, blink);
 
   canvas.style.cursor =
-    mode.k === 'move' || mode.k === 'pan' ? 'grabbing'
+    helpMode && mode.k === 'none' ? 'help'
+    : mode.k === 'move' || mode.k === 'pan' ? 'grabbing'
     : mode.k === 'knob' || h.k === 'knob' ? 'ns-resize'
     : mode.k === 'cable' || h.k === 'port' ? 'crosshair'
-    : h.k === 'bar' || h.k === 'close' || h.k === 'menu' || h.k === 'cable' ? 'pointer'
+    : h.k === 'bar' || h.k === 'close' || h.k === 'adv' || h.k === 'menu' || h.k === 'cable' ? 'pointer'
     : h.k === 'body' ? 'grab'
     : 'default';
 

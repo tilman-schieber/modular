@@ -263,7 +263,7 @@ function euclidJam() {
     { e: { steps: 16, hits: 9 }, d: ['hihat', { kit: 1, dec: 0.04 }] },
     { e: { steps: 7, hits: 2 }, d: ['cowbell', { kit: 1, dec: 0.08 }] },
   ] as const;
-  const mixer = b.add('mixer8', 400, 14, { l1: 0.6, l2: 0.45, l3: 0.5, p1: -0.3, p2: 0.4, p3: 0.6, l4: 0.7 });
+  const mixer = b.add('mixer', 400, 14, { adv: 1, l1: 0.6, l2: 0.45, l3: 0.5, p1: -0.3, p2: 0.4, p3: 0.6, l4: 0.7 });
   rhythms.forEach((r, i) => {
     const e = b.add('euclid', 82, 14 + i * 62, { ...r.e });
     const d = b.add(r.d[0], 160, 14 + i * 66, { ...r.d[1] });
@@ -486,10 +486,97 @@ function acidHouse() {
   return b.data;
 }
 
-// Before pitch became a voltage, MELODY and KEYS sent NOTE cables. Rewire those as PIT
+// A TURING machine writes a melody that slowly mutates: its voltage, snapped to
+// C minor pentatonic by QUANT, plays a SYNTH whenever its newest bit is 1. Turn CHG to
+// 0 to lock a loop you like. SCOPE shows the pitch CV and the sound.
+function turingMachine() {
+  const b = new Builder();
+  const drums = b.add('drums', 10, 30, { bpm: 118, kit: 0 }, drumSteps('OFFBEAT'));
+  const turing = b.add('turing', 186, 30, { chg: 0.08, len: 8, rng: 1.5 });
+  const quant = b.add('quant', 260, 30, { root: 0, scale: 2 });
+  const synth = b.add('synth', 334, 30, { wave: 1, cut: 0.3, res: 9, env: 0.55, dec: 0.25 });
+  const delay = b.add('delay', 408, 30, { time: 0.38, fb: 0.4, mix: 0.3 });
+  const speaker = b.add('speaker', 468, 30);
+  const scope = b.add('scope', 260, 110, { tim: 0.95 });
+  b.wire(drums, 'sync', turing, 'clk');
+  b.wire(turing, 'out', quant, 'in');
+  b.wire(quant, 'out', synth, 'pit');
+  b.wire(turing, 'gate', synth, 'gate');
+  b.wire(synth, 'out', delay, 'in');
+  b.wire(delay, 'out', speaker, 'in');
+  b.wire(drums, 'out', speaker, 'in');
+  b.wire(quant, 'out', scope, 'a');
+  b.wire(synth, 'out', scope, 'b');
+  return b.data;
+}
+
+// Everything at once. An advanced CLOCK runs the show and resets the sequencers on
+// start; its DIV output (every 2 bars) flips a SEQ SW between two pitch sources: a
+// TURING melody snapped to A minor pentatonic, and an advanced MELODY with a ratchet.
+// LOGIC ORs their gates into the SYNTH, CV MIX adds LFO vibrato, RING adds a bell-like
+// edge. The advanced DRUM MACHINE chains two patterns, with a ratcheted and a chance
+// step. A big MIXER pans it all; SCOPE shows the pitch CV and the ring-modulated voice.
+function showcase() {
+  const b = new Builder();
+  const clock = b.add('clock', 10, 30, { adv: 1, bpm: 122, div: 5 });
+  const turing = b.add('turing', 112, 30, { chg: 0.06, len: 8, rng: 1 });
+  const quant = b.add('quant', 186, 30, { root: 9, scale: 2 });
+  const seqsw = b.add('seqsw', 260, 30, { steps: 2 });
+  const cvmix = b.add('cvmix', 334, 30, { a0: 1, a1: 1, a2: 0 });
+  const synth = b.add('synth', 408, 30, { wave: 0, cut: 0.3, res: 10, env: 0.5, dec: 0.25 });
+  const ring = b.add('ring', 482, 30, { mix: 0.35 });
+  const delay = b.add('delay', 542, 30, { time: 0.37, fb: 0.4, mix: 0.3 });
+  const mixer = b.add('mixer', 602, 30, { adv: 1, l0: 0.9, l1: 0.7, p1: 0.25 });
+  const speaker = b.add('speaker', 680, 120);
+  const drums = b.add('drums', 10, 120, { adv: 1, chain: 2, bpm: 122, kit: 1 }, {
+    pats: [drumSteps('ACID'), drumSteps('JACK'), [], []],
+    pr: ['4444444444444424', '', '', ''],
+    rt: ['1111111111111113', '1111111131111111', '', ''],
+    e: 0,
+  });
+  const melody = b.add('melody', 186, 120, { adv: 1, scale: 1, root: 9, oct: 2, gate: 0.5 }, {
+    pats: [melodyState('ACID'), {}, {}, {}],
+    pr: ['', '', '', ''],
+    rt: ['1111111211111111', '', '', ''],
+    e: 0,
+  });
+  const logic = b.add('logic', 356, 120);
+  const lfo = b.add('lfo', 430, 120, { rate: 0.6, depth: 0.015 });
+  const osc = b.add('osc', 490, 120, { wave: 3, oct: 1 });
+  const scope = b.add('scope', 564, 120, { tim: 0.9 });
+  b.wire(clock, 'o16', drums, 'clk');
+  b.wire(clock, 'o16', turing, 'clk');
+  b.wire(clock, 'o16', melody, 'clk');
+  b.wire(clock, 'rst', drums, 'rst');
+  b.wire(clock, 'rst', melody, 'rst');
+  b.wire(clock, 'rst', seqsw, 'rst');
+  b.wire(clock, 'div', seqsw, 'trg');
+  b.wire(turing, 'out', quant, 'in');
+  b.wire(quant, 'out', seqsw, 'i0');
+  b.wire(melody, 'pit', seqsw, 'i1');
+  b.wire(seqsw, 'out', cvmix, 'i0');
+  b.wire(lfo, 'out', cvmix, 'i1');
+  b.wire(cvmix, 'out', synth, 'pit');
+  b.wire(turing, 'gate', logic, 'a');
+  b.wire(melody, 'gate', logic, 'b');
+  b.wire(logic, 'or', synth, 'gate');
+  b.wire(synth, 'out', ring, 'in');
+  b.wire(osc, 'out', ring, 'car');
+  b.wire(ring, 'out', delay, 'in');
+  b.wire(drums, 'out', mixer, 'i0');
+  b.wire(delay, 'out', mixer, 'i1');
+  b.wire(mixer, 'out', speaker, 'in');
+  b.wire(cvmix, 'out', scope, 'a');
+  b.wire(ring, 'out', scope, 'b');
+  return b.data;
+}
+
+// Brings older patches up to date. Before pitch became a voltage, MELODY and KEYS sent NOTE cables. Rewire those as PIT
 // and GATE cables. Two of them into one voice would now add their pitches together, so
 // only the first source keeps its cables there; returns how many sources were unplugged.
-export function migrate(data: PatchData) {
+export function migrate(old: PatchData) {
+  // BIG MIXER became MIXER with its BIG layout.
+  const data = { ...old, mods: old.mods.map((m) => (m.type === 'mixer8' ? { ...m, type: 'mixer', p: { ...m.p, adv: 1 } } : m)) };
   const type = new Map(data.mods.map((m) => [m.id, m.type]));
   const isNote = (c: PatchData['cables'][number]) => c.ap === 'note' && ['melody', 'keys'].includes(type.get(c.a) ?? '');
   const pitchIn = (c: PatchData['cables'][number]) => {
@@ -529,5 +616,7 @@ export const PATCHES: { name: string; build: () => PatchData }[] = [
   { name: 'LOFI CHORDS', build: lofiChords },
   { name: 'QUANTIZED', build: quantized },
   { name: 'ACID HOUSE', build: acidHouse },
+  { name: 'TURING MACHINE', build: turingMachine },
+  { name: 'SHOWCASE', build: showcase },
   { name: 'EMPTY', build: () => ({ mods: [], cables: [] }) },
 ];

@@ -451,64 +451,93 @@ function turingMachine() {
   return b.data;
 }
 
-// Everything at once. An advanced CLOCK runs the show and resets the sequencers on
-// start; its DIV output (every 2 bars) flips a SEQ SW between two pitch sources: a
-// TURING melody snapped to A minor pentatonic, and an advanced MELODY with a ratchet.
-// LOGIC ORs their gates into the SYNTH, CV MIX adds LFO vibrato, RING adds a bell-like
-// edge. The advanced DRUM MACHINE chains two patterns, with a ratcheted and a chance
-// step. A big MIXER pans it all; SCOPE shows the pitch CV and the ring-modulated voice.
+// Everything at once: a 32-bar deep house track in A minor, arranged.
+// - The ARRANGER plays the form: INTRO, GROOVE, LEAD, BREAK, DROP, OUTRO. P1 picks the
+//   DRUM MACHINE pattern, G1 and G2 bring the bass and the lead in and out, C1 opens the
+//   chord filter, C2 sends more to the reverb.
+// - One MELODY plays the chord roots in a stab rhythm, a bar each (Am7 Fmaj7 Cmaj7 G7,
+//   chained as patterns A-D). CHORD (DIA, in C) turns each root into four notes for
+//   four SYNTH voices, which share a FILTER (advanced: C1 at CUT, scaled by AMT).
+// - The bass is the same root pitch CV, two octaves down, with its own rhythm: a TRIG
+//   SEQ plays its gates on the offbeats. Pitch and gate need not come from one place.
+// - The lead is a TURING machine snapped to A minor pentatonic by QUANT.
+// - DELAY follows the clock: dotted 8th echoes. SCOPE shows the chords and the C1 lane.
 function showcase() {
   const b = new Builder();
-  const clock = b.add('clock', 10, 30, { adv: 1, bpm: 122, div: 5 });
-  const turing = b.add('turing', 112, 30, { chg: 0.06, len: 8, rng: 1 });
-  const quant = b.add('quant', 186, 30, { root: 9, scale: 2 });
-  const seqsw = b.add('seqsw', 260, 30, { steps: 2 });
-  const cvmix = b.add('cvmix', 334, 30, { a0: 1, a1: 1, a2: 0 });
-  const synth = b.add('synth', 408, 30, { wave: 0, cut: 0.3, res: 10, env: 0.5, dec: 0.25 });
-  const ring = b.add('ring', 482, 30, { mix: 0.35 });
-  const delay = b.add('delay', 542, 30, { time: 0.37, fb: 0.4, mix: 0.3 });
-  const mixer = b.add('mixer', 602, 30, { adv: 1, l0: 0.9, l1: 0.7, p1: 0.25 });
-  const speaker = b.add('speaker', 680, 120);
-  const drums = b.add('drums', 10, 120, { adv: 1, chain: 2, bpm: 122, kit: 1 }, {
-    pats: [drumSteps('ACID'), drumSteps('JACK'), [], []],
-    pr: ['4444444444444424', '', '', ''],
-    rt: ['1111111111111113', '1111111131111111', '', ''],
-    e: 0,
+  const bank = (pats: unknown[], rt: string[] = ['', '', '', '']) => ({ pats, pr: ['', '', '', ''], rt, e: 0 });
+  const clock = b.add('clock', 10, 20, { bpm: 122 });
+  //                     INTRO GROOVE LEAD BREAK DROP OUTRO
+  const arranger = b.add('arranger', 80, 20, {}, {
+    l: [4, 4, 8, 4, 8, 4, 0, 0],
+    c: [
+      [0, 1, 1, 3, 2, 0, 0, 0], // P1: drum pattern A-D
+      [0, 0, 0, 0, 0, 0, 0, 0], // P2
+      [0, 1, 1, 0, 1, 0, 0, 0], // G1: bass
+      [0, 0, 1, 1, 1, 0, 0, 0], // G2: lead
+      [0.25, 0.5, 0.75, 0.25, 1, 0.25, 0, 0], // C1: chord filter
+      [0.25, 0.25, 0.25, 0.75, 0.25, 0.75, 0, 0], // C2: reverb
+    ],
   });
-  const melody = b.add('melody', 186, 120, { adv: 1, scale: 1, root: 9, oct: 2, gate: 0.5 }, {
-    pats: [melodyState('ACID'), {}, {}, {}],
-    pr: ['', '', '', ''],
-    rt: ['1111111211111111', '', '', ''],
-    e: 0,
+  // DRUM MACHINE rows: BD, SD, CH, OH, CP, then accents.
+  const four = [0, 4, 8, 12], off = [2, 6, 10, 14], sixteenths = [0, 1, 3, 4, 5, 7, 8, 9, 11, 12, 13, 15];
+  const drums = b.add('drums', 250, 20, { adv: 1, kit: 1, vol: 0.8 }, bank([
+    gridSteps({ name: 'INTRO', rows: [four, [], off, [], []] }, 5),
+    gridSteps({ name: 'GROOVE', rows: [four, [], sixteenths, off, [4, 12]] }, 5),
+    gridSteps({ name: 'DROP', rows: [four, [15], sixteenths, off, [4, 12, 15]] }, 5),
+    gridSteps({ name: 'BREAK', rows: [[], [], off, [], [12]] }, 5),
+  ], ['', '', '1111111111111113', '']));
+  const mixer = b.add('mixer', 430, 20, { l0: 0.8, l1: 1, l2: 0.7, vol: 0.8 });
+  const reverb = b.add('reverb', 500, 20, { size: 0.7, mix: 0.15 });
+  const speaker = b.add('speaker', 560, 20);
+  const scope = b.add('scope', 500, 90, { tim: 0.35 });
+
+  // Chord roots in C major degrees (0 C ... 5 A ... 7 C), on the stab rhythm x..x..x...x.....
+  const stab = (deg: number) => ({ n: Array.from({ length: 16 }, (_, i) => ([0, 3, 6, 10].includes(i) ? deg : -1)) });
+  const roots = b.add('melody', 10, 180, { adv: 1, chain: 4, scale: 0, root: 0, oct: 3, gate: 0.35 },
+    bank([stab(5), stab(3), stab(7), stab(4)]));
+  const chord = b.add('chord', 180, 180, { type: 7, key: 0 });
+  const voices = [0, 1, 2, 3].map((i) => b.add('synth', 270 + i * 70, 180, { wave: 0, cut: 0.6, res: 3, env: 0.3, dec: 0.35 }));
+  const stabMix = b.add('mixer', 550, 180, { l0: 1, l1: 1, l2: 1, l3: 1, vol: 0.8 });
+  const filter = b.add('filter', 620, 180, { adv: 1, cut: 0.3, res: 4, amt: 1 });
+  const delay = b.add('delay', 690, 180, { time: 0.05 + (0.95 * 3) / 6, fb: 0.45, mix: 0.35 });
+
+  const bassSeq = b.add('beats', 10, 320, {}, gridSteps({ name: 'BASS', rows: [off] }, 4));
+  const bass = b.add('synth', 180, 320, { wave: 2, oct: -2, cut: 0.3, res: 2, env: 0.3, dec: 0.25 });
+  const bassVca = b.add('vca', 250, 320);
+  const turing = b.add('turing', 310, 320, { chg: 0.05, len: 8, rng: 1 });
+  const quant = b.add('quant', 380, 320, { root: 9, scale: 2 });
+  const lead = b.add('synth', 450, 320, { wave: 2, oct: 1, cut: 0.6, res: 1, env: 0.3, dec: 0.3 });
+  const leadVca = b.add('vca', 520, 320, { amt: 0.4 });
+
+  for (const m of [arranger, drums, roots, bassSeq, turing, delay]) b.wire(clock, 'o16', m, 'clk');
+  b.wire(arranger, 'o0', drums, 'pat');
+  b.wire(arranger, 'o2', bassVca, 'cv');
+  b.wire(arranger, 'o3', leadVca, 'cv');
+  b.wire(arranger, 'o4', filter, 'cv');
+  b.wire(arranger, 'o5', reverb, 'cv');
+  b.wire(roots, 'pit', chord, 'in');
+  voices.forEach((v, i) => {
+    b.wire(chord, 'o' + i, v, 'pit');
+    b.wire(roots, 'gate', v, 'gate');
+    b.wire(v, 'out', stabMix, 'i' + i);
   });
-  const logic = b.add('logic', 356, 120);
-  const lfo = b.add('lfo', 430, 120, { rate: 0.6, depth: 0.015 });
-  const osc = b.add('osc', 490, 120, { wave: 3, oct: 1 });
-  const scope = b.add('scope', 564, 120, { tim: 0.9 });
-  b.wire(clock, 'o16', drums, 'clk');
-  b.wire(clock, 'o16', turing, 'clk');
-  b.wire(clock, 'o16', melody, 'clk');
-  b.wire(clock, 'rst', drums, 'rst');
-  b.wire(clock, 'rst', melody, 'rst');
-  b.wire(clock, 'rst', seqsw, 'rst');
-  b.wire(clock, 'div', seqsw, 'trg');
+  b.wire(stabMix, 'out', filter, 'in');
+  b.wire(filter, 'out', delay, 'in');
+  b.wire(roots, 'pit', bass, 'pit');
+  b.wire(bassSeq, 'o0', bass, 'gate');
+  b.wire(bass, 'out', bassVca, 'in');
   b.wire(turing, 'out', quant, 'in');
-  b.wire(quant, 'out', seqsw, 'i0');
-  b.wire(melody, 'pit', seqsw, 'i1');
-  b.wire(seqsw, 'out', cvmix, 'i0');
-  b.wire(lfo, 'out', cvmix, 'i1');
-  b.wire(cvmix, 'out', synth, 'pit');
-  b.wire(turing, 'gate', logic, 'a');
-  b.wire(melody, 'gate', logic, 'b');
-  b.wire(logic, 'or', synth, 'gate');
-  b.wire(synth, 'out', ring, 'in');
-  b.wire(osc, 'out', ring, 'car');
-  b.wire(ring, 'out', delay, 'in');
+  b.wire(quant, 'out', lead, 'pit');
+  b.wire(turing, 'gate', lead, 'gate');
+  b.wire(lead, 'out', leadVca, 'in');
+  b.wire(leadVca, 'out', delay, 'in');
   b.wire(drums, 'out', mixer, 'i0');
-  b.wire(delay, 'out', mixer, 'i1');
+  b.wire(delay, 'out', reverb, 'in');
+  b.wire(reverb, 'out', mixer, 'i1');
+  b.wire(bassVca, 'out', mixer, 'i2');
   b.wire(mixer, 'out', speaker, 'in');
-  b.wire(cvmix, 'out', scope, 'a');
-  b.wire(ring, 'out', scope, 'b');
+  b.wire(filter, 'out', scope, 'a');
+  b.wire(arranger, 'o4', scope, 'b');
   return b.data;
 }
 

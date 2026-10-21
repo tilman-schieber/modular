@@ -18,7 +18,8 @@ with cables, press space.
 - Utilities: TURING machine, LOGIC, sequential switch, CV MIX, SCOPE with a tuner
 - Modules stay simple; the + in a title bar opens an advanced layout (CLOCK: tap tempo,
   clock in, reset and division outs; sequencers: reset, per-step chance and ratchets,
-  patterns A-D with chaining and a PAT input; MIXER: 8 channels with pan)
+  patterns A-D with chaining and a PAT input; FILTER: LP/HP/BP outputs at once, key
+  tracking and a CV depth knob; MIXER: 8 channels with pan)
 - Play live from the computer keyboard or a MIDI keyboard (velocity, mod wheel, pitch bend, aftertouch, sustain)
 - MIDI clock in and out, and MIDI learn: Alt+click a knob, then move a control
 - A RECORDER module: records any signal to WAV, by hand or started and stopped exactly by triggers

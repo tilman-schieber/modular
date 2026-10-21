@@ -1707,35 +1707,77 @@ export class Mixer extends Mod {
 
 // ---------------------------------------------------------------- FX
 
+// The three filter modes run side by side: OUT plays the one TYP picks, and the
+// advanced layout has all three as outputs at once, like a real multimode filter.
+const FILTER_TYPES = ['lowpass', 'highpass', 'bandpass'] as const;
+
 export class Filter extends Mod {
-  f = ac.createBiquadFilter();
+  in = ac.createGain();
+  fs = FILTER_TYPES.map((type) => Object.assign(ac.createBiquadFilter(), { type }));
+  out = ac.createGain();
   cv = ac.createGain();
+  // PIT: 1 per octave, so the cutoff follows the notes (key tracking).
+  pit = ac.createGain();
+  private sel = 0;
 
   constructor(e: Engine) {
     super(e, 'filter', 'FILTER', 'fx', 50, 52);
+    this.fs[0].connect(this.out);
+    for (const f of this.fs) {
+      this.in.connect(f);
+      this.cv.connect(f.detune);
+      this.pit.connect(f.detune);
+    }
+    this.pit.gain.value = 1200;
     this.knobRow([
       { id: 'type', label: 'TYP', min: 0, max: 2, def: 0, names: ['LP', 'HP', 'BP'] },
       { id: 'cut', label: 'CUT', min: 0, max: 1, def: 0.6, fmt: hz },
       { id: 'res', label: 'RES', min: 0, max: 20, def: 2, fmt: (v) => v.toFixed(1) },
     ], 13);
     io(this, 'audio');
-    this.cv.gain.value = CV_CENTS;
-    this.cv.connect(this.f.detune);
     this.port('cv', 'CUT', 'cv', 'in', 20, 32);
-    this.advanced('ADVANCED', 50, 70);
-    // A CV of 1 adds 10 to the resonance.
-    this.cvParam('res', 35, 51, this.f.Q, 10);
+    this.advanced('ADVANCED', 64, 72);
+    this.advOnly(() => {
+      // How much the CUT jack moves the cutoff: 1 = 3 octaves per volt, negative flips it.
+      this.knob({ id: 'amt', label: 'AMT', x: 49, y: 13, min: -1, max: 1, def: 1, fmt: pct });
+      this.port('pit', 'PIT', 'cv', 'in', 35, 32);
+      this.port('lp', 'LP', 'audio', 'out', 23, 51);
+      this.port('hp', 'HP', 'audio', 'out', 37, 51);
+      this.port('bp', 'BP', 'audio', 'out', 51, 51);
+    });
+    // A CV of 1 adds 10 to the resonance (of all three).
+    const res = this.cvParam('res', 4, 51, null, 10);
+    for (const f of this.fs) res.connect(f.Q);
     this.bypassable();
   }
 
-  onParam(id: string, v: number) {
-    if (id === 'type') this.f.type = (['lowpass', 'highpass', 'bandpass'] as const)[v];
-    if (id === 'cut') this.f.frequency.setTargetAtTime(cutHz(v), ac.currentTime, 0.02);
-    if (id === 'res') this.f.Q.setTargetAtTime(v, ac.currentTime, 0.02);
+  protected layout(adv: boolean) {
+    // Room for the AMT knob: the knob row and OUT move apart.
+    ['type', 'cut', 'res'].forEach((id, i) => (this.knobById(id).x = adv ? 4 + i * 15 : 6 + i * 13));
+    this.portById('out').x = adv ? 51 : 37;
+    this.onParam('amt');
   }
 
-  audioIn(port: string) { return port === 'cv' ? this.cv : this.f; }
-  audioOut() { return this.f; }
+  onParam(id: string) {
+    const t = ac.currentTime;
+    if (id === 'type' && this.fs) {
+      this.fs[this.sel].disconnect(this.out);
+      this.sel = this.p.type;
+      this.fs[this.sel].connect(this.out);
+    }
+    for (const f of this.fs ?? []) {
+      if (id === 'cut') f.frequency.setTargetAtTime(cutHz(this.p.cut), t, 0.02);
+      if (id === 'res') f.Q.setTargetAtTime(this.p.res, t, 0.02);
+    }
+    // The depth knob only applies in the advanced layout, where it shows.
+    if (id === 'amt' || id === 'adv') this.cv?.gain.setTargetAtTime(CV_CENTS * (this.isAdv ? this.p.amt ?? 1 : 1), t, 0.01);
+  }
+
+  audioIn(port: string) { return port === 'cv' ? this.cv : port === 'pit' ? this.pit : this.in; }
+  audioOut(port: string) {
+    const i = ['lp', 'hp', 'bp'].indexOf(port);
+    return i >= 0 ? this.fs[i] : this.out;
+  }
 }
 
 // Synced delay times, in 16th notes: 1/16, 1/8 triplet, 1/8, dotted 1/8, 1/4, dotted 1/4, 1/2.
@@ -3087,32 +3129,59 @@ export class Ring extends Mod {
 const scopeSec = (v: number) => 0.002 * 300 ** v;
 
 // The pitch of a signal by autocorrelation, or 0 if it has none (silence, or a CV
-// that steps or drifts rather than oscillates).
+// that steps or drifts rather than oscillates). It works on the signal averaged down
+// to a quarter of the sample rate, which keeps it cheap enough to run on every frame
+// without a hitch, and refines the peak between samples for the cents.
 function detectPitch(raw: Float32Array, rate: number) {
+  const D = 4, buf = new Float32Array(raw.length / D);
   let mean = 0;
-  for (const v of raw) mean += v;
-  mean /= raw.length;
-  const buf = raw.map((v) => v - mean);
+  for (let i = 0; i < buf.length; i++) {
+    buf[i] = (raw[i * D] + raw[i * D + 1] + raw[i * D + 2] + raw[i * D + 3]) / D;
+    mean += buf[i];
+  }
+  mean /= buf.length;
   let rms = 0, crossings = 0;
   for (let i = 0; i < buf.length; i++) {
+    buf[i] -= mean;
     rms += buf[i] * buf[i];
     if (i && buf[i - 1] < 0 && buf[i] >= 0) crossings++;
   }
   if (Math.sqrt(rms / buf.length) < 0.01 || crossings < 4) return 0;
-  const n = buf.length >> 1, minLag = Math.floor(rate / 2000), maxLag = Math.floor(rate / 30);
-  let best = 0, bestLag = 0, prev = 1, rising = false;
-  for (let lag = minLag; lag < Math.min(maxLag, n); lag++) {
+  rate /= D;
+  const n = buf.length >> 1, minLag = Math.max(2, Math.floor(rate / 4000)), maxLag = Math.min(n, Math.floor(rate / 30));
+  const r = new Float32Array(maxLag + 1);
+  let best = 0, bestLag = 0, rising = false;
+  for (let lag = minLag; lag < maxLag; lag++) {
     let sum = 0, e0 = 0, e1 = 0;
-    // every other sample is plenty, and keeps this cheap
-    for (let i = 0; i < n; i += 2) { sum += buf[i] * buf[i + lag]; e0 += buf[i] * buf[i]; e1 += buf[i + lag] * buf[i + lag]; }
-    const r = sum / Math.sqrt(e0 * e1 || 1);
+    for (let i = 0; i < n; i++) { sum += buf[i] * buf[i + lag]; e0 += buf[i] * buf[i]; e1 += buf[i + lag] * buf[i + lag]; }
+    r[lag] = sum / Math.sqrt(e0 * e1 || 1);
+    const prev = lag > minLag ? r[lag - 1] : 1;
     // the first strong peak after the correlation has dipped
-    if (r > prev && prev < 0.5) rising = true;
-    if (rising && r > best) { best = r; bestLag = lag; }
-    if (rising && r < prev && best > 0.9) break;
-    prev = r;
+    if (r[lag] > prev && prev < 0.5) rising = true;
+    if (rising && r[lag] > best) { best = r[lag]; bestLag = lag; }
+    if (rising && r[lag] < prev && best > 0.9) break;
   }
-  return best > 0.8 ? rate / bestLag : 0;
+  if (best <= 0.8) return 0;
+  // a parabola through the peak and its neighbours finds it between samples
+  const a = r[bestLag - 1], b = r[bestLag], c = r[bestLag + 1] ?? b;
+  const shift = a - 2 * b + c ? (0.5 * (a - c)) / (a - 2 * b + c) : 0;
+  return rate / (bestLag + Math.max(-0.5, Math.min(0.5, shift)));
+}
+
+// The most recent rising crossing of the signal's mid level in buf[from..to), with some
+// hysteresis so noise does not retrigger, or -1. The mid level (halfway between the
+// lowest and highest value) also finds signals that never cross zero.
+function trigger(buf: Float32Array, from: number, to: number) {
+  let lo = Infinity, hi = -Infinity;
+  for (let i = from; i < to; i++) { lo = Math.min(lo, buf[i]); hi = Math.max(hi, buf[i]); }
+  if (hi - lo < 0.01) return -1;
+  const mid = (lo + hi) / 2, hyst = (hi - lo) * 0.1;
+  let armed = false, at = -1;
+  for (let i = from; i < to; i++) {
+    if (buf[i] < mid - hyst) armed = true;
+    else if (armed && buf[i] >= mid) { at = i; armed = false; }
+  }
+  return at;
 }
 
 // Two-trace oscilloscope with a tuner on input A. At AMP X1 the screen spans -1..1.
@@ -3142,13 +3211,13 @@ export class Scope extends Mod {
     const span = Math.min(16384, Math.floor(scopeSec(this.p.tim) * ac.sampleRate));
     const live = [0, 1].map((i) => this.eng.cablesAt(this, i ? 'b' : 'a').length > 0);
     live.forEach((on, i) => { if (on) this.ans[i].getFloatTimeDomainData(this.bufs[i]); });
-    // Hold the picture still on a rising zero crossing of A (or B).
-    const ref = this.bufs[live[0] ? 0 : 1], len = ref.length;
-    let start = len - span;
-    if (live[0] || live[1]) {
-      for (let i = len - span - 1; i > Math.max(1, len - 2 * span); i--) {
-        if (ref[i - 1] < 0 && ref[i] >= 0) { start = i; break; }
-      }
+    // Hold the picture still on a rising edge of A, or of B when A does not repeat
+    // (a stepped pitch CV, say). With neither, the picture rolls.
+    const len = this.bufs[0].length, from = Math.max(0, len - 2 * span), to = len - span;
+    let start = to;
+    for (const i of [0, 1]) {
+      const at = live[i] ? trigger(this.bufs[i], from, to) : -1;
+      if (at >= 0) { start = at; break; }
     }
     [C.lime, C.sky].forEach((col, i) => {
       if (!live[i]) return;
@@ -3163,7 +3232,7 @@ export class Scope extends Mod {
       }
     });
     // tuner on A, a few times a second
-    if (live[0] && this.frame++ % 10 === 0) this.hz = detectPitch(this.bufs[0].subarray(len - 4096), ac.sampleRate);
+    if (live[0] && this.frame++ % 6 === 0) this.hz = detectPitch(this.bufs[0].subarray(len - 4096), ac.sampleRate);
     if (!live[0]) this.hz = 0;
     g.rect(66, 51, 31, 9, C.black);
     if (this.hz) {

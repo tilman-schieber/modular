@@ -161,8 +161,15 @@ export const HELP: Record<string, Help> = {
     jacks: { trg: 'EACH TRIGGER MOVES TO THE NEXT INPUT.', rst: 'BACK TO INPUT 1.' },
   },
   filter: {
-    text: 'FILTER: LP KEEPS THE LOWS, HP THE HIGHS, BP A BAND. RES ADDS A PEAK AT THE CUTOFF.',
-    jacks: { cv: 'CV MOVES THE CUTOFF (1 = 3 OCTAVES). TRY AN LFO OR ENVELOPE.' },
+    text: 'FILTER: LP KEEPS THE LOWS, HP THE HIGHS, BP A BAND. RES ADDS A PEAK AT THE CUTOFF. + ADDS ALL THREE AS SEPARATE OUTPUTS, KEY TRACKING (PIT), A DEPTH KNOB FOR CUT AND A RES JACK.',
+    jacks: {
+      cv: 'CV MOVES THE CUTOFF (1 = 3 OCTAVES, TIMES AMT). TRY AN LFO OR ENVELOPE.',
+      pit: 'PITCH CV, 1 PER OCTAVE: THE CUTOFF FOLLOWS THE NOTES, SO HIGH AND LOW NOTES SOUND EQUALLY BRIGHT.',
+      lp: 'LOWPASS, WHATEVER TYP IS SET TO.',
+      hp: 'HIGHPASS, WHATEVER TYP IS SET TO.',
+      bp: 'BANDPASS, WHATEVER TYP IS SET TO.',
+    },
+    knobs: { amt: 'HOW FAR THE CUT JACK MOVES THE CUTOFF. NEGATIVE FLIPS IT: MORE CV, DARKER.' },
   },
   delay: {
     text: 'ECHO. FBK SETS HOW MANY REPEATS, MIX HOW LOUD THEY ARE. PATCH A CLOCK INTO CLK AND THE ECHOES LOCK TO THE TEMPO.',
@@ -198,7 +205,7 @@ export const HELP: Record<string, Help> = {
 };
 
 // Modules whose + layout adds CV jacks for their knobs.
-for (const type of ['env', 'synth', 'filter', 'delay', 'lfo', 'kick', 'snare', 'hihat', 'clap', 'cowbell', 'euclid', 'chance', 'turing', 'drive', 'fold', 'slew']) {
+for (const type of ['env', 'synth', 'delay', 'lfo', 'kick', 'snare', 'hihat', 'clap', 'cowbell', 'euclid', 'chance', 'turing', 'drive', 'fold', 'slew']) {
   HELP[type].text += ' + ADDS CV JACKS FOR ITS KNOBS.';
 }
 

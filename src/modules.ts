@@ -1660,9 +1660,10 @@ export class Delay extends Mod {
     this.in.connect(this.out);
     this.in.connect(this.d);
     // The repeats run through a soft clipper, so feedback pushed past 100% saturates
-    // like tape instead of running away.
-    const clip = ac.createWaveShaper(), n = 1024, curve = new Float32Array(n);
-    for (let i = 0; i < n; i++) curve[i] = Math.tanh(((i / (n - 1)) * 2 - 1) * 1.5) / Math.tanh(1.5);
+    // like tape instead of running away. Its slope at zero is exactly 1: quiet echoes
+    // pass unchanged, so each repeat comes back at FBK times the one before.
+    const clip = ac.createWaveShaper(), n = 1025, curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) curve[i] = Math.tanh((i / (n - 1)) * 2 - 1);
     clip.curve = curve;
     this.d.connect(this.fb).connect(clip).connect(this.d);
     this.d.connect(this.wet).connect(this.out);

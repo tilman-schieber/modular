@@ -559,18 +559,23 @@ abstract class Drum extends Mod {
 
   constructor(e: Engine, type: string, title: string, knobs: KnobDef[], public kits: Kit[]) {
     super(e, type, title, 'drum', 50, 63);
+    this.advanced('ADVANCED', 50, 82);
     this.p.kit = 0;
     this.knobRow(knobs, 24);
     this.port('in', 'IN', 'trig', 'in', 4, 44);
     this.port('cv', knobs[0].label, 'cv', 'in', 20, 44);
     this.port('out', 'OUT', 'audio', 'out', 37, 44);
+    // Advanced: a CV jack under each of the other knobs.
+    for (const k of knobs.slice(1)) this.cvKnob(k.id, this.knobById(k.id).x + 1, 63);
   }
 
-  // Knob values for this hit; CV moves the first knob (tune or tone) by up to half its range.
+  // Knob values for this hit; CV moves the first knob (tune or tone) by up to half its
+  // range, and in the advanced layout the others too.
   protected q() {
     const k = this.knobs[0];
     const v = this.p[k.id] + (this.tap.read() * (k.max - k.min)) / 2;
-    return { ...this.p, [k.id]: Math.min(k.max, Math.max(k.min, v)) };
+    const rest = Object.fromEntries(this.knobs.slice(1).map((o) => [o.id, this.val(o.id)]));
+    return { ...this.p, ...rest, [k.id]: Math.min(k.max, Math.max(k.min, v)) };
   }
 
   audioIn() { return this.tap.in; }
@@ -600,7 +605,8 @@ abstract class Drum extends Mod {
 
   drawBody(g: Gfx) {
     drawPresetBar(g, 3, 12, this.kit, 44);
-    led(g, 35, 3, now() - this.flash < 90);
+    // A hit lights up the IN jack (the title bar has the toggles).
+    if (now() - this.flash < 90) g.frame(3, 43, 11, 11, C.red);
   }
 
   press(lx: number, ly: number): Drag | null {
@@ -1415,6 +1421,8 @@ export class Synth extends Mod {
     this.port('gate', 'GAT', 'trig', 'in', 19, 53);
     this.port('cv', 'CUT', 'cv', 'in', 34, 53);
     this.port('out', 'OUT', 'audio', 'out', 51, 53);
+    this.advanced('ADVANCED', 64, 92);
+    for (const id of ['res', 'env', 'dec']) this.cvKnob(id, this.knobById(id).x + 1, 73);
   }
 
   audioIn(port: string) { return port === 'pit' ? this.pitch : this.cv; }
@@ -1429,7 +1437,7 @@ export class Synth extends Mod {
       if (this.live) { release(this.live, ev.t); this.live = null; }
       return;
     }
-    const { wave, oct, cut, res, env, dec } = this.p;
+    const { wave, oct, cut } = this.p, res = this.val('res'), env = this.val('env'), dec = this.val('dec');
     const t = ev.t, dur = ev.hold ? HOLD : Math.max(0.02, ev.dur);
     const peak = 0.35 * (ev.acc ? 1.4 : 1) * velGain(ev.vel);
 
@@ -1564,6 +1572,9 @@ export class Filter extends Mod {
     this.cv.gain.value = CV_CENTS;
     this.cv.connect(this.f.detune);
     this.port('cv', 'CUT', 'cv', 'in', 20, 32);
+    this.advanced('ADVANCED', 50, 70);
+    // A CV of 1 adds 10 to the resonance.
+    this.cvParam('res', 35, 51, this.f.Q, 10);
   }
 
   onParam(id: string, v: number) {
@@ -1588,7 +1599,12 @@ export class Delay extends Mod {
     super(e, 'delay', 'DELAY', 'fx', 50, 52);
     this.in.connect(this.out);
     this.in.connect(this.d);
-    this.d.connect(this.fb).connect(this.d);
+    // The repeats run through a soft clipper, so feedback pushed past 100% saturates
+    // like tape instead of running away.
+    const clip = ac.createWaveShaper(), n = 1024, curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) curve[i] = Math.tanh(((i / (n - 1)) * 2 - 1) * 1.5) / Math.tanh(1.5);
+    clip.curve = curve;
+    this.d.connect(this.fb).connect(clip).connect(this.d);
     this.d.connect(this.wet).connect(this.out);
     // A CV of 1 adds a quarter second.
     this.cv.gain.value = 0.25;
@@ -1600,6 +1616,9 @@ export class Delay extends Mod {
     ], 13);
     io(this, 'audio');
     this.port('cv', 'TIM', 'cv', 'in', 20, 32);
+    this.advanced('ADVANCED', 50, 70);
+    this.cvParam('fb', 20, 51, this.fb.gain, 0.45);
+    this.cvParam('mix', 35, 51, this.wet.gain, 0.5);
   }
 
   onParam(id: string, v: number) {
@@ -1796,10 +1815,14 @@ export class Slew extends Mod {
     this.knob({ id: 'time', label: 'TIM', x: 4, y: 13, min: 0, max: 1, def: 0.1, fmt: ms });
     this.port('in', 'IN', 'cv', 'in', 4, 32);
     this.port('out', 'OUT', 'cv', 'out', 37, 32);
+    this.advanced('ADVANCED', 50, 52);
+    // A CV of 1 adds half a second (the param is a third of the time; see onParam).
+    const cv = this.cvParam('time', 20, 32, null, 0.5 / 3);
     void worklet(SLEW_PROCESSOR).then(() => {
       this.node = new AudioWorkletNode(ac, 'slew', { outputChannelCount: [1] });
       this.in.disconnect(this.out);
       this.in.connect(this.node).connect(this.out);
+      cv.connect(this.node.parameters.get('time')!);
       this.onParam('time', this.p.time);
     });
   }
@@ -1884,6 +1907,8 @@ export class Lfo extends Mod {
       { id: 'depth', label: 'DEP', min: 0, max: 1, def: 0.5, fmt: pct },
     ], 13);
     this.port('out', 'OUT', 'cv', 'out', 37, 32);
+    this.advanced('ADVANCED', 50, 70);
+    this.cvParam('depth', 35, 51, this.out.gain, 0.5);
   }
 
   onParam(id: string, v: number) {
@@ -1927,10 +1952,17 @@ export class Envelope extends Mod {
     ], 31);
     this.port('in', 'GATE', 'trig', 'in', 5, 51);
     this.port('out', 'OUT', 'cv', 'out', 51, 51);
+    // Advanced: a CV jack under each knob; the gate and output move down a row.
+    this.advanced('ADVANCED', 64, 90);
+    for (const id of ['a', 'd', 's', 'r']) this.cvKnob(id, this.knobById(id).x + 1, 51);
+  }
+
+  protected layout(adv: boolean) {
+    this.portById('in').y = this.portById('out').y = adv ? 71 : 51;
   }
 
   onEvent(_port: string, ev: Ev) {
-    const a = envSec(this.p.a), d = envSec(this.p.d), r = envSec(this.p.r), s = this.p.s;
+    const a = envSec(this.val('a')), d = envSec(this.val('d')), r = envSec(this.val('r')), s = this.val('s');
     const t = ev.t, lvl = this.src.offset;
     lvl.cancelScheduledValues(t);
     if (ev.off) { lvl.setTargetAtTime(0, t, r / 4); return; }
@@ -1954,7 +1986,7 @@ export class Envelope extends Mod {
       const [t0, v0] = pts[i - 1], [t1, v1] = pts[i];
       g.line(5 + Math.round(t0 * k), 26 - Math.round(v0 * 12), 5 + Math.round(t1 * k), 26 - Math.round(v1 * 12), C.lime);
     }
-    led(g, 30, 53, now() - this.flash < 90, C.lime);
+    led(g, 30, this.isAdv ? 73 : 53, now() - this.flash < 90, C.lime);
   }
 
   audioOut() { return this.src; }
@@ -2028,11 +2060,17 @@ export class Euclid extends Mod {
       { id: 'hits', label: 'HIT', min: 0, max: 16, def: 3, step: 1 },
       { id: 'rot', label: 'ROT', min: 0, max: 15, def: 0, step: 1 },
     ], 38, 18);
+    this.advanced('ADVANCED', 64, 76);
+    for (const id of ['steps', 'hits', 'rot']) this.cvKnob(id, this.knobById(id).x + 1, 58);
   }
 
-  private hit(i: number) {
-    const n = this.p.steps, k = Math.min(this.p.hits, n);
-    const j = (((i - this.p.rot) % n) + n) % n;
+  // Steps, hits and rotation, with their CVs.
+  private shape() {
+    return { n: Math.round(this.val('steps')), hits: Math.round(this.val('hits')), rot: Math.round(this.val('rot')) };
+  }
+
+  private hit(i: number, { n, hits, rot } = this.shape()) {
+    const k = Math.min(hits, n), j = (((i - rot) % n) + n) % n;
     return (j * k) % n < k;
   }
 
@@ -2040,20 +2078,21 @@ export class Euclid extends Mod {
 
   onEvent(_port: string, ev: Ev) {
     if (ev.off) return;
-    const s = (this.pos = (this.pos + 1) % this.p.steps);
+    const sh = this.shape();
+    const s = (this.pos = (this.pos + 1) % sh.n);
     this.eng.at(ev.t, () => (this.shown = s));
-    if (this.hit(s)) this.emit('out', ev);
+    if (this.hit(s, sh)) this.emit('out', ev);
   }
 
   drawBody(g: Gfx) {
-    const n = this.p.steps;
+    const sh = this.shape(), n = sh.n;
     for (let i = 0; i < n; i++) {
       const a = (i / n) * Math.PI * 2;
       const x = 32 + Math.round(Math.sin(a) * 10), y = 25 - Math.round(Math.cos(a) * 10);
-      const col = i === this.shown ? C.white : this.hit(i) ? C.yellow : C.slate;
+      const on = this.hit(i, sh), col = i === this.shown ? C.white : on ? C.yellow : C.slate;
       g.rect(x - 1, y - 1, 3, 3, C.black);
       g.px(x, y, col);
-      if (this.hit(i) || i === this.shown) g.rect(x - 1, y - 1, 3, 3, col);
+      if (on || i === this.shown) g.rect(x - 1, y - 1, 3, 3, col);
     }
   }
 }
@@ -2069,11 +2108,13 @@ export class Chance extends Mod {
     this.port('in', 'IN', 'trig', 'in', 4, 32);
     this.port('a', 'A', 'trig', 'out', 22, 32);
     this.port('b', 'B', 'trig', 'out', 37, 32);
+    this.advanced('ADVANCED', 50, 70);
+    this.cvKnob('prob', 5, 51);
   }
 
   onEvent(_port: string, ev: Ev) {
     if (ev.off) return;
-    const a = Math.random() < this.p.prob;
+    const a = Math.random() < this.val('prob');
     this.emit(a ? 'a' : 'b', ev);
     this.eng.at(ev.t, () => { this.flash = now(); this.lastA = a; });
   }
@@ -2306,14 +2347,16 @@ export class Turing extends Mod {
     this.port('clk', 'CLK', 'trig', 'in', 5, 45);
     this.port('out', 'OUT', 'cv', 'out', 36, 45);
     this.port('gate', 'GAT', 'trig', 'out', 51, 45);
+    this.advanced('ADVANCED', 64, 84);
+    for (const id of ['chg', 'len', 'rng']) this.cvKnob(id, this.knobById(id).x + 1, 64);
   }
 
   onEvent(_port: string, ev: Ev) {
     if (ev.off) return;
-    let bit = (this.reg >> (this.p.len - 1)) & 1;
-    if (Math.random() < this.p.chg) bit ^= 1;
+    let bit = (this.reg >> (Math.round(this.val('len')) - 1)) & 1;
+    if (Math.random() < this.val('chg')) bit ^= 1;
     const reg = (this.reg = ((this.reg << 1) | bit) & 0xffff);
-    this.out.offset.setValueAtTime(((reg & 0xff) / 255) * this.p.rng, ev.t);
+    this.out.offset.setValueAtTime(((reg & 0xff) / 255) * this.val('rng'), ev.t);
     if (bit) this.emit('gate', ev);
     this.eng.at(ev.t, () => (this.shown = reg));
   }
@@ -2630,6 +2673,8 @@ export class Drive extends Mod {
       { id: 'lvl', label: 'LVL', min: 0, max: 1, def: 0.5, fmt: pct },
     ], 13);
     io(this, 'audio');
+    this.advanced('ADVANCED', 50, 52);
+    this.cvParam('drive', 20, 32, this.pre.gain, 15);
   }
 
   onParam(id: string, v: number) {
@@ -2644,6 +2689,7 @@ export class Drive extends Mod {
 }
 
 // Wavefolder: loud parts fold back on themselves instead of clipping, adding harmonics.
+const FOLDS = 10;
 export class Fold extends Mod {
   pre = ac.createGain();
   sh = ac.createWaveShaper();
@@ -2651,21 +2697,25 @@ export class Fold extends Mod {
 
   constructor(e: Engine) {
     super(e, 'fold', 'FOLD', 'fx', 50, 52);
+    // A fixed curve that folds ten times; FLD is the gain in front of it, so the
+    // amount of folding can be modulated at audio rate.
+    const n = 4096, curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) curve[i] = Math.sin(((i / (n - 1)) * 2 - 1) * FOLDS * (Math.PI / 2));
+    this.sh.curve = curve;
     this.pre.connect(this.sh).connect(this.out);
     this.knobRow([
       { id: 'fold', label: 'FLD', min: 0, max: 1, def: 0.4, fmt: pct },
       { id: 'lvl', label: 'LVL', min: 0, max: 1, def: 0.6, fmt: pct },
     ], 13);
     io(this, 'audio');
+    this.advanced('ADVANCED', 50, 52);
+    this.cvParam('fold', 20, 32, this.pre.gain, 9 / FOLDS / 2);
   }
 
   onParam(id: string, v: number) {
-    if (id === 'lvl') this.out.gain.setTargetAtTime(v, ac.currentTime, 0.02);
-    if (id === 'fold') {
-      const k = 1 + v * 9, n = 2048, curve = new Float32Array(n);
-      for (let i = 0; i < n; i++) curve[i] = Math.sin(((i / (n - 1)) * 2 - 1) * k * (Math.PI / 2));
-      this.sh.curve = curve;
-    }
+    const t = ac.currentTime;
+    if (id === 'lvl') this.out.gain.setTargetAtTime(v, t, 0.02);
+    if (id === 'fold') this.pre.gain.setTargetAtTime((1 + v * 9) / FOLDS, t, 0.02);
   }
 
   audioIn() { return this.pre; }

@@ -88,6 +88,10 @@ export abstract class Mod {
   private allPorts: Port[] = [];
   private allKnobs: Knob[] = [];
   private building = false;
+  // Advanced-layout CV jacks that move a knob ('cv_<knob id>'), and the taps of the
+  // ones that are read when a note or step is scheduled.
+  private cvIns: Record<string, AudioNode> = {};
+  private knobTaps: Record<string, CvTap> = {};
   // MIDI CC number mapped to each knob, by knob id.
   cc: Record<string, number> = {};
 
@@ -125,6 +129,41 @@ export abstract class Mod {
     fn();
     this.building = false;
   }
+
+  // A CV jack (advanced layout only) for a knob that is read when a note or step is
+  // scheduled. A CV of 1 moves the knob by half its range; read it with val().
+  protected cvKnob(id: string, x: number, y: number) {
+    const tap = new CvTap();
+    this.knobTaps[id] = tap;
+    this.cvJack(id, x, y, tap.in);
+  }
+
+  // A CV jack (advanced layout only) for a knob that is a Web Audio param: the CV,
+  // times scale, is added to the param.
+  protected cvParam(id: string, x: number, y: number, param: AudioParam | null, scale: number) {
+    const g = ac.createGain();
+    g.gain.value = scale;
+    if (param) g.connect(param);
+    this.cvJack(id, x, y, g);
+    return g;
+  }
+
+  private cvJack(id: string, x: number, y: number, node: AudioNode) {
+    const label = this.knobById(id).label;
+    this.advOnly(() => this.port('cv_' + id, label, 'cv', 'in', x, y));
+    this.cvIns['cv_' + id] = node;
+  }
+
+  // A knob's value with its CV added, kept within the knob's range.
+  val(id: string) {
+    const tap = this.knobTaps[id], v = this.p[id];
+    if (!tap) return v;
+    const k = this.knobById(id);
+    return Math.min(k.max, Math.max(k.min, v + (tap.read() * (k.max - k.min)) / 2));
+  }
+
+  // Where a cable plugged into this input goes.
+  input(port: string) { return this.cvIns[port] ?? this.audioIn(port); }
 
   protected portById(id: string) { return this.allPorts.find((p) => p.id === id)!; }
   protected knobById(id: string) { return this.allKnobs.find((k) => k.id === id)!; }

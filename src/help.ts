@@ -153,6 +153,11 @@ export const HELP: Record<string, Help> = {
   speaker: { text: 'THE OUTPUT TO YOUR SPEAKERS, WITH A SCOPE. EVERY PATCH NEEDS ONE. SEVERAL CABLES INTO IN ARE MIXED.' },
 };
 
+// Modules whose + layout adds CV jacks for their knobs.
+for (const type of ['env', 'synth', 'filter', 'delay', 'lfo', 'kick', 'snare', 'hihat', 'clap', 'cowbell', 'euclid', 'chance', 'turing', 'drive', 'fold', 'slew']) {
+  HELP[type].text += ' + ADDS CV JACKS FOR ITS KNOBS.';
+}
+
 const JACK_KIND: Record<SigType, [string, string]> = {
   trig: ['GATE IN: TRIGGERS OR GATES FROM A CLOCK, SEQUENCER OR KEYS.', 'GATE OUT: TRIGGERS OR GATES. ONE OUTPUT CAN FEED MANY INPUTS.'],
   cv: ['CV IN: A CONTROL VOLTAGE, LIKE AN LFO, ENVELOPE OR PITCH. AUDIO FITS TOO.', 'CV OUT: A CONTROL VOLTAGE.'],
@@ -165,7 +170,9 @@ export function jackHelp(type: string, p: Port) {
   const kind = { trig: 'GATE', cv: 'CV', audio: 'AUDIO' }[p.type];
   return {
     title: `${p.label || p.id.toUpperCase()} - ${kind} ${p.dir === 'in' ? 'IN' : 'OUT'}`,
-    text: HELP[type]?.jacks?.[p.id] ?? JACK_KIND[p.type][p.dir === 'in' ? 0 : 1],
+    text: HELP[type]?.jacks?.[p.id]
+      ?? (p.id.startsWith('cv_') ? `CV MOVES THE ${p.label} KNOB: 1 = HALF ITS RANGE, ADDED TO WHERE THE KNOB IS SET.` : null)
+      ?? JACK_KIND[p.type][p.dir === 'in' ? 0 : 1],
   };
 }
 

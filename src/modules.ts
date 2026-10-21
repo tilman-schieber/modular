@@ -2,6 +2,7 @@ import { ac, cutHz, decay, noiseBuffer, noiseSrc } from './audio';
 import type { Engine } from './engine';
 import { C, type Gfx } from './gfx';
 import { midi } from './midi';
+import { download, Recorder, stamp } from './rec';
 import { CvTap, Mod, PITCH_REF, velGain, type Cat, type Drag, type Ev, type KnobDef, type SigType } from './mod';
 import { drawButton } from './render';
 
@@ -1678,21 +1679,90 @@ export class Reverb extends Mod {
   destroy() { clearTimeout(this.timer); }
 }
 
+// ---------------------------------------------------------------- RECORDER
+
+// Records whatever is patched into IN (in stereo, if it is) as WAV files. REC starts
+// and stops a take by hand; each trigger at TRG does the same, exactly on time: CLOCK
+// RST records from the moment you press play, a 2-bar DIV records 2-bar loops.
+// Stopping playback ends a take. Every take downloads when it ends.
+export class RecorderMod extends Mod {
+  private rec = new Recorder((wav) => {
+    download(wav, `pixel-modular-${stamp()}.wav`);
+    this.saved = now();
+  });
+  private an = ac.createAnalyser();
+  private buf = new Float32Array(256);
+  private saved = -1e9;
+
+  constructor(e: Engine) {
+    super(e, 'recorder', 'RECORDER', 'util', 64, 52);
+    this.an.fftSize = 256;
+    this.rec.in.connect(this.an);
+    this.port('in', 'IN', 'audio', 'in', 4, 32);
+    this.port('trg', 'TRG', 'trig', 'in', 20, 32);
+  }
+
+  private toggle(t: number) {
+    if (this.rec.recording) this.rec.stop(t);
+    else this.rec.start(t);
+  }
+
+  onEvent(_port: string, ev: Ev) { if (!ev.off) this.toggle(ev.t); }
+
+  audioIn() { return this.rec.in; }
+
+  // Engine.stop resets with t0 = 0: that ends a take.
+  reset(t0: number) { if (!t0) this.rec.stop(ac.currentTime); }
+
+  press(lx: number, ly: number): Drag | null {
+    if (!inBtn(lx, ly, 36, 34, 25)) return null;
+    void ac.resume();
+    this.toggle(ac.currentTime + 0.02);
+    return noDrag;
+  }
+
+  drawBody(g: Gfx) {
+    const on = this.rec.recording;
+    g.rect(3, 12, 58, 16, C.black);
+    g.disc(9, 18, 3, on && Math.floor(now() / 400) % 2 === 0 ? C.red : C.dark);
+    const s = Math.floor(this.rec.seconds);
+    const text = now() - this.saved < 2000 ? 'SAVED' : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+    g.text(text, 16, 15, on ? C.red : C.silver);
+    // input level
+    this.an.getFloatTimeDomainData(this.buf);
+    let peak = 0;
+    for (const v of this.buf) peak = Math.max(peak, Math.abs(v));
+    g.rect(16, 23, 42, 2, C.ink);
+    g.rect(16, 23, Math.round(Math.min(1, peak) * 42), 2, peak > 0.95 ? C.red : C.lime);
+    drawButton(g, 36, 34, 25, on ? 'STOP' : 'REC', on ? C.red : C.silver);
+  }
+
+  destroy() {
+    // A take in progress still ends and downloads.
+    this.rec.stop(ac.currentTime);
+    setTimeout(() => this.rec.destroy(), 500);
+  }
+}
+
 // ---------------------------------------------------------------- SPEAKER
+
+// The output to the speakers: a grille and a small LED level meter (after VOL).
+const SPEAKER_LEDS = [-36, -30, -24, -18, -12, -6, -3, -0.5]; // dB at which each LED lights
 
 export class Speaker extends Mod {
   in = ac.createGain();
   an = ac.createAnalyser();
   vol = ac.createGain();
-  private buf = new Uint8Array(256);
+  private buf = new Float32Array(256);
+  private level = 0;
 
   constructor(e: Engine) {
-    super(e, 'speaker', 'SPEAKER', 'util', 64, 54);
+    super(e, 'speaker', 'SPEAKER', 'util', 64, 44);
     this.an.fftSize = 256;
-    this.in.connect(this.an);
     this.in.connect(this.vol).connect(e.master);
-    this.port('in', 'IN', 'audio', 'in', 4, 33);
-    this.knob({ id: 'vol', label: 'VOL', x: 49, y: 32, min: 0, max: 1, def: 0.8, fmt: pct });
+    this.vol.connect(this.an);
+    this.port('in', 'IN', 'audio', 'in', 4, 23);
+    this.knob({ id: 'vol', label: 'VOL', x: 49, y: 22, min: 0, max: 1, def: 0.8, fmt: pct });
   }
 
   onParam(_id: string, v: number) { this.vol.gain.setTargetAtTime(v, ac.currentTime, 0.01); }
@@ -1700,22 +1770,18 @@ export class Speaker extends Mod {
   audioIn() { return this.in; }
 
   drawBody(g: Gfx) {
-    g.rect(3, 12, 58, 18, C.black);
-    this.an.getByteTimeDomainData(this.buf);
-    // Trigger on a rising zero crossing so the wave stands still.
-    let s = 0;
-    for (let i = 1; i < 128; i++) {
-      if (this.buf[i - 1] < 128 && this.buf[i] >= 128) { s = i; break; }
-    }
-    let py = -1;
-    for (let x = 0; x < 56; x++) {
-      const y = 20 - Math.round(((this.buf[s + x * 2] - 128) / 128) * 7);
-      const y0 = py < 0 ? y : py;
-      g.rect(4 + x, Math.min(y, y0), 1, Math.abs(y - y0) + 1, C.lime);
-      py = y;
-    }
+    // Peak level, falling back slowly so short hits stay visible.
+    this.an.getFloatTimeDomainData(this.buf);
+    let peak = 0;
+    for (const v of this.buf) peak = Math.max(peak, Math.abs(v));
+    this.level = Math.max(peak, this.level * 0.9);
+    const db = 20 * Math.log10(this.level + 1e-9);
+    SPEAKER_LEDS.forEach((at, i) => {
+      const col = i === SPEAKER_LEDS.length - 1 ? C.red : i >= SPEAKER_LEDS.length - 3 ? C.yellow : C.lime;
+      g.rect(17 + i * 5, 13, 4, 3, db >= at ? col : C.ink);
+    });
     // speaker grille
-    for (let y = 34; y < 47; y += 3) for (let x = 18; x < 45; x += 3) g.rect(x, y, 2, 2, C.ink);
+    for (let y = 20; y < 36; y += 3) for (let x = 18; x < 45; x += 3) g.rect(x, y, 2, 2, C.ink);
   }
 
   destroy() { this.vol.disconnect(); }
@@ -2825,5 +2891,6 @@ export const KINDS: Kind[] = [
   { type: 'ring', label: 'RING', cat: 'fx', make: (e) => new Ring(e) },
   { type: 'mixer', label: 'MIXER', cat: 'util', make: (e) => new Mixer(e) },
   { type: 'scope', label: 'SCOPE', cat: 'util', make: (e) => new Scope(e) },
+  { type: 'recorder', label: 'RECORDER', cat: 'util', make: (e) => new RecorderMod(e) },
   { type: 'speaker', label: 'SPEAKER', cat: 'util', make: (e) => new Speaker(e) },
 ];

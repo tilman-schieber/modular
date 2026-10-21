@@ -11,8 +11,6 @@ export class Engine {
   running = false;
   dirty = false;
   master: GainNode;
-  // The final mix after the compressor, for recording.
-  output: AudioNode;
   private nextId = 0;
   private queue: { t: number; fn: () => void }[] = [];
   private depth = 0;
@@ -24,7 +22,6 @@ export class Engine {
     comp.threshold.value = -12;
     comp.ratio.value = 4;
     this.master.connect(comp).connect(ac.destination);
-    this.output = comp;
     setInterval(() => this.tick(), 25);
   }
 

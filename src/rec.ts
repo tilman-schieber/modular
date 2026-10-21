@@ -1,11 +1,34 @@
 import { ac } from './audio';
 
-// Captures raw stereo samples from a node with an AudioWorklet and saves them as a WAV.
+// Records an input between two times on the audio clock, to the sample, and hands
+// back each take as a WAV. The AudioWorklet cuts the takes itself, so a take started
+// by a trigger begins exactly on that trigger.
 const PROCESSOR = `
 class Tap extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.from = Infinity; this.to = Infinity;
+    this.port.onmessage = (e) => {
+      if (e.data.start !== undefined) { this.from = e.data.start; this.to = Infinity; }
+      if (e.data.stop !== undefined) this.to = e.data.stop;
+    };
+  }
   process(inputs) {
-    const ch = inputs[0];
-    if (ch.length) this.port.postMessage([ch[0].slice(), (ch[1] || ch[0]).slice()]);
+    const ch = inputs[0], n = 128, t0 = currentTime, t1 = t0 + n / sampleRate;
+    if (this.from < t1 && this.to > t0) {
+      const a = Math.max(0, Math.round((this.from - t0) * sampleRate));
+      const b = Math.min(n, Math.round((this.to - t0) * sampleRate));
+      if (b > a) {
+        // nothing plugged in records silence
+        const l = ch[0] ? ch[0].slice(a, b) : new Float32Array(b - a);
+        const r = ch[1] ? ch[1].slice(a, b) : l.slice();
+        this.port.postMessage([l, r]);
+      }
+    }
+    if (this.to <= t1 && this.from !== Infinity) {
+      this.port.postMessage('done');
+      this.from = this.to = Infinity;
+    }
     return true;
   }
 }
@@ -15,41 +38,75 @@ registerProcessor('tap', Tap);
 let ready: Promise<void> | null = null;
 
 export class Recorder {
+  // Patch the signal to record into this.
+  in = ac.createGain();
   private node: AudioWorkletNode | null = null;
   // The tap feeds a silent gain into the destination so every browser keeps it running.
   private mute = ac.createGain();
   private chunks: [Float32Array, Float32Array][] = [];
-  private started = 0;
+  // Start/stop messages sent before the worklet has loaded wait here.
+  private queue: object[] = [];
+  private from = 0;
+  recording = false;
 
-  constructor(private source: AudioNode) {
+  constructor(private done: (wav: Blob) => void) {
     this.mute.gain.value = 0;
     this.mute.connect(ac.destination);
-  }
-
-  get recording() { return this.node !== null; }
-  get seconds() { return this.recording ? ac.currentTime - this.started : 0; }
-
-  async start() {
     ready ??= ac.audioWorklet.addModule(URL.createObjectURL(new Blob([PROCESSOR], { type: 'text/javascript' })));
-    await ready;
-    this.chunks = [];
-    this.started = ac.currentTime;
-    const node = new AudioWorkletNode(ac, 'tap', { channelCount: 2, channelCountMode: 'explicit' });
-    node.port.onmessage = (e) => this.chunks.push(e.data);
-    this.source.connect(node);
-    node.connect(this.mute);
-    this.node = node;
+    void ready.then(() => {
+      const node = new AudioWorkletNode(ac, 'tap', { channelCount: 2, channelCountMode: 'explicit' });
+      node.port.onmessage = (e) => {
+        if (e.data !== 'done') { this.chunks.push(e.data); return; }
+        if (this.chunks.length) this.done(encodeWav(this.chunks, ac.sampleRate));
+        this.chunks = [];
+      };
+      this.in.connect(node).connect(this.mute);
+      this.node = node;
+      for (const msg of this.queue) node.port.postMessage(msg);
+      this.queue = [];
+    });
   }
 
-  // Stops and returns the recording as a WAV blob.
-  stop() {
-    if (!this.node) return null;
-    this.source.disconnect(this.node);
-    this.node.disconnect();
-    this.node.port.onmessage = null;
-    this.node = null;
-    return encodeWav(this.chunks, ac.sampleRate);
+  // Seconds recorded so far in this take.
+  get seconds() {
+    const now = ac.currentTime;
+    return this.recording ? Math.max(0, now - this.from) : 0;
   }
+
+  private send(msg: object) {
+    if (this.node) this.node.port.postMessage(msg);
+    else this.queue.push(msg);
+  }
+
+  start(t: number) {
+    if (this.recording) return;
+    this.recording = true;
+    this.from = t;
+    this.chunks = [];
+    this.send({ start: t });
+  }
+
+  stop(t: number) {
+    if (!this.recording) return;
+    this.recording = false;
+    this.send({ stop: t });
+  }
+
+  destroy() {
+    this.in.disconnect();
+    this.node?.disconnect();
+    this.mute.disconnect();
+  }
+}
+
+export const stamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+
+export function download(blob: Blob, name: string) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
 function encodeWav(chunks: [Float32Array, Float32Array][], rate: number) {

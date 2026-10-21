@@ -16,7 +16,8 @@ with cables, press space.
   patterns A-D with chaining; MIXER: 8 channels with pan)
 - Play live from the computer keyboard or a MIDI keyboard (velocity, mod wheel, pitch bend, aftertouch, sustain)
 - MIDI clock in and out, and MIDI learn: Alt+click a knob, then move a control
-- Undo/redo, WAV recording, and share links that carry the whole patch
+- A RECORDER module: records any signal to WAV, by hand or started and stopped exactly by triggers
+- Undo/redo, and share links that carry the whole patch
 
 ```sh
 npm install

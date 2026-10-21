@@ -7,7 +7,7 @@ import { PATCHES, migrate, type PatchData } from './patches';
 import { cablePoints, drawButton, drawCable, drawModule, plug } from './render';
 import { BAR_HELP, CABLE_HELP, HELP, MODULE_HOW, jackHelp, knobHelp } from './help';
 import { midi } from './midi';
-import { Recorder } from './rec';
+import { download, stamp } from './rec';
 import { decodePatch, encodePatch, hashCode } from './share';
 
 // The patch field zooms; the UI overlay (toolbar, menu, hints) keeps a fixed pixel scale.
@@ -97,42 +97,12 @@ function togglePlay() {
   else { eng.start(); everPlayed = true; }
 }
 
-// ---------------------------------------------------------------- recording
-
-const recorder = new Recorder(eng.output);
-
-function toggleRec() {
-  void ac.resume();
-  if (!recorder.recording) {
-    void recorder.start().then(() => showToast('RECORDING - CLICK AGAIN TO SAVE'));
-    return;
-  }
-  download(recorder.stop()!, `pixel-modular-${stamp()}.wav`);
-  showToast('RECORDING SAVED');
-}
-
-const stamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-
-function download(blob: Blob, name: string) {
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-}
-
-function recLabel() {
-  const s = Math.floor(recorder.seconds);
-  return recorder.recording ? `  ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` : '  REC';
-}
-
 function layoutBar() {
   const cats = Object.keys(CAT) as Cat[];
   const items: Omit<Btn, 'x' | 'y' | 'w'>[] = [
     eng.running
       ? { label: '  STOP', col: C.red, text: C.ink, hi: C.white, act: togglePlay }
       : { label: '  PLAY', col: C.green, text: C.ink, hi: C.white, act: togglePlay },
-    { label: recLabel(), col: recorder.recording ? C.red : C.silver, text: C.ink, hi: C.white, act: toggleRec },
     { label: 'PATCHES', col: C.silver, text: C.ink, hi: C.white, menu: patchesMenu() },
     ...cats.map((cat) => ({
       label: CAT[cat].name, col: CAT[cat].bar, text: C.white, hi: CAT[cat].cap,
@@ -153,7 +123,7 @@ function layoutBar() {
     bar.push({ ...it, x, y, w });
     x += w + 2;
     // Small gaps separate transport, patches, modules and the rest.
-    if (it.act === toggleRec || it.label === 'PATCHES' || it.label === CAT.util.name || it.label === 'CLEAR') x += 6;
+    if (it.act === togglePlay || it.label === 'PATCHES' || it.label === CAT.util.name || it.label === 'CLEAR') x += 6;
   }
   barH = y + 12;
 }
@@ -191,11 +161,6 @@ function drawBar() {
     if (b.menu) {
       const ax = b.x + b.w - 8, ac = active ? C.ink : b.text;
       for (let i = 0; i < 3; i++) ui.rect(ax + i, b.y + 3 + i, 5 - i * 2, 1, ac);
-    }
-    if (b.act === toggleRec) {
-      const on = !recorder.recording || Math.floor(performance.now() / 400) % 2 === 0;
-      ui.disc(b.x + 6, b.y + 4, 2, on ? C.red : C.ink);
-      if (recorder.recording && on) ui.disc(b.x + 6, b.y + 4, 2, C.white);
     }
     if (b.act === togglePlay) {
       if (eng.running) ui.rect(b.x + 4, b.y + 2, 5, 5, C.ink);
@@ -998,7 +963,7 @@ function helpFor(h: Hit): HelpCard | null {
   const mod = (m: Mod) => ({ title: m.title, col: CAT[m.cat].bar, text: HELP[m.type]?.text ?? '' });
   switch (h.k) {
     case 'bar': {
-      const label = h.b.act === toggleRec ? 'REC' : h.b.label.trim();
+      const label = h.b.label.trim();
       return { title: label, col: h.b.col, text: BAR_HELP[label] ?? '' };
     }
     case 'port': return { ...mod(h.m), part: jackHelp(h.m.type, h.p) };

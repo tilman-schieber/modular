@@ -1,4 +1,4 @@
-import { ac, cutHz, decay, noiseBuffer, noiseSrc } from './audio';
+import { ac, cutHz, decay, noiseSrc } from './audio';
 import type { Engine } from './engine';
 import { C, type Gfx } from './gfx';
 import { midi } from './midi';
@@ -2429,36 +2429,107 @@ export class Maths extends Mod {
   destroy() { this.node?.disconnect(); }
 }
 
+// Noise in colours: white (flat), pink (-3 dB per octave, Paul Kellet's filter),
+// brown (-6 dB, leaky integrated white), blue (+6 dB, differentiated white), plus
+// DUST (random single-sample clicks, DNS per second) and a sample and hold: each
+// trigger holds a new random value at RND. Holds are queued and land sample-accurately.
+const NOISE_PROCESSOR = `
+class Noise extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [{ name: 'dens', defaultValue: 20, minValue: 0, automationRate: 'k-rate' }];
+  }
+  constructor() {
+    super();
+    this.p = [0, 0, 0, 0, 0, 0, 0]; this.br = 0; this.w0 = 0; this.held = 0;
+    this.holds = [];
+    this.port.onmessage = (e) => { this.holds.push(e.data.hold); this.holds.sort((a, b) => a - b); };
+  }
+  process(inputs, outputs, params) {
+    const o = outputs[0];
+    if (!o || o.length < 6) return true;
+    const p = this.p, n = o[0].length, pr = params.dens[0] / sampleRate;
+    for (let s = 0; s < n; s++) {
+      const t = currentTime + s / sampleRate;
+      while (this.holds.length && this.holds[0] <= t) { this.holds.shift(); this.held = Math.random() * 2 - 1; }
+      const w = Math.random() * 2 - 1;
+      p[0] = 0.99886 * p[0] + w * 0.0555179; p[1] = 0.99332 * p[1] + w * 0.0750759;
+      p[2] = 0.969 * p[2] + w * 0.153852; p[3] = 0.8665 * p[3] + w * 0.3104856;
+      p[4] = 0.55 * p[4] + w * 0.5329522; p[5] = -0.7616 * p[5] - w * 0.016898;
+      const pink = (p[0] + p[1] + p[2] + p[3] + p[4] + p[5] + p[6] + w * 0.5362) * 0.11;
+      p[6] = w * 0.115926;
+      this.br = (this.br + 0.02 * w) / 1.02;
+      o[0][s] = w;
+      o[1][s] = pink;
+      o[2][s] = this.br * 3.5;
+      o[3][s] = (w - this.w0) / 2;
+      o[4][s] = Math.random() < pr ? Math.random() * 2 - 1 : 0;
+      o[5][s] = this.held;
+      this.w0 = w;
+    }
+    return true;
+  }
+}
+registerProcessor('noise', Noise);
+`;
+const NOISE_OUTS = ['wht', 'pnk', 'brn', 'blu', 'dst', 'rnd'];
+const dustHz = (v: number) => 0.5 * 2 ** (v * 12);
+
 export class Noise extends Mod {
-  src = ac.createBufferSource();
   f = ac.createBiquadFilter();
   out = ac.createGain();
+  // The colours and DUST at LVL; RND is a CV and stays at -1..1.
+  outs = NOISE_OUTS.map(() => ac.createGain());
+  private node: AudioWorkletNode | null = null;
 
   constructor(e: Engine) {
     super(e, 'noise', 'NOISE', 'synth', 50, 52);
-    this.src.buffer = noiseBuffer();
-    this.src.loop = true;
     this.f.type = 'lowpass';
-    this.src.connect(this.f).connect(this.out);
-    this.src.start();
+    this.f.connect(this.out);
     this.knobRow([
       { id: 'tone', label: 'TON', min: 0, max: 1, def: 0.8, fmt: hz },
       { id: 'lvl', label: 'LVL', min: 0, max: 1, def: 0.3, fmt: pct },
     ], 13);
     this.port('out', 'OUT', 'audio', 'out', 37, 32);
+    this.advanced('ADVANCED', 97, 70);
+    // A CV of 1 raises TON by four octaves; one on LVL adds half the range.
+    this.cvParam('tone', 12, 51, this.f.detune, 4800);
+    const lvl = this.cvParam('lvl', 27, 51, null, 0.5);
+    for (const g of [this.out, ...this.outs.slice(0, 5)]) lvl.connect(g.gain);
+    this.advOnly(() => {
+      ['WHT', 'PNK', 'BRN', 'BLU', 'DST'].forEach((l, i) =>
+        this.port(NOISE_OUTS[i], l, 'audio', 'out', 52 + (i % 3) * 15, i < 3 ? 13 : 32));
+      this.knob({ id: 'dens', label: 'DNS', x: 82, y: 32, min: 0, max: 1, def: 0.4, fmt: (v) => Math.round(dustHz(v)) + '/S' });
+      this.port('trg', 'TRG', 'trig', 'in', 52, 51);
+      this.port('rnd', 'RND', 'cv', 'out', 67, 51);
+    });
+    void worklet(NOISE_PROCESSOR).then(() => {
+      const node = new AudioWorkletNode(ac, 'noise', { outputChannelCount: [6] });
+      const split = ac.createChannelSplitter(6);
+      node.connect(split);
+      this.outs.forEach((o, i) => split.connect(o, i));
+      split.connect(this.f, 0);
+      this.node = node;
+      for (const id of ['tone', 'lvl', 'dens']) this.onParam(id);
+    });
   }
 
-  onParam(id: string, v: number) {
-    if (id === 'tone') this.f.frequency.setTargetAtTime(cutHz(v), ac.currentTime, 0.02);
-    if (id === 'lvl') this.out.gain.setTargetAtTime(v, ac.currentTime, 0.02);
+  onParam(id: string) {
+    const t = ac.currentTime;
+    if (id === 'tone') this.f.frequency.setTargetAtTime(cutHz(this.p.tone), t, 0.02);
+    if (id === 'lvl') for (const g of [this.out, ...this.outs.slice(0, 5)]) g.gain.setTargetAtTime(this.p.lvl, t, 0.02);
+    if (id === 'dens') this.node?.parameters.get('dens')!.setTargetAtTime(dustHz(this.p.dens), t, 0.02);
+  }
+
+  onEvent(port: string, ev: Ev) {
+    if (port === 'trg' && !ev.off) this.node?.port.postMessage({ hold: ev.t });
   }
 
   drawBody(g: Gfx) {
     for (let i = 0; i < 40; i++) g.px(5 + ((i * 37) % 26), 34 + ((i * 11) % 13), C.slate);
   }
 
-  audioOut() { return this.out; }
-  destroy() { this.src.stop(); }
+  audioOut(port: string) { return port === 'out' ? this.out : this.outs[NOISE_OUTS.indexOf(port)] ?? null; }
+  destroy() { this.node?.disconnect(); }
 }
 
 // ---------------------------------------------------------------- MODULATION
@@ -2476,39 +2547,141 @@ function worklet(code: string) {
 
 const lfoHz = (v: number) => 0.05 * 2 ** (v * 9);
 
+// One phase drives every wave, so all outputs stay in step. The waves start where
+// Web Audio's oscillators do (0 rising; the square high first). RND holds a new random
+// value each cycle, SMO glides to it. Resets are queued and land sample-accurately.
+const LFO_PROCESSOR = `
+class Lfo extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [{ name: 'freq', defaultValue: 1, automationRate: 'k-rate' }];
+  }
+  constructor() {
+    super();
+    this.ph = 0; this.shape = 0; this.uni = false;
+    this.r0 = 0; this.r1 = Math.random() * 2 - 1;
+    this.resets = [];
+    this.port.onmessage = (e) => {
+      const d = e.data;
+      if (d.reset !== undefined) { this.resets.push(d.reset); this.resets.sort((a, b) => a - b); }
+      else Object.assign(this, d);
+    };
+  }
+  next() { this.r0 = this.r1; this.r1 = Math.random() * 2 - 1; }
+  process(inputs, outputs, params) {
+    const o = outputs[0];
+    if (!o || o.length < 7) return true;
+    const cv = inputs[0][0], n = o[0].length, f0 = params.freq[0];
+    for (let s = 0; s < n; s++) {
+      const t = currentTime + s / sampleRate;
+      while (this.resets.length && this.resets[0] <= t) { this.resets.shift(); if (this.ph > 0.001) this.next(); this.ph = 0; }
+      // A CV of 1 adds 5 Hz.
+      this.ph += (f0 + (cv ? cv[s] * 5 : 0)) / sampleRate;
+      if (this.ph >= 1) { this.ph -= Math.floor(this.ph); this.next(); }
+      else if (this.ph < 0) { this.ph += 1 - Math.floor(this.ph + 1); this.next(); }
+      const p = this.ph;
+      const w = [
+        Math.sin(2 * Math.PI * p),
+        p < 0.25 ? 4 * p : p < 0.75 ? 2 - 4 * p : 4 * p - 4,
+        p < 0.5 ? 2 * p : 2 * p - 2,
+        p < 0.5 ? 1 : -1,
+        this.r0,
+        this.r0 + (this.r1 - this.r0) * (0.5 - 0.5 * Math.cos(Math.PI * p)),
+      ];
+      for (let i = 0; i < 6; i++) {
+        const v = this.uni ? (w[i] + 1) / 2 : w[i];
+        o[i + 1][s] = v;
+        if (i === this.shape) o[0][s] = v;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('lfo', Lfo);
+`;
+
+// With a clock at CLK, RAT picks a note value; the clock sends 16ths.
+const LFO_SYNC = [1, 2, 4, 8, 16, 32, 64, 128];
+const LFO_SYNC_NAMES = ['1/16', '1/8', '1/4', '1/2', '1 BAR', '2 BAR', '4 BAR', '8 BAR'];
+const LFO_OUTS = ['out', 'sin', 'tri', 'saw', 'sqr', 'rnd', 'smo'];
+
 export class Lfo extends Mod {
-  o = ac.createOscillator();
   cv = ac.createGain();
-  out = ac.createGain();
+  outs = LFO_OUTS.map(() => ac.createGain());
   an = ac.createAnalyser();
   private buf = new Float32Array(32);
+  private node: AudioWorkletNode | null = null;
+  private clk: number[] = [];
+  private ticks = 0;
+  private tick = 0;
 
   constructor(e: Engine) {
     super(e, 'lfo', 'LFO', 'mod', 50, 52);
     this.an.fftSize = 32;
-    this.o.connect(this.out);
-    this.out.connect(this.an);
-    this.o.start();
-    // A CV of 1 adds 5 Hz.
-    this.cv.gain.value = 5;
-    this.cv.connect(this.o.frequency);
+    this.outs[0].connect(this.an);
     this.port('cv', 'RAT', 'cv', 'in', 4, 32);
     this.knobRow([
-      { id: 'rate', label: 'RAT', min: 0, max: 1, def: 0.4, fmt: (v) => lfoHz(v).toFixed(2) + 'HZ' },
-      { id: 'shape', label: 'SHP', min: 0, max: 3, def: 0, names: ['SIN', 'TRI', 'SAW', 'SQR'] },
+      { id: 'rate', label: 'RAT', min: 0, max: 1, def: 0.4, fmt: (v) => (this.synced ? LFO_SYNC_NAMES[this.syncIdx(v)] : lfoHz(v).toFixed(2) + 'HZ') },
+      { id: 'shape', label: 'SHP', min: 0, max: 5, def: 0, names: ['SIN', 'TRI', 'SAW', 'SQR', 'RND', 'SMO'] },
       { id: 'depth', label: 'DEP', min: 0, max: 1, def: 0.5, fmt: pct },
     ], 13);
     this.port('out', 'OUT', 'cv', 'out', 37, 32);
-    this.advanced('ADVANCED', 50, 70);
-    this.cvParam('depth', 35, 51, this.out.gain, 0.5);
+    this.advanced('ADVANCED', 97, 70);
+    const dep = this.cvParam('depth', 35, 51, null, 0.5);
+    for (const o of this.outs) dep.connect(o.gain);
+    this.advOnly(() => {
+      ['SIN', 'TRI', 'SAW', 'SQR', 'RND', 'SMO'].forEach((l, i) =>
+        this.port(LFO_OUTS[i + 1], l, 'cv', 'out', 52 + (i % 3) * 15, i < 3 ? 13 : 32));
+      this.port('clk', 'CLK', 'trig', 'in', 4, 51);
+      this.port('rst', 'RST', 'trig', 'in', 20, 51);
+      this.knob({ id: 'uni', label: 'POL', x: 52, y: 51, min: 0, max: 1, def: 0, step: 1, names: ['+-', '+'] });
+    });
+    void worklet(LFO_PROCESSOR).then(() => {
+      const node = new AudioWorkletNode(ac, 'lfo', { outputChannelCount: [7] });
+      this.cv.connect(node);
+      const split = ac.createChannelSplitter(7);
+      node.connect(split);
+      this.outs.forEach((o, i) => split.connect(o, i));
+      this.node = node;
+      for (const id of ['rate', 'shape', 'depth', 'uni']) this.onParam(id);
+    });
   }
 
-  onParam(id: string, v: number) {
-    const t = ac.currentTime;
-    if (id === 'rate') this.o.frequency.setTargetAtTime(lfoHz(v), t, 0.02);
-    if (id === 'shape') this.o.type = (['sine', 'triangle', 'sawtooth', 'square'] as const)[v];
-    if (id === 'depth') this.out.gain.setTargetAtTime(v, t, 0.02);
+  get synced() { return this.isAdv && this.tick > 0 && this.eng.cablesAt(this, 'clk').length > 0; }
+  private syncIdx(v: number) { return Math.round(v * (LFO_SYNC.length - 1)); }
+  private n() { return LFO_SYNC[this.syncIdx(this.p.rate)]; }
+
+  private retime(t: number) {
+    const hz = this.synced ? 1 / (this.tick * this.n()) : lfoHz(this.p.rate);
+    this.node?.parameters.get('freq')!.setTargetAtTime(hz, Math.max(t, ac.currentTime), 0.005);
   }
+
+  protected layout() { this.onParam('uni'); this.retime(ac.currentTime); }
+
+  onParam(id: string) {
+    const t = ac.currentTime;
+    if (id === 'rate') this.retime(t);
+    if (id === 'shape') this.node?.port.postMessage({ shape: this.p.shape });
+    // The basic layout is always bipolar.
+    if (id === 'uni') this.node?.port.postMessage({ uni: this.isAdv && this.p.uni === 1 });
+    if (id === 'depth') for (const o of this.outs) o.gain.setTargetAtTime(this.p.depth, t, 0.02);
+  }
+
+  onEvent(port: string, ev: Ev) {
+    if (ev.off || !this.isAdv) return;
+    if (port === 'rst') { this.ticks = 0; this.node?.port.postMessage({ reset: ev.t }); }
+    if (port !== 'clk') return;
+    // Averaged over two ticks, so swing does not wobble the rate.
+    const c = (this.clk = [...this.clk.slice(-2), ev.t]);
+    const tick = c.length === 3 ? (c[2] - c[0]) / 2 : c.length === 2 ? c[1] - c[0] : 0;
+    if (tick > 0.02 && tick < 1 && Math.abs(tick - this.tick) > 0.0005) { this.tick = tick; this.retime(ev.t); }
+    // Start the wave over every cycle's worth of ticks, so it stays locked to the bar.
+    if (this.ticks % this.n() === 0) this.node?.port.postMessage({ reset: ev.t });
+    this.ticks++;
+  }
+
+  // Unplugging the clock goes back to the knob's rate.
+  schedule() { if (this.tick && !this.eng.cablesAt(this, 'clk').length) { this.tick = 0; this.retime(ac.currentTime); } }
+  reset() { this.clk = []; this.ticks = 0; }
 
   drawBody(g: Gfx) {
     // A centre-zero meter showing where the LFO is right now.
@@ -2521,8 +2694,8 @@ export class Lfo extends Mod {
   }
 
   audioIn() { return this.cv; }
-  audioOut() { return this.out; }
-  destroy() { this.o.stop(); }
+  audioOut(port: string) { return this.outs[LFO_OUTS.indexOf(port)] ?? null; }
+  destroy() { this.node?.disconnect(); }
 }
 
 const envSec = (v: number) => 0.002 * 1000 ** v;

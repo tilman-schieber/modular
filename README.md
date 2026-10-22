@@ -20,8 +20,10 @@ with cables, press space.
   clock in, reset and division outs; sequencers: reset, per-step chance and ratchets,
   patterns A-D with chaining and a PAT input; FILTER: LP/HP/BP outputs at once, key
   tracking and a CV depth knob; MIXER: 8 channels with pan; VCA: a quad VCA and mixer
-  with lin/exp response, bipolar CV, normalled CV jacks and outputs, and a SUM out; OSC:
-  pulse width and PWM, FM depth, hard sync and a sub octave)
+  with lin/exp response, bipolar CV, normalled CV jacks and outputs, and a SUM out; LFO: all
+  waves at once plus random, clock sync, reset and unipolar; NOISE: white, pink, brown and
+  blue outs, dust and a sample and hold; OSC: pulse width and PWM, FM depth, hard sync and
+  a sub octave)
 - An ADVANCED menu with models of real hardware modules: MATHS (after Make Noise MATHS),
   two function generators for envelopes, LFOs and slew, plus attenuverters and SUM, INV and OR buses
   (example patch: MATHS BOUNCE)

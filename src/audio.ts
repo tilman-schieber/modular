@@ -29,3 +29,7 @@ export function decay(param: AudioParam, t: number, peak: number, len: number) {
 export function cutHz(v: number) {
   return 40 * 2 ** (v * 9);
 }
+
+// Silence everything when the page goes away; a page kept in the back/forward cache could otherwise keep playing.
+addEventListener('pagehide', () => void ac.suspend());
+addEventListener('pageshow', (e) => { if (e.persisted) void ac.resume(); });

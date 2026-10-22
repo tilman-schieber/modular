@@ -92,35 +92,70 @@ function voice() {
   return b.data;
 }
 
+// A slow Am7 Fmaj7 Cmaj7 G7 pad in delay and reverb, with sparse sine bells on top.
+// An ENVELOPE on the pad's VCA makes it swell each bar and fade out when you press STOP;
+// an LFO on its A and R jacks makes every swell a little different.
 function ambient() {
   const b = new Builder();
+  const bank = (pats: object[]) => ({ pats, pr: ['', '', '', ''], rt: ['', '', '', ''], e: 0 });
   const clock = b.add('clock', 10, 30, { bpm: 70 });
-  const melody = b.melody(82, 30, 'DRONE', { oct: 3, gate: 1 });
-  const oscA = b.add('osc', 256, 30, { wave: 0 });
-  const oscB = b.add('osc', 256, 90, { wave: 2, oct: 1 });
-  // Glide: the pitch CV goes through a SLEW.
-  const slew = b.add('slew', 176, 200, { time: 0.9 });
-  const noise = b.add('noise', 256, 150, { tone: 0.5, lvl: 0.12 });
-  const drift = b.add('lfo', 176, 140, { rate: 0.15, depth: 0.015 });
-  const mixer = b.add('mixer', 330, 40, { l0: 0.6, l1: 0.5, l2: 0.6 });
-  const filter = b.add('filter', 408, 40, { cut: 0.4, res: 5 });
-  const sweep = b.add('lfo', 408, 110, { rate: 0.05, depth: 0.6 });
-  const reverb = b.add('reverb', 468, 40, { size: 1, mix: 0.6 });
-  const delay = b.add('delay', 528, 40, { time: 0.8, fb: 0.6, mix: 0.4 });
-  const speaker = b.add('speaker', 468, 120);
-  b.wire(clock, 'o16', melody, 'clk');
-  b.wire(melody, 'pit', slew, 'in');
+  // One held root per bar: Am7, Fmaj7, Cmaj7, G7. A minor's degrees: 0 A, 2 C, 5 F, 6 G.
+  const roots = b.add('melody', 82, 30, { adv: 1, chain: 4, scale: 1, root: 9, oct: 2, gate: 1 },
+    bank([0, 5, 2, 6].map((d) => phrase([[0, d, 16]]))));
+  // CHORD in C (the relative major of A minor) builds the diatonic 7th chord on each root.
+  const chord = b.add('chord', 256, 30, { type: 7, key: 0 });
+  // Glide: the root goes through a SLEW; the upper voices step.
+  const slew = b.add('slew', 256, 96, { time: 0.9 });
+  const oscA = b.add('osc', 344, 30, { wave: 0 });
+  const oscB = b.add('osc', 344, 90, { wave: 2, oct: 1 });
+  const oscC = b.add('osc', 344, 150, { wave: 3, oct: 1 });
+  const drift = b.add('lfo', 256, 160, { rate: 0.15, depth: 0.015 });
+  const noise = b.add('noise', 344, 210, { tone: 0.5, lvl: 0.1 });
+  const mixer = b.add('mixer', 420, 30, { l0: 0.35, l1: 0.35, l2: 0.4, l3: 0.45 });
+  // The pad swells in on each bar and fades out on STOP instead of droning on.
+  const env = b.add('env', 420, 110, { adv: 1, a: 0.75, d: 0.8, s: 0.75, r: 0.85 });
+  // A slow LFO into the envelope's A and R jacks: some bars swell in slowly and fade long, others bloom fast.
+  const breath = b.add('lfo', 420, 210, { rate: 0.1, depth: 0.6 });
+  const vca = b.add('vca', 500, 30);
+  const filter = b.add('filter', 560, 30, { cut: 0.4, res: 4 });
+  const sweep = b.add('lfo', 560, 96, { rate: 0.05, depth: 0.5 });
+  const delay = b.add('delay', 620, 30, { time: 0.8, fb: 0.45, mix: 0.35 });
+  const reverb = b.add('reverb', 680, 30, { size: 1, mix: 0.5 });
+  const speaker = b.add('speaker', 680, 110);
+  // Sparkle: a slowly changing TURING line in A minor pentatonic, thinned out by CHANCE.
+  const turing = b.add('turing', 82, 190, { chg: 0.05, len: 8, rng: 1 });
+  const quant = b.add('quant', 166, 190, { root: 9, scale: 2 });
+  const chance = b.add('chance', 82, 270, { prob: 0.4 });
+  const bell = b.add('synth', 166, 270, { wave: 3, oct: 1, cut: 0.5, res: 1, env: 0.2, dec: 1.2 });
+  const bellVca = b.add('vca', 240, 270, { base: 0.3 });
+  b.wire(clock, 'o16', roots, 'clk');
+  b.wire(roots, 'pit', chord, 'in');
+  b.wire(roots, 'gate', env, 'in');
+  b.wire(chord, 'o0', slew, 'in');
   b.wire(slew, 'out', oscA, 'cv');
-  b.wire(slew, 'out', oscB, 'cv');
-  b.wire(drift, 'out', oscB, 'cv');
+  b.wire(chord, 'o1', oscB, 'cv');
+  b.wire(chord, 'o3', oscC, 'cv');
+  b.wire(drift, 'out', oscC, 'cv');
   b.wire(oscA, 'out', mixer, 'i0');
   b.wire(oscB, 'out', mixer, 'i1');
-  b.wire(noise, 'out', mixer, 'i2');
-  b.wire(mixer, 'out', filter, 'in');
+  b.wire(oscC, 'out', mixer, 'i2');
+  b.wire(noise, 'out', mixer, 'i3');
+  b.wire(mixer, 'out', vca, 'in');
+  b.wire(env, 'out', vca, 'cv');
+  b.wire(breath, 'out', env, 'cv_a');
+  b.wire(breath, 'out', env, 'cv_r');
+  b.wire(vca, 'out', filter, 'in');
   b.wire(sweep, 'out', filter, 'cv');
-  b.wire(filter, 'out', reverb, 'in');
-  b.wire(reverb, 'out', delay, 'in');
-  b.wire(delay, 'out', speaker, 'in');
+  b.wire(filter, 'out', delay, 'in');
+  b.wire(clock, 'o4', turing, 'clk');
+  b.wire(turing, 'out', quant, 'in');
+  b.wire(turing, 'gate', chance, 'in');
+  b.wire(quant, 'out', bell, 'pit');
+  b.wire(chance, 'a', bell, 'gate');
+  b.wire(bell, 'out', bellVca, 'in');
+  b.wire(bellVca, 'out', delay, 'in');
+  b.wire(delay, 'out', reverb, 'in');
+  b.wire(reverb, 'out', speaker, 'in');
   return b.data;
 }
 

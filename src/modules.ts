@@ -2257,6 +2257,15 @@ export class Envelope extends Mod {
     this.portById('in').y = this.portById('out').y = adv ? 71 : 51;
   }
 
+  // STOP releases a held envelope now instead of at the end of its last gate.
+  reset(t0: number) {
+    if (t0) return;
+    const t = ac.currentTime, lvl = this.src.offset;
+    if (lvl.cancelAndHoldAtTime) lvl.cancelAndHoldAtTime(t);
+    else { lvl.cancelScheduledValues(t); lvl.setValueAtTime(lvl.value, t); }
+    lvl.setTargetAtTime(0, t, envSec(this.val('r')) / 4);
+  }
+
   onEvent(_port: string, ev: Ev) {
     const a = envSec(this.val('a')), d = envSec(this.val('d')), r = envSec(this.val('r')), s = this.val('s');
     const t = ev.t, lvl = this.src.offset;

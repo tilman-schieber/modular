@@ -107,6 +107,7 @@ export class Engine {
     const c: Cable = { a, ap, b, bp, type: po.type, lit: 0 };
     this.cables.push(c);
     this.dirty = true;
+    a.onCables(); b.onCables();
     return c;
   }
 
@@ -116,6 +117,7 @@ export class Engine {
       try { c.a.output(c.ap)!.disconnect(c.b.input(c.bp)!); } catch { /* already gone */ }
     }
     this.dirty = true;
+    c.a.onCables(); c.b.onCables();
   }
 
   cablesAt(m: Mod, port: string) {

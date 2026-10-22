@@ -3,7 +3,7 @@ import { C, type Gfx } from './gfx';
 import type { Engine } from './engine';
 
 export type SigType = 'trig' | 'audio' | 'cv';
-export type Cat = 'util' | 'drum' | 'seq' | 'synth' | 'mod' | 'fx';
+export type Cat = 'util' | 'drum' | 'seq' | 'synth' | 'mod' | 'fx' | 'pro';
 
 // Category colours: `bar` is used for title bars and the matching toolbar menu.
 export const CAT: Record<Cat, { name: string; bar: string; cap: string }> = {
@@ -13,6 +13,8 @@ export const CAT: Record<Cat, { name: string; bar: string; cap: string }> = {
   mod: { name: 'MODULATE', bar: C.green, cap: C.lime },
   fx: { name: 'EFFECTS', bar: C.teal, cap: C.cyan },
   util: { name: 'OUTPUT', bar: C.slate, cap: C.silver },
+  // Models of real hardware modules: deeper, with more jacks.
+  pro: { name: 'ADVANCED', bar: C.orange, cap: C.yellow },
 };
 
 export const TYPEC: Record<SigType, string> = { trig: C.yellow, audio: C.red, cv: C.green };
@@ -63,6 +65,8 @@ export interface Port { id: string; label: string; type: SigType; dir: 'in' | 'o
 
 export interface Knob {
   id: string; label: string; x: number; y: number; adv?: boolean;
+  // For help, when the label is left blank to pack knobs tightly.
+  name?: string;
   min: number; max: number; def: number;
   step?: number;
   names?: string[];
@@ -270,6 +274,8 @@ export abstract class Mod {
 
   onParam(_id: string, _v: number) {}
   onEvent(_port: string, _ev: Ev) {}
+  // A cable was plugged into or out of one of this module's jacks.
+  onCables() {}
   schedule(_until: number) {}
   reset(_t0: number) {}
   // Audio and CV ports are both plain Web Audio nodes.

@@ -1622,7 +1622,7 @@ export class Mixer extends Mod {
       if (c < 4) add(); else this.advOnly(add);
     });
     this.advOnly(() => this.ins.forEach((_, c) =>
-      this.knob({ id: 'p' + c, label: '', x: 0, y: 45, min: -1, max: 1, def: 0, fmt: panFmt })));
+      this.knob({ id: 'p' + c, label: '', name: 'PAN', x: 0, y: 45, min: -1, max: 1, def: 0, fmt: panFmt })));
     this.knob({ id: 'vol', label: 'VOL', x: 0, y: 0, min: 0, max: 1.5, def: 1, fmt: pct });
     this.port('out', 'OUT', 'audio', 'out', 0, 0);
     // Mute ('mu') and solo ('so') per channel: click / shift+click the channel number.
@@ -2023,62 +2023,110 @@ export class Speaker extends Mod {
 // frequency, so the timbre stays the same up and down the keyboard.
 const FM_DEPTH = 4;
 
-// 2^x for x in -1..1, read through a WaveShaper: pitch CV / 8 in, frequency ratio out.
-const EXP_RANGE = 8;
-const expCurve = (() => {
-  const n = 4097, c = new Float32Array(n);
-  for (let i = 0; i < n; i++) c[i] = 2 ** (((i / (n - 1)) * 2 - 1) * EXP_RANGE);
-  return c;
-})();
+// The oscillator core runs in a worklet so all its waves share one phase: SAW, SQR (with
+// pulse width) and SUB (a square an octave down) are band-limited with polyBLEP; TRI and
+// SIN are clean as they are. SYNC restarts the phase on each rising edge (hard sync).
+const OSC_PROCESSOR = `
+function blep(t, dt) {
+  if (t < dt) { t /= dt; return t + t - t * t - 1; }
+  if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; }
+  return 0;
+}
+class Osc extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [
+      { name: 'freq', defaultValue: 130.81, automationRate: 'k-rate' },
+      { name: 'pw', defaultValue: 0.5, automationRate: 'k-rate' },
+      { name: 'fm', defaultValue: ${FM_DEPTH}, automationRate: 'k-rate' },
+    ];
+  }
+  constructor() { super(); this.ph = 0; this.sub = 0; this.last = 0; }
+  process(inputs, outputs, params) {
+    const o = outputs[0];
+    if (!o || o.length < 5) return true;
+    const pit = inputs[0][0], fm = inputs[1][0], pwm = inputs[2][0], sync = inputs[3][0];
+    const f0 = params.freq[0], pw0 = params.pw[0], fmd = params.fm[0], L = 0.3;
+    for (let s = 0; s < o[0].length; s++) {
+      let f = pit ? f0 * Math.exp(pit[s] * Math.LN2) : f0;
+      if (fm) f *= 1 + fmd * fm[s];
+      if (sync) {
+        const x = sync[s];
+        if (x > 0 && this.last <= 0) { this.ph = 0; this.sub = 0; }
+        this.last = x;
+      }
+      const dt = Math.min(0.5, Math.abs(f) / sampleRate), ph = this.ph, sub = this.sub;
+      const pw = Math.min(0.98, Math.max(0.02, pw0 + (pwm ? pwm[s] * 0.45 : 0)));
+      o[0][s] = L * (2 * ph - 1 - blep(ph, dt));
+      o[1][s] = L * ((ph < pw ? 1 : -1) + blep(ph, dt) - blep((ph - pw + 1) % 1, dt));
+      o[2][s] = L * (1 - 4 * Math.abs(((ph + 0.25) % 1) - 0.5));
+      o[3][s] = L * Math.sin(2 * Math.PI * ph);
+      o[4][s] = L * ((sub < 0.5 ? 1 : -1) + blep(sub, dt / 2) - blep((sub + 0.5) % 1, dt / 2));
+      const step = f / sampleRate;
+      this.ph = ph + step - Math.floor(ph + step);
+      this.sub = sub + step / 2 - Math.floor(sub + step / 2);
+    }
+    return true;
+  }
+}
+registerProcessor('osc', Osc);
+`;
+
+// Basic: all four waves out at once, like a real VCO. Advanced: pulse width (PW, with
+// a PWM jack), FM depth, hard SYNC and a SUB output an octave down.
+const OSC_OUTS = ['saw', 'sqr', 'tri', 'sin', 'sub'];
 
 export class Osc extends Mod {
-  o = ac.createOscillator();
-  out = ac.createGain();
   pitch = ac.createGain();
-  cents = ac.createGain();
   fm = ac.createGain();
-  // FM depth follows the pitch CV, so the timbre stays the same up and down the keyboard.
-  private fmDepth = ac.createGain();
+  pwm = ac.createGain();
+  sync = ac.createGain();
+  outs = OSC_OUTS.map(() => ac.createGain());
+  private node: AudioWorkletNode | null = null;
 
   constructor(e: Engine) {
     super(e, 'osc', 'OSC', 'synth', 64, 52);
-    this.o.connect(this.out);
-    this.out.gain.value = 0.3;
-    // A CV of 1 raises the pitch by one octave, like 1V/oct.
-    this.cents.gain.value = 1200;
-    this.pitch.connect(this.cents).connect(this.o.detune);
-    const pre = ac.createGain(), exp = ac.createWaveShaper();
-    pre.gain.value = 1 / EXP_RANGE;
-    exp.curve = expCurve;
-    this.pitch.connect(pre).connect(exp).connect(this.fmDepth).connect(this.fm.gain);
-    // Without a pitch CV the WaveShaper still outputs 2^0 = 1.
-    this.fm.gain.value = 0;
-    this.fm.connect(this.o.frequency);
-    this.o.start();
-    this.knobRow([
-      { id: 'wave', label: 'WAV', min: 0, max: 3, def: 0, names: ['SAW', 'SQR', 'TRI', 'SIN'] },
-      { id: 'oct', label: 'OCT', min: -2, max: 2, def: 0, step: 1, fmt: (v) => (v > 0 ? '+' : '') + v },
-      { id: 'fine', label: 'FIN', min: -1, max: 1, def: 0, fmt: (v) => (v > 0 ? '+' : '') + Math.round(v * 100) + 'CT' },
-    ], 13);
-    this.port('cv', 'PIT', 'cv', 'in', 5, 32);
-    this.port('fm', 'FM', 'cv', 'in', 20, 32);
-    this.port('out', 'OUT', 'audio', 'out', 51, 32);
+    this.knob({ id: 'oct', label: 'OCT', x: 4, y: 13, min: -2, max: 2, def: 0, step: 1, fmt: (v) => (v > 0 ? '+' : '') + v });
+    this.knob({ id: 'fine', label: 'FIN', x: 19, y: 13, min: -1, max: 1, def: 0, fmt: (v) => (v > 0 ? '+' : '') + Math.round(v * 100) + 'CT' });
+    this.port('cv', 'PIT', 'cv', 'in', 35, 13);
+    this.port('fm', 'FM', 'cv', 'in', 50, 13);
+    ['SAW', 'SQR', 'TRI', 'SIN'].forEach((l, i) => this.port(OSC_OUTS[i], l, 'audio', 'out', 5 + i * 15, 32));
+    this.advanced('ADVANCED', 79, 70);
+    this.advOnly(() => {
+      this.knob({ id: 'pw', label: 'PW', x: 4, y: 51, min: 0.05, max: 0.95, def: 0.5, fmt: pct });
+      this.port('pwm', 'PWM', 'cv', 'in', 20, 51);
+      this.knob({ id: 'fma', label: 'FMA', x: 34, y: 51, min: 0, max: 2, def: 1, fmt: pct });
+      this.port('sync', 'SYN', 'audio', 'in', 50, 51);
+      this.port('sub', 'SUB', 'audio', 'out', 65, 51);
+    });
+    void worklet(OSC_PROCESSOR).then(() => {
+      const node = new AudioWorkletNode(ac, 'osc', { numberOfInputs: 4, outputChannelCount: [5] });
+      [this.pitch, this.fm, this.pwm, this.sync].forEach((g, i) => g.connect(node, 0, i));
+      const split = ac.createChannelSplitter(5);
+      node.connect(split);
+      this.outs.forEach((o, i) => split.connect(o, i));
+      this.node = node;
+      for (const id of ['oct', 'pw', 'fma']) this.onParam(id);
+    });
   }
 
-  onParam(id: string, v: number) {
-    const t = ac.currentTime;
-    if (id === 'wave') this.o.type = WAVES[v];
-    if (id === 'fine') this.o.detune.setTargetAtTime(v * 100, t, 0.01);
-    if (id === 'oct') {
-      const f = 440 * 2 ** ((PITCH_REF - 69) / 12 + v);
-      this.o.frequency.setValueAtTime(f, t);
-      this.fmDepth.gain.setValueAtTime(f * FM_DEPTH, t);
+  protected layout() { for (const id of ['pw', 'fma']) this.onParam(id); }
+
+  onParam(id: string) {
+    const t = ac.currentTime, prm = (n: string) => this.node?.parameters.get(n);
+    if (id === 'oct' || id === 'fine') {
+      prm('freq')?.setValueAtTime(440 * 2 ** ((PITCH_REF - 69) / 12 + this.p.oct + (this.p.fine ?? 0) / 12), t);
     }
+    // The basic layout plays a square wave and the standard FM depth.
+    if (id === 'pw') prm('pw')?.setValueAtTime(this.isAdv ? this.p.pw : 0.5, t);
+    if (id === 'fma') prm('fm')?.setValueAtTime(FM_DEPTH * (this.isAdv ? this.p.fma : 1), t);
   }
 
-  audioIn(port: string) { return port === 'fm' ? this.fm : this.pitch; }
-  audioOut() { return this.out; }
-  destroy() { this.o.stop(); }
+  audioIn(port: string) {
+    return port === 'fm' ? this.fm : port === 'pwm' ? this.pwm : port === 'sync' ? this.sync : this.pitch;
+  }
+
+  audioOut(port: string) { return this.outs[OSC_OUTS.indexOf(port)] ?? null; }
+  destroy() { this.node?.disconnect(); }
 }
 
 // Slew limiter: smooths a CV, for portamento on pitch or softening stepped modulation.
@@ -2130,6 +2178,254 @@ export class Slew extends Mod {
 
   audioIn() { return this.in; }
   audioOut() { return this.out; }
+  destroy() { this.node?.disconnect(); }
+}
+
+// ---------------------------------------------------------------- MATHS
+
+// After Make Noise MATHS: two function generators (channels 1 and 4) around two
+// attenuverted inputs (2 and 3), all summed onto SUM, INV and OR buses.
+// A function generator rises to its input, or to 1 on a trigger, at the RISE rate and
+// falls at the FALL rate, shaped by SHP (log, lin, exp). CYCLE makes it start over
+// at the bottom: an LFO. Its outputs are the plain function (UNI), the function
+// through its attenuverter (OUT, onto the buses), and a gate: EOR on channel 1 (high
+// from the end of the rise to the end of the fall), EOC on 4 (high from the end of the
+// fall until the next rise, so also at rest). An OUT with a cable in it leaves the
+// buses, as on MATHS.
+const MATHS_PROCESSOR = `
+const secs = (k) => 0.001 * 20000 ** Math.min(1, Math.max(0, k));
+function shape(v, s) {
+  if (v <= 0 || v >= 1 || Math.abs(s - 0.5) < 0.01) return v;
+  const k = 1 + Math.abs(s - 0.5) * 6;
+  return s > 0.5 ? v ** k : 1 - (1 - v) ** k;
+}
+class Maths extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return ['rise1', 'fall1', 'both1', 'rise4', 'fall4', 'both4']
+      .map((name) => ({ name, defaultValue: 0, automationRate: 'k-rate' }));
+  }
+  constructor() {
+    super();
+    // Knob values, the cycle buttons, ins 2 and 3 patched, OUTs patched (off the buses).
+    this.k = { rise: [0.4, 0.4], fall: [0.5, 0.5], shp: [0.5, 0.5], cyc: [0, 0], att: [1, 0, 0, 1] };
+    this.patched = [false, false];
+    this.offBus = [false, false, false, false];
+    this.fn = [0, 1].map(() => ({ v: 0, env: '', cyc: false, rising: false, falling: false, eor: false, eoc: true }));
+    this.events = [];
+    this.out = [];
+    this.lvl = 0;
+    this.port.onmessage = (e) => {
+      const d = e.data;
+      if (d.ev) { this.events.push(d.ev); this.events.sort((a, b) => a.t - b.t); }
+      else if (d.stop) { this.events = []; for (const f of this.fn) f.cyc = false; }
+      else Object.assign(this, d);
+    };
+  }
+  // A gate change on 'eor' (channel 1) or 'eoc' (channel 4).
+  gate(f, j, kind, on, t) {
+    if (f[kind] === on) return;
+    f[kind] = on;
+    if ((j === 0) === (kind === 'eor')) this.out.push({ kind, on, t });
+  }
+  process(inputs, outputs, params) {
+    const o = outputs[0];
+    if (!o || o.length < 9) return true;
+    const n = o[0].length, sr = sampleRate;
+    const sig = [inputs[0][0], inputs[3][0]], ins = [inputs[1][0], inputs[2][0]];
+    const rate = [0, 1].map((j) => {
+      const c = j ? '4' : '1', both = params['both' + c][0] / 2;
+      return [1 / (secs(this.k.rise[j] + params['rise' + c][0] / 2 - both) * sr),
+              1 / (secs(this.k.fall[j] + params['fall' + c][0] / 2 - both) * sr)];
+    });
+    for (let s = 0; s < n; s++) {
+      const t = currentTime + s / sr;
+      while (this.events.length && this.events[0].t <= t) {
+        const e = this.events.shift(), f = this.fn[e.j];
+        // A trigger restarts the function unless it is already rising, as on MATHS.
+        if (e.k === 'trig' && f.env !== 'rise') f.env = 'rise';
+        if (e.k === 'cyc') f.cyc = e.on;
+      }
+      const vals = [0, 0, 0, 0];
+      for (let j = 0; j < 2; j++) {
+        const f = this.fn[j], x = sig[j] ? sig[j][s] : 0, [up, dn] = rate[j], was = f.v;
+        if (f.env === 'rise') { f.v += up; if (f.v >= 1) { f.v = Math.max(1, x); f.env = 'fall'; } }
+        else if (f.env === 'fall') { f.v -= dn; if (f.v <= x) { f.v = x; f.env = ''; } }
+        else f.v = x > f.v ? Math.min(x, f.v + up) : Math.max(x, f.v - dn);
+        if (!f.env && (this.k.cyc[j] || f.cyc) && f.v <= x + 1e-6) f.env = 'rise';
+        const rising = f.env === 'rise' || f.v > was + 1e-9;
+        const falling = !rising && (f.env === 'fall' || f.v < was - 1e-9);
+        if (rising && !f.rising) { this.gate(f, j, 'eor', false, t); this.gate(f, j, 'eoc', false, t); }
+        if (!rising && f.rising) this.gate(f, j, 'eor', true, t);
+        if (!rising && !falling && f.falling) { this.gate(f, j, 'eor', false, t); this.gate(f, j, 'eoc', true, t); }
+        f.rising = rising; f.falling = falling;
+        const u = shape(f.v, this.k.shp[j]);
+        o[j][s] = u;
+        vals[j ? 3 : 0] = u * this.k.att[j ? 3 : 0];
+      }
+      for (let j = 0; j < 2; j++) {
+        const x = this.patched[j] ? (ins[j] ? ins[j][s] : 0) : (j ? 0.5 : 1);
+        vals[j + 1] = x * this.k.att[j + 1];
+      }
+      let sum = 0, or = 0;
+      for (let c = 0; c < 4; c++) {
+        o[2 + c][s] = vals[c];
+        if (!this.offBus[c]) { sum += vals[c]; or = Math.max(or, vals[c]); }
+      }
+      o[6][s] = sum; o[7][s] = -sum; o[8][s] = or;
+    }
+    // Gate changes, and now and then the levels for the LEDs.
+    this.lvl += n;
+    const lv = this.lvl >= 1024 ? [o[0][n - 1], o[1][n - 1], o[6][n - 1]] : null;
+    if (lv) this.lvl = 0;
+    if (this.out.length || lv) { this.port.postMessage({ gates: this.out, lv }); this.out = []; }
+    return true;
+  }
+}
+registerProcessor('maths', Maths);
+`;
+
+const mathsSec = (k: number) => 0.001 * 20000 ** k;
+const secFmt = (v: number) => {
+  const s = mathsSec(v);
+  return s < 1 ? Math.round(s * 1000) + 'MS' : s.toFixed(s < 10 ? 1 : 0) + 'S';
+};
+const shpFmt = (v: number) => (v < 0.45 ? 'LOG' : v > 0.55 ? 'EXP' : 'LIN');
+const attFmt = (v: number) => (v > 0 ? '+' : '') + Math.round(v * 100) + '%';
+// The worklet's output channels, in order.
+const MATHS_OUTS = ['uni1', 'uni4', 'out1', 'out2', 'out3', 'out4', 'sum', 'inv', 'or'];
+// Where the CYCLE buttons are, per function channel.
+const MATHS_CYC = [{ x: 4, y: 72 }, { x: 128, y: 72 }];
+
+export class Maths extends Mod {
+  sigs = [ac.createGain(), ac.createGain()];
+  ins = [ac.createGain(), ac.createGain()];
+  // CV for RISE, FALL and BOTH, per function channel; connected to the worklet's params.
+  cvs: Record<string, GainNode> = {};
+  outs = MATHS_OUTS.map(() => ac.createGain());
+  private node: AudioWorkletNode | null = null;
+  private lv = [0, 0, 0];
+  // When each gate output last went high, so a gate that drops at once still shows.
+  private high: Record<string, number> = {};
+
+  constructor(e: Engine) {
+    super(e, 'maths', 'MATHS', 'pro', 160, 110);
+    for (const [j, c] of ['1', '4'].entries()) {
+      const left = j === 0, x = left ? [4, 19, 34] : [115, 130, 145];
+      this.knob({ id: 'rise' + c, label: 'RIS', x: x[0] - 1, y: 13, min: 0, max: 1, def: 0.4, fmt: secFmt });
+      this.knob({ id: 'fall' + c, label: 'FAL', x: x[1] - 1, y: 13, min: 0, max: 1, def: 0.5, fmt: secFmt });
+      this.knob({ id: 'shp' + c, label: 'SHP', x: x[2] - 1, y: 13, min: 0, max: 1, def: 0.5, fmt: shpFmt });
+      this.port('sig' + c, 'SIG', 'cv', 'in', x[0], 32);
+      this.port('trg' + c, 'TRG', 'trig', 'in', x[1], 32);
+      this.port('cyc' + c, 'CYC', 'trig', 'in', x[2], 32);
+      for (const [k, id] of ['rise', 'fall', 'both'].entries()) {
+        this.cvs[id + c] = ac.createGain();
+        this.port('c' + id + c, ['RIS', 'FAL', 'BTH'][k], 'cv', 'in', x[k], 51);
+      }
+      this.port(left ? 'eor' : 'eoc', left ? 'EOR' : 'EOC', 'trig', 'out', left ? x[2] : x[0], 70);
+      // Bottom row, mirrored: ATT UNI OUT on the left, OUT UNI ATT on the right.
+      this.knob({ id: 'att' + c, label: 'ATT', x: (left ? x[0] : x[2]) - 1, y: 89, min: -1, max: 1, def: 1, fmt: attFmt });
+      this.port('uni' + c, 'UNI', 'cv', 'out', x[1], 89);
+      this.port('out' + c, c, 'cv', 'out', left ? x[2] : x[0], 89);
+      this.p['cy' + c] = 0;
+    }
+    for (const [j, c] of ['2', '3'].entries()) {
+      const x = 62 + j * 28;
+      this.port('in' + c, c, 'cv', 'in', x, 13);
+      this.knob({ id: 'att' + c, label: 'ATT', x: x - 1, y: 30, min: -1, max: 1, def: 0, fmt: attFmt });
+      this.port('out' + c, 'OUT', 'cv', 'out', x, 47);
+    }
+    this.port('sum', 'SUM', 'cv', 'out', 57, 89);
+    this.port('inv', 'INV', 'cv', 'out', 76, 89);
+    this.port('or', 'OR', 'cv', 'out', 95, 89);
+    void worklet(MATHS_PROCESSOR).then(() => {
+      const node = new AudioWorkletNode(ac, 'maths', { numberOfInputs: 4, outputChannelCount: [9] });
+      [this.sigs[0], this.ins[0], this.ins[1], this.sigs[1]].forEach((g, i) => g.connect(node, 0, i));
+      for (const [id, g] of Object.entries(this.cvs)) g.connect(node.parameters.get(id)!);
+      const split = ac.createChannelSplitter(9);
+      node.connect(split);
+      this.outs.forEach((o, i) => split.connect(o, i));
+      node.port.onmessage = (e) => this.fromWorklet(e.data);
+      this.node = node;
+      this.send();
+      this.onCables();
+    });
+  }
+
+  private fromWorklet(d: { gates: { kind: string; on: boolean; t: number }[]; lv: number[] | null }) {
+    if (d.lv) this.lv = d.lv;
+    for (const gt of d.gates) {
+      // The gate's time has just passed; play it now, and keep a high at least 5 ms.
+      let t = Math.max(gt.t, ac.currentTime);
+      if (gt.on) this.high[gt.kind] = t;
+      else t = Math.max(t, (this.high[gt.kind] ?? 0) + 0.005);
+      this.emit(gt.kind, gt.on ? { t, dur: 0, hold: true } : { t, dur: 0, off: true });
+    }
+  }
+
+  private send() {
+    const p = this.p, both = (id: string) => [p[id + '1'], p[id + '4']];
+    this.node?.port.postMessage({
+      k: { rise: both('rise'), fall: both('fall'), shp: both('shp'), cyc: both('cy'), att: [p.att1, p.att2, p.att3, p.att4] },
+    });
+  }
+
+  onParam() { this.send(); }
+
+  onCables() {
+    const has = (port: string) => this.eng.cablesAt(this, port).length > 0;
+    this.node?.port.postMessage({
+      patched: [has('in2'), has('in3')],
+      offBus: ['out1', 'out2', 'out3', 'out4'].map(has),
+    });
+  }
+
+  onEvent(port: string, ev: Ev) {
+    const j = port.endsWith('4') ? 1 : 0, post = (e: object) => this.node?.port.postMessage({ ev: { j, ...e } });
+    if (port.startsWith('trg')) { if (!ev.off) post({ k: 'trig', t: ev.t }); return; }
+    if (ev.off) { post({ k: 'cyc', on: false, t: ev.t }); return; }
+    post({ k: 'cyc', on: true, t: ev.t });
+    if (!ev.hold) post({ k: 'cyc', on: false, t: ev.t + ev.dur });
+  }
+
+  reset(t0: number) { if (!t0) this.node?.port.postMessage({ stop: true }); }
+
+  press(lx: number, ly: number): Drag | null {
+    for (const [j, b] of MATHS_CYC.entries()) {
+      if (lx >= b.x && lx < b.x + 27 && ly >= b.y && ly < b.y + 9) {
+        const id = j ? 'cy4' : 'cy1';
+        this.set(id, this.p[id] ? 0 : 1);
+        return noDrag;
+      }
+    }
+    return null;
+  }
+
+  drawBody(g: Gfx) {
+    // Channel blocks: 1 on the left, 2 and 3 in the middle, 4 on the right.
+    g.rect(52, 12, 1, 94, C.ink);
+    g.rect(110, 12, 1, 94, C.ink);
+    for (const [j, b] of MATHS_CYC.entries()) {
+      const on = this.p[j ? 'cy4' : 'cy1'] === 1;
+      drawButton(g, b.x, b.y, 27, 'CYCLE', on ? C.lime : C.slate, on ? C.ink : C.silver);
+    }
+    // Levels of channel 1, channel 4 and SUM.
+    const bar = (y: number, label: string, v: number, col: string) => {
+      g.text(label, 56, y, C.silver);
+      g.rect(68, y, 38, 5, C.black);
+      g.rect(68, y, Math.round(Math.min(1, Math.abs(v)) * 38), 5, v < 0 ? C.red : col);
+    };
+    bar(67, '1', this.lv[0], C.lime);
+    bar(73, '4', this.lv[1], C.lime);
+    bar(79, 'S', this.lv[2], C.yellow);
+  }
+
+  audioIn(port: string) {
+    if (port.startsWith('sig')) return this.sigs[port === 'sig4' ? 1 : 0];
+    if (port.startsWith('in')) return this.ins[port === 'in3' ? 1 : 0];
+    return this.cvs[port.slice(1)] ?? null;
+  }
+
+  audioOut(port: string) { return this.outs[MATHS_OUTS.indexOf(port)] ?? null; }
   destroy() { this.node?.disconnect(); }
 }
 
@@ -2298,29 +2594,143 @@ export class Envelope extends Mod {
   destroy() { this.src.stop(); }
 }
 
+// VCA response: RSP 0 is linear, 1 exponential (quiet longer, then a steep rise, like
+// a VCA in dB). The CV is halved going into the WaveShaper so -2..2 fits; above 1 it
+// continues linearly so an accented envelope (1.3) is not clipped.
+function vcaCurve(rsp: number) {
+  const n = 257, curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * 4 - 2, u = Math.abs(x);
+    const e = u <= 1 ? (64 ** u - 1) / 63 : u;
+    curve[i] = Math.sign(x) * ((1 - rsp) * u + rsp * e);
+  }
+  return curve;
+}
+
+const VCA_CH = 4;
+// Jacks and knobs of channel c: channel 1 keeps the basic layout's ids.
+const vcaId = (id: string, c: number) => (c ? id + c : id);
+// The QUAD layout's columns, with room between them for the normal arrows.
+const vcaX = (c: number) => 22 + c * 17;
+
+// Basic: one VCA. Advanced (QUAD), after quad VCAs like Intellijel's and Mutable's Veils:
+// four channels, each with IN, CV, LVL (gain with no CV) and a bipolar CV amount, and
+// a shared lin/exp response. Like on those, jacks are normalled down the row: an
+// unpatched CV jack gets the CV of the channel before it, and an unpatched OUT adds its
+// channel into the next one, so the last OUT is the mix of all four. SUM always mixes all four.
 export class Vca extends Mod {
-  g = ac.createGain();
-  cv = ac.createGain();
+  ins = Array.from({ length: VCA_CH }, () => ac.createGain());
+  vcas = this.ins.map((g) => g.connect(ac.createGain()) as GainNode);
+  buses = this.vcas.map((v) => v.connect(ac.createGain()) as GainNode);
+  cvs = this.ins.map(() => ac.createGain());
+  cvBuses = this.cvs.map((cv) => cv.connect(ac.createGain()) as GainNode);
+  shapers = this.cvBuses.map(() => ac.createWaveShaper());
+  amts = this.ins.map(() => ac.createGain());
+  // Normals from channel c-1 into channel c: its OUT into the mix, its CV into this CV.
+  outNorm = this.ins.map(() => ac.createGain());
+  cvNorm = this.ins.map(() => ac.createGain());
+  // SUM: all four channels, whatever is patched into the OUTs.
+  sum = ac.createGain();
 
   constructor(e: Engine) {
     super(e, 'vca', 'VCA', 'mod', 50, 52);
-    this.cv.connect(this.g.gain);
+    this.advanced('QUAD', 110, 96);
+    for (let c = 0; c < VCA_CH; c++) {
+      const half = ac.createGain();
+      half.gain.value = 0.5;
+      this.vcas[c].gain.value = 0;
+      this.vcas[c].connect(this.sum);
+      this.cvBuses[c].connect(half).connect(this.shapers[c]).connect(this.amts[c]).connect(this.vcas[c].gain);
+      if (c) {
+        this.buses[c - 1].connect(this.outNorm[c]).connect(this.buses[c]);
+        this.cvBuses[c - 1].connect(this.cvNorm[c]).connect(this.cvBuses[c]);
+      }
+    }
     this.knobRow([
       { id: 'base', label: 'LVL', min: 0, max: 1, def: 0, fmt: pct },
-      { id: 'amt', label: 'CV', min: 0, max: 1, def: 1, fmt: pct },
+      { id: 'amt', label: 'CV', min: -1, max: 1, def: 1, fmt: pct },
     ], 13);
     io(this, 'audio');
     this.port('cv', 'CV', 'cv', 'in', 20, 32);
+    this.advOnly(() => {
+      for (let c = 1; c < VCA_CH; c++) {
+        this.port('in' + c, String(c + 1), 'audio', 'in', 0, 13);
+        this.port('cv' + c, '', 'cv', 'in', 0, 32);
+        this.knob({ id: 'base' + c, label: '', name: 'LVL', x: 0, y: 47, min: 0, max: 1, def: 0, fmt: pct });
+        this.knob({ id: 'amt' + c, label: '', name: 'CV', x: 0, y: 62, min: -1, max: 1, def: 1, fmt: pct });
+        this.port('out' + c, '', 'audio', 'out', 0, 77);
+      }
+      this.port('sum', 'SUM', 'audio', 'out', 95, 77);
+      this.knob({ id: 'rsp', label: 'RSP', x: 94, y: 13, min: 0, max: 1, def: 0, fmt: (v) => (v < 0.02 ? 'LIN' : v > 0.98 ? 'EXP' : pct(v)) });
+    });
+    this.layout(false);
+  }
+
+  // Basic: channel 1's jacks and knobs where they always were. QUAD: a column per
+  // channel with row labels on the left; channel 1's jacks lose their names.
+  protected layout(adv: boolean) {
+    const at = (o: { x: number; y: number }, x: number, y: number) => Object.assign(o, { x, y });
+    for (let c = 0; c < VCA_CH; c++) {
+      const x = vcaX(c);
+      if (c && !adv) continue;
+      at(this.portById(vcaId('in', c)), adv ? x + 1 : 4, adv ? 13 : 32);
+      at(this.portById(vcaId('cv', c)), adv ? x + 1 : 20, 32);
+      at(this.knobById(vcaId('base', c)), adv ? x : 12, adv ? 47 : 13);
+      at(this.knobById(vcaId('amt', c)), adv ? x : 27, adv ? 62 : 13);
+      at(this.portById(vcaId('out', c)), adv ? x + 1 : 37, adv ? 77 : 32);
+    }
+    Object.assign(this.portById('in'), { label: adv ? '1' : 'IN' });
+    Object.assign(this.portById('cv'), { label: adv ? '' : 'CV' });
+    Object.assign(this.portById('out'), { label: adv ? '' : 'OUT' });
+    Object.assign(this.knobById('base'), { label: adv ? '' : 'LVL', name: 'LVL' });
+    Object.assign(this.knobById('amt'), { label: adv ? '' : 'CV', name: 'CV' });
+    // The basic layout is always linear.
+    this.onParam('rsp', this.p.rsp ?? 0);
+    this.onCables();
+  }
+
+  onCables() {
+    const t = ac.currentTime;
+    for (let c = 1; c < VCA_CH; c++) {
+      const free = (id: string) => (this.eng.cablesAt(this, vcaId(id, c - 1)).length ? 0 : 1);
+      this.outNorm[c].gain.setTargetAtTime(free('out'), t, 0.005);
+      // The CV normal looks at this channel's own jack.
+      this.cvNorm[c].gain.setTargetAtTime(this.eng.cablesAt(this, 'cv' + c).length ? 0 : 1, t, 0.005);
+    }
   }
 
   onParam(id: string, v: number) {
-    const t = ac.currentTime;
-    if (id === 'base') this.g.gain.setTargetAtTime(v, t, 0.01);
-    if (id === 'amt') this.cv.gain.setTargetAtTime(v, t, 0.01);
+    const t = ac.currentTime, c = Number(id.replace(/\D/g, '')) || 0;
+    if (id.startsWith('base')) this.vcas[c].gain.setTargetAtTime(v, t, 0.01);
+    if (id.startsWith('amt')) this.amts[c].gain.setTargetAtTime(v, t, 0.01);
+    if (id === 'rsp') {
+      const curve = vcaCurve(this.isAdv ? v : 0);
+      for (const sh of this.shapers) sh.curve = curve;
+    }
   }
 
-  audioIn(port: string) { return port === 'cv' ? this.cv : this.g; }
-  audioOut() { return this.g; }
+  audioIn(port: string) {
+    const c = Number(port.replace(/\D/g, '')) || 0;
+    return port.startsWith('cv') ? this.cvs[c] : this.ins[c];
+  }
+
+  audioOut(port: string) { return port === 'sum' ? this.sum : this.buses[Number(port.replace(/\D/g, '')) || 0]; }
+
+  drawBody(g: Gfx) {
+    if (!this.isAdv) return;
+    g.text('IN', 3, 17, C.silver);
+    g.text('CV', 3, 35, C.silver);
+    g.text('LVL', 3, 50, C.silver);
+    g.text('CV', 3, 65, C.silver);
+    g.text('OUT', 3, 80, C.silver);
+    // Arrows where a normal is active: CV flows right into an empty CV jack, and an
+    // unpatched OUT flows right into the next channel's mix.
+    for (let c = 1; c < VCA_CH; c++) {
+      const x = vcaX(c) - 3;
+      if (!this.eng.cablesAt(this, 'cv' + c).length) g.text('>', x, 35, C.green);
+      if (!this.eng.cablesAt(this, vcaId('out', c - 1)).length) g.text('>', x, 80, C.red);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- RHYTHM TOOLS
@@ -3416,7 +3826,7 @@ export const KINDS: Kind[] = [
   { type: 'noise', label: 'NOISE', cat: 'synth', make: (e) => new Noise(e) },
   { type: 'lfo', label: 'LFO', cat: 'mod', make: (e) => new Lfo(e) },
   { type: 'env', label: 'ENV', cat: 'mod', make: (e) => new Envelope(e) },
-  { type: 'vca', label: 'VCA', cat: 'mod', make: (e) => new Vca(e) },
+    { type: 'vca', label: 'VCA', cat: 'mod', make: (e) => new Vca(e) },
   { type: 'snh', label: 'S&H', cat: 'mod', make: (e) => new SampleHold(e) },
   { type: 'atten', label: 'ATTEN', cat: 'mod', make: (e) => new Atten(e) },
   { type: 'quant', label: 'QUANT', cat: 'mod', make: (e) => new Quant(e) },
@@ -3435,4 +3845,5 @@ export const KINDS: Kind[] = [
   { type: 'scope', label: 'SCOPE', cat: 'util', make: (e) => new Scope(e) },
   { type: 'recorder', label: 'RECORDER', cat: 'util', make: (e) => new RecorderMod(e) },
   { type: 'speaker', label: 'SPEAKER', cat: 'util', make: (e) => new Speaker(e) },
+  { type: 'maths', label: 'MATHS', cat: 'pro', make: (e) => new Maths(e) },
 ];

@@ -42,7 +42,7 @@ let helpMode = false;
 
 function toggleHelp() {
   helpMode = !helpMode;
-  if (helpMode) showToast('HELP MODE - HOVER ANYTHING - ? OR ESC TO LEAVE');
+  if (helpMode) showToast('HELP MODE - HOVER ANYTHING - ?, ESC OR RIGHT-CLICK TO LEAVE');
 }
 
 function showToast(text: string) {
@@ -113,7 +113,7 @@ function layoutBar() {
     { label: 'WIRES', col: [C.silver, C.slate, C.dark][wires], text: wires === 2 ? C.silver : C.ink, hi: C.white, act: cycleWires },
     { label: 'SHARE', col: C.silver, text: C.ink, hi: C.white, act: () => void share() },
     { label: 'CLEAR', col: C.silver, text: C.ink, hi: C.white, act: () => eng.clear() },
-    { label: 'HELP', col: helpMode ? C.yellow : C.silver, text: C.ink, hi: C.white, act: toggleHelp },
+    { label: '?', col: helpMode ? C.yellow : C.silver, text: C.ink, hi: C.white, act: toggleHelp },
   ];
   bar = [];
   let x = 2, y = 2;
@@ -123,7 +123,7 @@ function layoutBar() {
     bar.push({ ...it, x, y, w });
     x += w + 2;
     // Small gaps separate transport, patches, modules and the rest.
-    if (it.act === togglePlay || it.label === 'PATCHES' || it.label === CAT.util.name || it.label === 'CLEAR') x += 6;
+    if (it.act === togglePlay || it.label === 'PATCHES' || it.label === CAT[cats[cats.length - 1]].name || it.label === 'CLEAR') x += 6;
   }
   barH = y + 12;
 }
@@ -362,6 +362,8 @@ canvas.addEventListener('pointerdown', (e) => {
   void ac.resume();
   if (e.button === 1) { mode = { k: 'pan', sx: mx, sy: my, cx: camX, cy: camY }; return; }
   if (namePrompt) { namePrompt = null; return; }
+  // In help mode a right-click just leaves it.
+  if (helpMode && e.button === 2) { helpMode = false; return; }
   const h = hitTest();
 
   if (h.k === 'menu' && (h.item.header || (e.button === 2 && h.item.del))) {
@@ -976,7 +978,7 @@ const TIPS = [
   'CTRL+D DUPLICATE - CTRL+C / CTRL+V COPY AND PASTE - CTRL+Z UNDO - CTRL+S SAVE',
   'ALT+CLICK A KNOB, THEN MOVE A MIDI CONTROL TO MAP IT - ALT+CLICK AGAIN TO UNMAP',
   'THE + IN A MODULE TITLE OPENS ITS ADVANCED LAYOUT - MIXER GOES BIG',
-  'PRESS ? (OR THE HELP BUTTON) AND HOVER ANYTHING TO SEE WHAT IT DOES',
+  'PRESS ? (OR THE ? BUTTON) AND HOVER ANYTHING TO SEE WHAT IT DOES',
 ];
 
 // ---------------------------------------------------------------- help panel
@@ -1139,7 +1141,7 @@ function frame() {
     ui.text(toast.text, x + 5, barH + 8, C.ink);
   }
   if (!everPlayed && blink && !openMenu && !popup) ui.textC('PRESS SPACE TO PLAY', Math.floor(UW / 2), UH - 16, C.yellow);
-  ui.text(helpMode ? 'HELP MODE - HOVER ANYTHING - ? OR ESC TO LEAVE' : TIPS[Math.floor(t / 7000) % TIPS.length], 3, UH - 7, helpMode ? C.yellow : C.slate);
+  ui.text(helpMode ? 'HELP MODE - HOVER ANYTHING - ?, ESC OR RIGHT-CLICK TO LEAVE' : TIPS[Math.floor(t / 7000) % TIPS.length], 3, UH - 7, helpMode ? C.yellow : C.slate);
   // Hovering a module in a menu describes it, next to the menu.
   const am = activeMenu(), item = menuItemAt(ux, uy);
   if (am && item) {

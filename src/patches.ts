@@ -70,7 +70,7 @@ function voice() {
   const b = new Builder();
   const clock = b.add('clock', 10, 30, { bpm: 110 });
   const melody = b.melody(82, 30, 'ARP', { oct: 3, gate: 0.6 });
-  const osc = b.add('osc', 256, 30, { wave: 0 });
+  const osc = b.add('osc', 256, 30);
   const filter = b.add('filter', 330, 30, { cut: 0.3, res: 8 });
   const vca = b.add('vca', 390, 30);
   const delay = b.add('delay', 450, 30, { time: 0.41, fb: 0.4, mix: 0.3 });
@@ -82,7 +82,7 @@ function voice() {
   b.wire(melody, 'pit', osc, 'cv');
   b.wire(melody, 'gate', env, 'in');
   b.wire(lfo, 'out', osc, 'cv');
-  b.wire(osc, 'out', filter, 'in');
+  b.wire(osc, 'saw', filter, 'in');
   b.wire(env, 'out', filter, 'cv');
   b.wire(filter, 'out', vca, 'in');
   b.wire(env, 'out', vca, 'cv');
@@ -106,9 +106,9 @@ function ambient() {
   const chord = b.add('chord', 256, 30, { type: 7, key: 0 });
   // Glide: the root goes through a SLEW; the upper voices step.
   const slew = b.add('slew', 256, 96, { time: 0.9 });
-  const oscA = b.add('osc', 344, 30, { wave: 0 });
-  const oscB = b.add('osc', 344, 90, { wave: 2, oct: 1 });
-  const oscC = b.add('osc', 344, 150, { wave: 3, oct: 1 });
+  const oscA = b.add('osc', 344, 30);
+  const oscB = b.add('osc', 344, 90, { oct: 1 });
+  const oscC = b.add('osc', 344, 150, { oct: 1 });
   const drift = b.add('lfo', 256, 160, { rate: 0.15, depth: 0.015 });
   const noise = b.add('noise', 344, 210, { tone: 0.5, lvl: 0.1 });
   const mixer = b.add('mixer', 420, 30, { l0: 0.35, l1: 0.35, l2: 0.4, l3: 0.45 });
@@ -136,9 +136,9 @@ function ambient() {
   b.wire(chord, 'o1', oscB, 'cv');
   b.wire(chord, 'o3', oscC, 'cv');
   b.wire(drift, 'out', oscC, 'cv');
-  b.wire(oscA, 'out', mixer, 'i0');
-  b.wire(oscB, 'out', mixer, 'i1');
-  b.wire(oscC, 'out', mixer, 'i2');
+  b.wire(oscA, 'saw', mixer, 'i0');
+  b.wire(oscB, 'tri', mixer, 'i1');
+  b.wire(oscC, 'sin', mixer, 'i2');
   b.wire(noise, 'out', mixer, 'i3');
   b.wire(mixer, 'out', vca, 'in');
   b.wire(env, 'out', vca, 'cv');
@@ -302,25 +302,26 @@ function euclidBossa() {
 function fmPiano() {
   const b = new Builder();
   const keys = b.add('keys', 82, 30, { oct: 4 });
-  const mod = b.add('osc', 256, 30, { wave: 3, oct: 1 });
+  const mod = b.add('osc', 256, 30, { oct: 1 });
   const depth = b.add('vca', 330, 30);
   const atten = b.add('atten', 390, 30, { amt: 2.5 });
-  const carrier = b.add('osc', 450, 30, { wave: 3 });
-  const vca = b.add('vca', 524, 30);
+  // FMA 2: OSC's FM is the same depth for every note; this matches the old sound around C4.
+  const carrier = b.add('osc', 450, 30, { adv: 1, fma: 2 });
+  const vca = b.add('vca', 534, 30);
   const bright = b.add('env', 330, 100, { a: 0, d: 0.7, s: 0.1, r: 0.45 });
-  const amp = b.add('env', 450, 100, { a: 0.05, d: 0.8, s: 0.2, r: 0.6 });
-  const delay = b.add('delay', 584, 30, { time: 0.36, fb: 0.35, mix: 0.25 });
-  const reverb = b.add('reverb', 644, 30, { size: 0.7, mix: 0.35 });
-  const speaker = b.add('speaker', 584, 110);
+  const amp = b.add('env', 450, 104, { a: 0.05, d: 0.8, s: 0.2, r: 0.6 });
+  const delay = b.add('delay', 594, 30, { time: 0.36, fb: 0.35, mix: 0.25 });
+  const reverb = b.add('reverb', 654, 30, { size: 0.7, mix: 0.35 });
+  const speaker = b.add('speaker', 594, 110);
   b.wire(keys, 'pit', mod, 'cv');
   b.wire(keys, 'pit', carrier, 'cv');
   b.wire(keys, 'gate', bright, 'in');
   b.wire(keys, 'gate', amp, 'in');
-  b.wire(mod, 'out', depth, 'in');
+  b.wire(mod, 'sin', depth, 'in');
   b.wire(bright, 'out', depth, 'cv');
   b.wire(depth, 'out', atten, 'in');
   b.wire(atten, 'out', carrier, 'fm');
-  b.wire(carrier, 'out', vca, 'in');
+  b.wire(carrier, 'sin', vca, 'in');
   b.wire(amp, 'out', vca, 'cv');
   b.wire(vca, 'out', delay, 'in');
   b.wire(delay, 'out', reverb, 'in');
@@ -412,7 +413,7 @@ function quantized() {
   const chance = b.add('chance', 82, 96, { prob: 0.7 });
   const kick = b.add('kick', 82, 160, { kit: 3 });
   const quant = b.add('quant', 142, 30, { root: 9, scale: 2 });
-  const osc = b.add('osc', 216, 30, { wave: 1 });
+  const osc = b.add('osc', 216, 30);
   const env = b.add('env', 216, 96, { a: 0, d: 0.45, s: 0.1, r: 0.45 });
   const filter = b.add('filter', 290, 30, { cut: 0.4, res: 6 });
   const synth = b.add('synth', 290, 96, { wave: 0, oct: -1, cut: 0.25, env: 0.5, dec: 0.4 });
@@ -425,7 +426,7 @@ function quantized() {
   b.wire(chance, 'a', env, 'in');
   b.wire(snh, 'out', quant, 'in');
   b.wire(quant, 'out', osc, 'cv');
-  b.wire(osc, 'out', filter, 'in');
+  b.wire(osc, 'sqr', filter, 'in');
   b.wire(env, 'out', filter, 'cv');
   b.wire(filter, 'out', vca, 'in');
   b.wire(env, 'out', vca, 'cv');
@@ -583,6 +584,10 @@ export function migrate(old: PatchData) {
   // BIG MIXER became MIXER with its BIG layout.
   const data = { ...old, mods: old.mods.map((m) => (m.type === 'mixer8' ? { ...m, type: 'mixer', p: { ...m.p, adv: 1 } } : m)) };
   const type = new Map(data.mods.map((m) => [m.id, m.type]));
+  // OSC had one OUT and a WAV knob; now each wave has its own output.
+  const wave = new Map(data.mods.map((m) => [m.id, Math.round(m.p.wave ?? 0)]));
+  data.cables = data.cables.map((c) => (c.ap === 'out' && type.get(c.a) === 'osc'
+    ? { ...c, ap: ['saw', 'sqr', 'tri', 'sin'][wave.get(c.a)!] ?? 'saw' } : c));
   const isNote = (c: PatchData['cables'][number]) => c.ap === 'note' && ['melody', 'keys'].includes(type.get(c.a) ?? '');
   const pitchIn = (c: PatchData['cables'][number]) => {
     const t = type.get(c.b);
@@ -606,6 +611,41 @@ export function migrate(old: PatchData) {
   return { data: { ...data, cables }, dropped: losers.size };
 }
 
+// MATHS on its own makes a bouncing ball (after the "Bouncing Ball" patch in the MATHS
+// manual); an OSC, a VCA and the speaker just make it audible, and a SCOPE visible.
+// - CH. 1 cycles slowly: a 1 s rise (silence, the ball is thrown), then a 3.7 s fall.
+//   Its EOR is high while it falls, and into CH. 4's CYC makes CH. 4 cycle: the bounces.
+// - CH. 1's OUT, turned negative, goes into CH. 4's BOTH: early on CH. 1 is high, so
+//   CH. 4 cycles slowly; as CH. 1 falls the bounces come faster and faster.
+// - Pitch is the SUM bus: CH. 3 scales CH. 1 (high bounces, high notes) and a little of
+//   CH. 4 adds a chirp to each bounce.
+// - The QUAD VCA multiplies two contours: its channel 1 opens with each bounce (CH. 4)
+//   and feeds channel 2, which follows CH. 1, so the bounces also get quieter.
+function mathsBounce() {
+  const b = new Builder();
+  const maths = b.add('maths', 10, 30, {
+    cy1: 1, rise1: 0.7, fall1: 0.83, shp1: 0.5, att1: -0.4,
+    rise4: 0.15, fall4: 0.5, shp4: 0.8, att4: 0.08,
+    att2: 0, att3: 0.5,
+  });
+  const osc = b.add('osc', 190, 30, { oct: 1 });
+  const vca = b.add('vca', 190, 100, { adv: 1, base: 0, amt: 1, base1: 0, amt1: 1 });
+  const speaker = b.add('speaker', 320, 30);
+  // The SCOPE shows the sound itself, zoomed in 4x: each bounce a burst that fades.
+  const scope = b.add('scope', 320, 100, { tim: 1, amp: 4 });
+  b.wire(maths, 'eor', maths, 'cyc4');
+  b.wire(maths, 'out1', maths, 'cboth4');
+  b.wire(maths, 'uni1', maths, 'in3');
+  b.wire(maths, 'sum', osc, 'cv');
+  b.wire(osc, 'sin', vca, 'in');
+  b.wire(maths, 'uni4', vca, 'cv');
+  b.wire(vca, 'out', vca, 'in1');
+  b.wire(maths, 'uni1', vca, 'cv1');
+  b.wire(vca, 'out1', speaker, 'in');
+  b.wire(vca, 'out1', scope, 'a');
+  return b.data;
+}
+
 export const PATCHES: { name: string; build: () => PatchData }[] = [
   { name: '808 GROOVE', build: groove },
   { name: 'BUILD A VOICE', build: voice },
@@ -619,5 +659,6 @@ export const PATCHES: { name: string; build: () => PatchData }[] = [
   { name: 'ACID HOUSE', build: acidHouse },
   { name: 'TURING MACHINE', build: turingMachine },
   { name: 'SHOWCASE', build: showcase },
+  { name: 'MATHS BOUNCE', build: mathsBounce },
   { name: 'EMPTY', build: () => ({ mods: [], cables: [] }) },
 ];

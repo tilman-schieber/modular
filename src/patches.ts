@@ -720,39 +720,89 @@ export function migrate(old: PatchData) {
 //   CH. 4 adds a chirp to each bounce.
 // - The QUAD VCA multiplies two contours: its channel 1 opens with each bounce (CH. 4)
 //   and feeds channel 2, which follows CH. 1, so the bounces also get quieter.
-// A voice in a box: OSC -> FILTER -> VCA with an envelope, inside a SUBMODULE. Its IN,
-// OUT and KNOB modules give the box PIT and GATE jacks, a CUT knob and an audio OUT, so
-// outside it plays like one module. OPEN it (or double-click it) to see the patch inside.
-function subVoice() {
-  const inner = new Builder();
-  const pit = inner.label(inner.add('subin', 10, 30, { type: 1, slot: 1 }), 'PIT');
-  const gate = inner.label(inner.add('subin', 10, 100, { type: 2, slot: 2 }), 'GATE');
-  const cut = inner.label(inner.add('subknob', 10, 170, { val: 0.3, slot: 1 }), 'CUT');
-  const osc = inner.add('osc', 90, 30);
-  const filter = inner.add('filter', 170, 30, { cut: 0.2, res: 6 });
-  const vca = inner.add('vca', 240, 30);
-  const env = inner.add('env', 90, 100, { a: 0.05, d: 0.5, s: 0.2, r: 0.4 });
-  const out = inner.label(inner.add('subout', 310, 30, { slot: 1 }), 'OUT');
-  inner.wire(pit, 'out', osc, 'cv');
-  inner.wire(gate, 'out', env, 'in');
-  inner.wire(osc, 'saw', filter, 'in');
-  inner.wire(filter, 'out', vca, 'in');
-  inner.wire(env, 'out', filter, 'cv');
-  inner.wire(env, 'out', vca, 'cv');
-  inner.wire(cut, 'out', filter, 'cv');
-  inner.wire(vca, 'out', out, 'in');
-
+// A duet in two submodules: the opening of Beethoven's "Ode to Joy" (9th symphony), the
+// melody on a VIOLIN, the chords on a PIANO. Each instrument is a patch inside its box:
+// OPEN one (or double-click it) to see how it is made, and try the VIB and TONE knobs
+// on the boxes. Each MELODY step is one beat; two four-bar phrases repeat.
+function violinInside() {
   const b = new Builder();
-  const clock = b.add('clock', 10, 30, { bpm: 110 });
-  const melody = b.melody(82, 30, 'ARP', { oct: 3, gate: 0.6 });
-  const voice = b.label(b.add('sub', 256, 40, {}, { key: 'subvoice', d: inner.data }), 'VOICE');
-  const delay = b.add('delay', 336, 30, { time: 0.41, fb: 0.4, mix: 0.3 });
-  const speaker = b.add('speaker', 396, 30, { vol: 1 });
-  b.wire(clock, 'o16', melody, 'clk');
-  b.wire(melody, 'pit', voice, 'i1');
-  b.wire(melody, 'gate', voice, 'i2');
-  b.wire(voice, 'o1', delay, 'in');
-  b.wire(delay, 'out', speaker, 'in');
+  const pit = b.label(b.add('subin', 10, 30, { type: 1, slot: 1 }), 'PIT');
+  const gate = b.label(b.add('subin', 10, 100, { type: 2, slot: 2 }), 'GATE');
+  const vib = b.label(b.add('subknob', 10, 170, { val: 0.5, slot: 1 }), 'VIB');
+  // A bowed saw: a soft attack, a short release, a gentle filter swell on each note.
+  const bow = b.label(b.add('synth', 170, 30, { wave: 0, cut: 0.42, res: 2, env: 0.15, dec: 0.8, atk: 0.55, rel: 0.7 }), 'STRING');
+  // Vibrato: a 5.5 Hz wobble whose depth VIB sets, through an ATTEN, up to about half
+  // a semitone either way (the LFO's DEP jack adds half its range per volt).
+  const amount = b.label(b.add('atten', 80, 170, { amt: 0.1 }), 'VIB DEPTH');
+  const lfo = b.label(b.add('lfo', 140, 170, { adv: 1, rate: 0.75, depth: 0 }), 'VIBRATO');
+  const out = b.label(b.add('subout', 250, 30, { slot: 1 }), 'OUT');
+  b.wire(pit, 'out', bow, 'pit');
+  b.wire(gate, 'out', bow, 'gate');
+  b.wire(vib, 'out', amount, 'in');
+  b.wire(amount, 'out', lfo, 'cv_depth');
+  b.wire(lfo, 'out', bow, 'pit');
+  b.wire(bow, 'out', out, 'in');
+  return b.data;
+}
+
+function pianoInside() {
+  const b = new Builder();
+  const pit = b.label(b.add('subin', 10, 30, { type: 1, slot: 1 }), 'ROOT');
+  const gate = b.label(b.add('subin', 10, 100, { type: 2, slot: 2 }), 'GATE');
+  const tone = b.label(b.add('subknob', 10, 170, { val: 0.3, slot: 1 }), 'TONE');
+  // CHORD builds the C major triad on each root: C, F or G.
+  const chord = b.add('chord', 80, 30, { type: 7, key: 0 });
+  // Plucked saws that ring out after each short gate, like a struck string. The filter
+  // starts dark so TONE has room: down for a soft felt piano, up for a bright, hard one.
+  const key = { wave: 0, cut: 0.15, res: 1, env: 0.35, dec: 0.5, atk: 0, rel: 0.88 };
+  const voices = ['ROOT', '3RD', '5TH'].map((l, i) => b.label(b.add('synth', 170, 30 + i * 90, key), l));
+  const mix = b.label(b.add('mixer', 250, 30, { l0: 0.7, l1: 0.6, l2: 0.6 }), 'HAMMERS');
+  const out = b.label(b.add('subout', 330, 30, { slot: 1 }), 'OUT');
+  b.wire(pit, 'out', chord, 'in');
+  voices.forEach((v, i) => {
+    b.wire(chord, 'o' + i, v, 'pit');
+    b.wire(gate, 'out', v, 'gate');
+    b.wire(tone, 'out', v, 'cv');
+    b.wire(v, 'out', mix, 'i' + i);
+  });
+  b.wire(mix, 'out', out, 'in');
+  return b.data;
+}
+
+function odeToJoy() {
+  const b = new Builder();
+  const bank = (pats: object[]) => ({ pats: [...pats, ...pats], pr: ['', '', '', ''], rt: ['', '', '', ''], e: 0 });
+  // C major degrees from C4: 0 C, 1 D, 2 E, 3 F, 4 G. [step, degree, beats]
+  const first = [[0, 2, 1], [1, 2, 1], [2, 3, 1], [3, 4, 1], [4, 4, 1], [5, 3, 1], [6, 2, 1], [7, 1, 1],
+    [8, 0, 1], [9, 0, 1], [10, 1, 1], [11, 2, 1]] as [number, number, number][];
+  const tune = [
+    phrase([...first, [12, 2, 1], [13, 1, 1], [14, 1, 2]]), // ... E D D
+    phrase([...first, [12, 1, 1], [13, 0, 1], [14, 0, 2]]), // ... D C C
+  ];
+  // The piano's chord roots from C3, on beats 1 and 3: C (0), G (4) and back home.
+  const _ = -1, C = 0, G = 4;
+  const harmony = [
+    { n: [C, _, C, _, G, _, G, _, C, _, C, _, G, _, G, _], a: '1000100010001000', s: '0'.repeat(16) },
+    { n: [C, _, C, _, G, _, G, _, C, _, C, _, G, _, C, _], a: '1000100010001000', s: '0'.repeat(16) },
+  ];
+  const clock = b.add('clock', 10, 30, { bpm: 104 });
+  const melody = b.label(b.add('melody', 82, 30, { adv: 1, chain: 2, scale: 0, root: 0, oct: 4, gate: 0.9 }, bank(tune)), 'VIOLIN PART');
+  const chords = b.label(b.add('melody', 82, 165, { adv: 1, chain: 2, scale: 0, root: 0, oct: 3, gate: 0.45 }, bank(harmony)), 'PIANO PART');
+  const violin = b.label(b.add('sub', 256, 40, {}, { key: 'violin', d: violinInside() }), 'VIOLIN');
+  const piano = b.label(b.add('sub', 256, 177, {}, { key: 'piano', d: pianoInside() }), 'PIANO');
+  const mixer = b.add('mixer', 336, 100, { l0: 0.8, l1: 0.55 });
+  const reverb = b.add('reverb', 410, 100, { size: 0.75, mix: 0.3 });
+  const speaker = b.add('speaker', 470, 100, { vol: 1 });
+  // Beats, not 16ths: each MELODY step is a quarter note.
+  for (const m of [melody, chords]) b.wire(clock, 'o4', m, 'clk');
+  b.wire(melody, 'pit', violin, 'i1');
+  b.wire(melody, 'gate', violin, 'i2');
+  b.wire(chords, 'pit', piano, 'i1');
+  b.wire(chords, 'gate', piano, 'i2');
+  b.wire(violin, 'o1', mixer, 'i0');
+  b.wire(piano, 'o1', mixer, 'i1');
+  b.wire(mixer, 'out', reverb, 'in');
+  b.wire(reverb, 'out', speaker, 'in');
   return b.data;
 }
 
@@ -794,7 +844,7 @@ export const PATCHES: { name: string; build: () => PatchData }[] = [
   { name: 'ACID HOUSE', build: acidHouse },
   { name: 'TURING MACHINE', build: turingMachine },
   { name: 'MATHS BOUNCE', build: mathsBounce },
-  { name: 'SUBMODULE VOICE', build: subVoice },
+  { name: 'ODE TO JOY', build: odeToJoy },
   { name: 'SHOWCASE', build: showcase },
   { name: 'EMPTY', build: () => ({ mods: [], cables: [] }) },
 ];

@@ -16,6 +16,8 @@ with cables, press space.
   a cable at CLK), reverb, ring mod, mixer (click a channel number to mute, shift+click to solo)
 - Shift+click an effect to bypass it; audio and CV cables show the signal flowing through them
 - Utilities: TURING machine, LOGIC, sequential switch, CV MIX, SCOPE with a tuner
+- PADS to play by hand (click or keys 1-4): each pad triggers, gates while held or latches
+  on and off, to fire fills or bring parts in and out during a performance
 - Modules stay simple; the + in a title bar opens an advanced layout (CLOCK: tap tempo,
   clock in, reset and division outs; sequencers: reset, per-step chance and ratchets,
   patterns A-D with chaining and a PAT input; FILTER: LP/HP/BP outputs at once, key
@@ -23,7 +25,7 @@ with cables, press space.
   with lin/exp response, bipolar CV, normalled CV jacks and outputs, and a SUM out; LFO: all
   waves at once plus random, clock sync, reset and unipolar; NOISE: white, pink, brown and
   blue outs, dust and a sample and hold; OSC: pulse width and PWM, FM depth, hard sync and
-  a sub octave)
+  a sub octave; PADS: presses quantized to a clock, CV outs and MIDI mapping)
 - An ADVANCED menu with models of real hardware modules: MATHS (after Make Noise MATHS),
   two function generators for envelopes, LFOs and slew, plus attenuverters and SUM, INV and OR buses
   (example patch: MATHS BOUNCE)

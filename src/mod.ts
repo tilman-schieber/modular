@@ -10,11 +10,11 @@ export const CAT: Record<Cat, { name: string; bar: string; cap: string }> = {
   seq: { name: 'SEQUENCE', bar: C.plum, cap: C.yellow },
   drum: { name: 'DRUMS', bar: C.red, cap: C.orange },
   synth: { name: 'SOUND', bar: C.blue, cap: C.sky },
-  mod: { name: 'MODULATE', bar: C.green, cap: C.lime },
+  mod: { name: 'MODULATE', bar: C.moss, cap: C.lime },
   fx: { name: 'EFFECTS', bar: C.teal, cap: C.cyan },
   util: { name: 'OUTPUT', bar: C.slate, cap: C.silver },
   // Models of real hardware modules: deeper, with more jacks.
-  pro: { name: 'ADVANCED', bar: C.orange, cap: C.yellow },
+  pro: { name: 'ADVANCED', bar: C.rust, cap: C.yellow },
 };
 
 export const TYPEC: Record<SigType, string> = { trig: C.yellow, audio: C.red, cv: C.green };
@@ -290,6 +290,12 @@ export abstract class Mod {
     this.set('byp', this.bypassed ? 0 : 1);
     return true;
   }
+  // Alt+click on the module body; return true if used.
+  pressAlt(_lx: number, _ly: number) { return false; }
+  // The computer keyboard, for modules played live (KEYS, PADS); return true if the
+  // key was used. allOff lets go of every held key, e.g. when the window loses focus.
+  key(_code: string, _down: boolean) { return false; }
+  allOff() {}
   save(): unknown { return undefined; }
   load(_s: unknown) {}
   destroy() {}

@@ -299,20 +299,28 @@ function euclidBossa() {
 // rate, which adds bell-like overtones. A second envelope fades that FM depth during
 // each note, so notes start bright and "tiny" and mellow out, like a struck tine.
 // Play it on KEYS, from the computer keyboard (A-K) or a MIDI keyboard.
+// Play KEYS with one hand and the PADS (keys 1-4) with the other. Held: 1 the delay,
+// 2 a big reverb wash, 3 a brighter, bell-like tone. 4 latches a different tone: the
+// carrier's square wave in place of its sine, hollow and woody.
 function fmPiano() {
   const b = new Builder();
   const keys = b.add('keys', 82, 30, { oct: 4 });
+  const pads = b.add('pads', 82, 104, { adv: 1, m0: 1, m1: 1, m2: 1, m3: 2 });
   const mod = b.add('osc', 256, 30, { oct: 1 });
   const depth = b.add('vca', 330, 30);
   const atten = b.add('atten', 390, 30, { amt: 2.5 });
   // FMA 2: OSC's FM is the same depth for every note; this matches the old sound around C4.
   const carrier = b.add('osc', 450, 30, { adv: 1, fma: 2 });
   const vca = b.add('vca', 534, 30);
+  // A crossfade between the carrier's waves, run by pad 4: channel 1 (SIN) is 1 - CV,
+  // channel 2 (SQR, a little lower to match its loudness) gets the same CV, normalled.
+  const tone = b.add('vca', 534, 100, { adv: 1, base: 1, amt: -1, base1: 0, amt1: 0.7 });
   const bright = b.add('env', 330, 100, { a: 0, d: 0.7, s: 0.1, r: 0.45 });
   const amp = b.add('env', 450, 104, { a: 0.05, d: 0.8, s: 0.2, r: 0.6 });
-  const delay = b.add('delay', 594, 30, { time: 0.36, fb: 0.35, mix: 0.25 });
-  const reverb = b.add('reverb', 654, 30, { size: 0.7, mix: 0.35 });
-  const speaker = b.add('speaker', 594, 110);
+  // Both effects start dry-ish; a held pad's CV of 1 adds half the MIX range.
+  const delay = b.add('delay', 594, 30, { adv: 1, time: 0.36, fb: 0.45, mix: 0 });
+  const reverb = b.add('reverb', 654, 30, { size: 0.85, mix: 0.15 });
+  const speaker = b.add('speaker', 654, 100);
   b.wire(keys, 'pit', mod, 'cv');
   b.wire(keys, 'pit', carrier, 'cv');
   b.wire(keys, 'gate', bright, 'in');
@@ -321,11 +329,18 @@ function fmPiano() {
   b.wire(bright, 'out', depth, 'cv');
   b.wire(depth, 'out', atten, 'in');
   b.wire(atten, 'out', carrier, 'fm');
-  b.wire(carrier, 'sin', vca, 'in');
+  b.wire(carrier, 'sin', tone, 'in');
+  b.wire(carrier, 'sqr', tone, 'in1');
+  b.wire(tone, 'sum', vca, 'in');
   b.wire(amp, 'out', vca, 'cv');
   b.wire(vca, 'out', delay, 'in');
   b.wire(delay, 'out', reverb, 'in');
   b.wire(reverb, 'out', speaker, 'in');
+  b.wire(pads, 'c0', delay, 'cv_mix');
+  b.wire(pads, 'c1', reverb, 'cv');
+  // Added to the brightness envelope: more FM while the pad is held.
+  b.wire(pads, 'c2', depth, 'cv');
+  b.wire(pads, 'c3', tone, 'cv');
   return b.data;
 }
 

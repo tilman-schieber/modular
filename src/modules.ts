@@ -12,6 +12,8 @@ const CV_CENTS = 3600;
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 const ms = (v: number) => Math.round(v * 1000) + 'MS';
 const pct = (v: number) => Math.round(v * 100) + '%';
+// Envelope times: knob 0..1 is 2 ms to 2 s, exponentially.
+const envSec = (v: number) => 0.002 * 1000 ** v;
 const hz = (v: number) => {
   const f = cutHz(v);
   return f >= 1000 ? (f / 1000).toFixed(1) + 'K' : Math.round(f) + 'HZ';
@@ -73,8 +75,8 @@ export class Clock extends Mod {
   private extDur = 0;
 
   constructor(e: Engine) {
-    super(e, 'clock', 'CLOCK', 'seq', 60, 68);
-    this.advanced('ADVANCED', 92, 68);
+    super(e, 'clock', 'CLOCK', 'seq', 60, 72);
+    this.advanced('ADVANCED', 92, 72);
     this.knob({ id: 'bpm', label: 'BPM', x: 4, y: 32, min: 60, max: 200, def: 120, step: 1 });
     this.knob({ id: 'swing', label: 'SWG', x: 20, y: 32, min: 0, max: 0.5, def: 0, fmt: pct });
     this.knob({ id: 'sync', label: 'SYN', x: 22, y: 51, min: 0, max: 2, def: INT, names: ['INT', 'EXT', 'OUT'] });
@@ -1495,12 +1497,250 @@ export class Keys extends Mod {
   }
 }
 
+// ---------------------------------------------------------------- PADS
+
+const PADS = 4;
+const PAD_MODES = ['TRG', 'GAT', 'LAT'];
+const [TRG, GAT, LAT] = [0, 1, 2];
+// Quantize: how many CLK triggers (16ths) between the points a press may land on.
+const PAD_Q = ['OFF', '16TH', 'BEAT', 'BAR'];
+const PAD_QN = [0, 1, 4, 16];
+// An unquantized TRG gate, and the shortest gate a quick tap makes.
+const PAD_TRG = 0.1;
+const PAD_MIN = 0.03;
+const padX = (i: number) => 3 + i * 15;
+
+// Four pads to play by hand, with the mouse, the keys 1-4 or (+) MIDI. Each pad's mode:
+// TRG fires one gate per press, GAT stays open while held, LAT toggles on and off on
+// each press (and is saved with the patch). +: CLK and Q hold a press back to the next
+// 16th, beat or bar, counted from PLAY; a CV out per pad gives 0 or 1; Alt+click a pad,
+// then press a MIDI key or button, to map it.
+export class Pads extends Mod {
+  cvs = Array.from({ length: PADS }, () => cvSource());
+  private open = Array.from({ length: PADS }, () => false); // a GAT or LAT gate is open
+  private openAt = Array.from({ length: PADS }, () => 0);
+  private down = Array.from({ length: PADS }, () => false); // held by hand right now
+  private pending: (number | null)[] = Array.from({ length: PADS }, () => null); // action waiting for the grid
+  private upEarly = Array.from({ length: PADS }, () => false); // a GAT let go before it opened
+  private flash = Array.from({ length: PADS }, () => -1e9);
+  private ticks = 0;
+  private lastQ = -1; // time of the latest grid point CLK has scheduled
+  private tick = 0.125;
+  private learning = -1;
+  private unlisten: () => void;
+
+  constructor(e: Engine) {
+    super(e, 'pads', 'PADS', 'seq', 64, 56);
+    for (let i = 0; i < PADS; i++) {
+      this.p['m' + i] = TRG;
+      this.p['on' + i] = 0;
+      this.p['midi' + i] = -1;
+      this.port('g' + i, 'OUT', 'trig', 'out', padX(i) + 2, 37);
+    }
+    this.advanced('ADVANCED', 79, 77);
+    this.advOnly(() => {
+      this.port('clk', 'CLK', 'trig', 'in', 65, 14);
+      this.knob({ id: 'q', label: 'Q', x: 64, y: 37, min: 0, max: PAD_Q.length - 1, def: 0, names: PAD_Q });
+      for (let i = 0; i < PADS; i++) this.port('c' + i, 'CV', 'cv', 'out', padX(i) + 2, 57);
+    });
+    this.unlisten = midi.on((d, t) => this.midiIn(d, t));
+  }
+
+  private mode(i: number) { return this.p['m' + i]; }
+
+  // Presses wait for the grid only with + open, Q set, a clock patched and PLAY on.
+  private quantized() {
+    return this.isAdv && this.p.q > 0 && this.eng.running && this.eng.cablesAt(this, 'clk').length > 0;
+  }
+
+  private padDown(i: number) {
+    if (this.down[i]) return;
+    this.down[i] = true;
+    this.upEarly[i] = false;
+    this.request(i, this.mode(i));
+  }
+
+  private padUp(i: number) {
+    if (!this.down[i]) return;
+    this.down[i] = false;
+    if (this.mode(i) !== GAT) return;
+    if (this.pending[i] !== null) { this.upEarly[i] = true; return; }
+    if (this.open[i]) this.close(i, Math.max(ac.currentTime + 0.005, this.openAt[i] + PAD_MIN));
+  }
+
+  private request(i: number, action: number) {
+    const now = ac.currentTime + 0.005;
+    if (!this.quantized()) this.run(i, action, now);
+    // CLK schedules ahead: a grid point it already sent may still be in the future.
+    else if (this.lastQ > now) this.run(i, action, this.lastQ);
+    else this.pending[i] = action;
+  }
+
+  private run(i: number, action: number, t: number) {
+    this.pending[i] = null;
+    this.eng.at(t, () => (this.flash[i] = now()));
+    if (action === TRG) {
+      const dur = this.quantized() ? this.tick : PAD_TRG;
+      this.emit('g' + i, { t, dur });
+      this.level(i, 1, t);
+      this.level(i, 0, t + dur);
+    } else if (action === GAT) {
+      this.openGate(i, t);
+      if (this.upEarly[i]) { this.upEarly[i] = false; this.close(i, t + Math.max(PAD_MIN, this.quantized() ? this.tick : 0)); }
+    } else {
+      // The gate moves first, at t; then the saved state follows.
+      const on = this.p['on' + i] ? 0 : 1;
+      if (on) this.openGate(i, t);
+      else this.close(i, t);
+      this.set('on' + i, on);
+    }
+  }
+
+  private openGate(i: number, t: number) {
+    if (this.open[i]) return;
+    this.open[i] = true;
+    this.openAt[i] = t;
+    this.emit('g' + i, { t, dur: 0, hold: true });
+    this.level(i, 1, t);
+  }
+
+  private close(i: number, t: number) {
+    if (!this.open[i]) return;
+    this.open[i] = false;
+    this.emit('g' + i, { t, dur: 0, off: true });
+    this.level(i, 0, t);
+  }
+
+  // CV outs glide for a few milliseconds so they don't click a VCA.
+  private level(i: number, v: number, t: number) { this.cvs[i].offset.setTargetAtTime(v, t, 0.003); }
+
+  onEvent(port: string, ev: Ev) {
+    if (port !== 'clk' || ev.off || !this.isAdv) return;
+    this.tick = ev.dur || this.tick;
+    const n = PAD_QN[Math.round(this.p.q)] || 1;
+    if (this.ticks++ % n !== 0) return;
+    this.lastQ = ev.t;
+    for (let i = 0; i < PADS; i++) if (this.pending[i] !== null) this.run(i, this.pending[i]!, ev.t);
+  }
+
+  reset(t0: number) {
+    this.ticks = 0;
+    this.lastQ = -1;
+    this.pending.fill(null);
+    // Pads latched on open their gates again on PLAY, after every module has reset.
+    if (t0) queueMicrotask(() => {
+      for (let i = 0; i < PADS; i++) if (this.open[i]) this.emit('g' + i, { t: t0, dur: 0, hold: true });
+    });
+  }
+
+  onParam(id: string) {
+    const m = /^(m|on)(\d)$/.exec(id);
+    if (!m) return;
+    const i = Number(m[2]), t = ac.currentTime + 0.005;
+    // Leaving a mode lets go of what it held.
+    if (m[1] === 'm') {
+      this.pending[i] = null;
+      this.down[i] = false;
+      if (this.p['on' + i]) this.set('on' + i, 0);
+      this.close(i, t);
+    // A latch set from outside (loading a patch) opens or closes its gate now.
+    } else if (this.mode(i) === LAT) {
+      if (this.p[id]) this.openGate(i, t);
+      else this.close(i, t);
+    }
+  }
+
+  // Keys 1-4; returns whether the key was used.
+  key(code: string, isDown: boolean) {
+    const i = ['Digit1', 'Digit2', 'Digit3', 'Digit4'].indexOf(code);
+    if (i < 0) return false;
+    if (isDown) this.padDown(i);
+    else this.padUp(i);
+    return true;
+  }
+
+  allOff() { for (let i = 0; i < PADS; i++) this.padUp(i); }
+
+  // A mapped MIDI note plays its pad; a mapped CC presses it at 64 and up.
+  private midiIn(d: Uint8Array, _t: number) {
+    const [st, d1 = 0, d2 = 0] = d, cmd = st & 0xf0;
+    const note = cmd === 0x90 || cmd === 0x80, cc = cmd === 0xb0;
+    if (!note && !cc) return;
+    const code = cc ? 1000 + d1 : d1, press = cmd !== 0x80 && d2 > 0, on = cc ? d2 >= 64 : press;
+    if (this.learning >= 0 && press) {
+      this.set('midi' + this.learning, code);
+      this.learning = -1;
+      return;
+    }
+    if (!this.isAdv) return;
+    for (let i = 0; i < PADS; i++) {
+      if (this.p['midi' + i] !== code) continue;
+      if (on) this.padDown(i);
+      else this.padUp(i);
+    }
+  }
+
+  private padAt(lx: number, ly: number) {
+    for (let i = 0; i < PADS; i++) if (lx >= padX(i) && lx < padX(i) + 13 && ly >= 12 && ly < 25) return i;
+    return -1;
+  }
+
+  press(lx: number, ly: number): Drag | null {
+    for (let i = 0; i < PADS; i++) {
+      if (inBtn(lx, ly, padX(i), 26, 13)) {
+        this.set('m' + i, (this.mode(i) + 1) % PAD_MODES.length);
+        return noDrag;
+      }
+    }
+    const i = this.padAt(lx, ly);
+    if (i < 0) return null;
+    this.padDown(i);
+    return { move() {}, up: () => this.padUp(i) };
+  }
+
+  // +: Alt+click a pad to map it to the next MIDI note or button; again to unmap it.
+  pressAlt(lx: number, ly: number) {
+    const i = this.padAt(lx, ly);
+    if (i < 0 || !this.isAdv) return false;
+    if (this.learning === i) this.learning = -1;
+    else if (this.p['midi' + i] >= 0) this.set('midi' + i, -1);
+    else { this.learning = i; void midi.enable(); }
+    return true;
+  }
+
+  drawBody(g: Gfx) {
+    const blink = Math.floor(now() / 250) % 2 === 0;
+    for (let i = 0; i < PADS; i++) {
+      const x = padX(i), lit = this.open[i] || now() - this.flash[i] < 90;
+      g.rect(x, 12, 13, 13, C.black);
+      g.rect(x + 1, 13, 11, 11, lit ? C.yellow : C.slate);
+      g.rect(x + 1, 13, 11, 1, lit ? C.white : C.silver);
+      g.textC(String(i + 1), x + 7, 16, lit ? C.ink : C.dark);
+      // Waiting for the grid, or for a MIDI control to learn.
+      if ((this.pending[i] !== null && blink) || (this.learning === i && blink)) {
+        g.frame(x - 1, 11, 15, 15, this.learning === i ? C.sky : C.yellow);
+      }
+      if (this.isAdv && this.p['midi' + i] >= 0) g.rect(x + 10, 13, 2, 2, C.sky);
+      const m = this.mode(i);
+      drawButton(g, x, 26, 13, PAD_MODES[m], m === LAT ? C.lime : m === GAT ? C.cyan : C.yellow);
+    }
+  }
+
+  audioOut(port: string) { return port.startsWith('c') ? this.cvs[Number(port.slice(1))] ?? null : null; }
+
+  destroy() {
+    this.unlisten();
+    for (const s of this.cvs) s.stop();
+  }
+}
+
 // ---------------------------------------------------------------- SYNTH
 
 const WAVES: OscillatorType[] = ['sawtooth', 'square', 'triangle', 'sine'];
 
 // A one-oscillator voice with its own filter and envelopes: give it a pitch CV and gates.
 // Each gate starts a voice; the pitch CV moves every sounding voice, sample-accurately.
+// The amp rises over ATK, holds while the gate is open, and fades over REL after it.
 export class Synth extends Mod {
   out = ac.createGain();
   cv = ac.createGain();
@@ -1512,21 +1752,27 @@ export class Synth extends Mod {
       { id: 'wave', label: 'WAV', min: 0, max: 3, def: 0, names: ['SAW', 'SQR', 'TRI', 'SIN'] },
       { id: 'oct', label: 'OCT', min: -2, max: 2, def: 0, step: 1, fmt: (v) => (v > 0 ? '+' : '') + v },
       { id: 'cut', label: 'CUT', min: 0, max: 1, def: 0.35, fmt: hz },
-    ], 13, 18);
-    this.knobRow([
       { id: 'res', label: 'RES', min: 0, max: 20, def: 6, fmt: (v) => v.toFixed(1) },
+    ], 13);
+    // The defaults (4 ms, 78 ms) are the fixed amp shape SYNTH had before ATK and REL.
+    const time = (v: number) => ms(envSec(v));
+    this.knobRow([
       { id: 'env', label: 'ENV', min: 0, max: 1, def: 0.6, fmt: pct },
       { id: 'dec', label: 'DEC', min: 0.05, max: 1.5, def: 0.3, fmt: ms },
-    ], 33, 18);
+      { id: 'atk', label: 'ATK', min: 0, max: 1, def: 0.1, fmt: time },
+      { id: 'rel', label: 'REL', min: 0, max: 1, def: 0.53, fmt: time },
+    ], 33);
     this.cv.gain.value = CV_CENTS;
     // 1 per octave, like OSC.
     this.pitch.gain.value = 1200;
-    this.port('pit', 'PIT', 'cv', 'in', 4, 53);
-    this.port('gate', 'GAT', 'trig', 'in', 19, 53);
-    this.port('cv', 'CUT', 'cv', 'in', 34, 53);
-    this.port('out', 'OUT', 'audio', 'out', 51, 53);
-    this.advanced('ADVANCED', 64, 92);
-    for (const id of ['res', 'env', 'dec']) this.cvKnob(id, this.knobById(id).x + 1, 73);
+    this.port('pit', 'PIT', 'cv', 'in', 5, 53);
+    this.port('gate', 'GAT', 'trig', 'in', 20, 53);
+    this.port('cv', 'CUT', 'cv', 'in', 35, 53);
+    this.port('out', 'OUT', 'audio', 'out', 50, 53);
+    // Advanced: a CV jack under each knob of the second row, and one beside RES.
+    this.advanced('ADVANCED', 79, 92);
+    this.cvKnob('res', 65, 13);
+    for (const id of ['env', 'dec', 'atk', 'rel']) this.cvKnob(id, this.knobById(id).x + 1, 73);
   }
 
   audioIn(port: string) { return port === 'pit' ? this.pitch : this.cv; }
@@ -1538,23 +1784,27 @@ export class Synth extends Mod {
 
   onEvent(_port: string, ev: Ev) {
     if (ev.off) {
-      if (this.live) { release(this.live, ev.t); this.live = null; }
+      if (this.live) { release(this.live, ev.t, envSec(this.val('rel'))); this.live = null; }
       return;
     }
     const { wave, oct, cut } = this.p, res = this.val('res'), env = this.val('env'), dec = this.val('dec');
+    const atk = envSec(this.val('atk')), rel = envSec(this.val('rel'));
     const t = ev.t, dur = ev.hold ? HOLD : Math.max(0.02, ev.dur);
     const peak = 0.35 * (ev.acc ? 1.4 : 1) * velGain(ev.vel);
 
     // Slide: keep the still-sounding voice going, with no new attack; the pitch CV glides.
     const old = this.last;
     if (ev.slide && old && old.end > t) {
+      // Mid-attack it keeps rising, now towards the new peak.
+      const lv = t < old.start + old.atk ? level(old, t) : peak;
       old.g.gain.cancelScheduledValues(t);
-      old.g.gain.setValueAtTime(peak, t);
-      hold(old, t + dur, peak);
+      old.g.gain.setValueAtTime(lv, t);
+      old.peak = peak;
+      hold(old, t, t + dur, rel);
       return;
     }
     // A new live gate takes over from the one being held.
-    if (this.live) { release(this.live, t); this.live = null; }
+    if (this.live) { release(this.live, t, rel); this.live = null; }
 
     const o = ac.createOscillator(), fl = ac.createBiquadFilter(), g = ac.createGain();
     o.type = WAVES[wave];
@@ -1565,7 +1815,6 @@ export class Synth extends Mod {
     fl.frequency.setValueAtTime(Math.min(18000, base * (1 + amt * 16)), t);
     fl.frequency.exponentialRampToValueAtTime(base, t + dec);
     g.gain.setValueAtTime(0, t);
-    g.gain.linearRampToValueAtTime(peak, t + 0.004);
     o.connect(fl).connect(g).connect(this.out);
     this.pitch.connect(o.detune);
     this.cv.connect(fl.detune);
@@ -1574,30 +1823,42 @@ export class Synth extends Mod {
       this.cv.disconnect(fl.detune);
     };
     o.start(t);
-    const v: Voice = { o, g, end: 0 };
-    hold(v, t + dur, peak);
+    const v: Voice = { o, g, end: 0, start: t, atk, peak };
+    hold(v, t, t + dur, rel);
     this.last = v;
     if (ev.hold) this.live = v;
   }
 }
 
-interface Voice { o: OscillatorNode; g: GainNode; end: number }
+// `end` is when the gate closes; the attack rises linearly from `start`, over `atk`, to `peak`.
+interface Voice { o: OscillatorNode; g: GainNode; end: number; start: number; atk: number; peak: number }
+
+// The level a voice's attack has reached at t.
+const level = (v: Voice, t: number) => v.peak * Math.min(1, Math.max(0, (t - v.start) / v.atk));
 
 // How long a live (held) note may ring before it stops by itself.
 const HOLD = 60;
 
-// Keep a voice at peak until `end`, then fade it out.
-function hold(v: Voice, end: number, peak: number) {
-  v.g.gain.setValueAtTime(peak, end);
-  v.g.gain.exponentialRampToValueAtTime(0.001, end + 0.08);
-  v.o.stop(end + 0.1);
+// From `from` (the gain already set there), finish the attack and hold until `end`,
+// then fade out over rel. A gate shorter than the attack releases from where it got to.
+function hold(v: Voice, from: number, end: number, rel: number) {
+  const top = v.start + v.atk, g = v.g.gain;
+  if (from < top && end > top) g.linearRampToValueAtTime(v.peak, top);
+  const lv = Math.max(0.001, level(v, end));
+  if (from < top && end <= top) g.linearRampToValueAtTime(lv, end);
+  else g.setValueAtTime(lv, end);
+  g.exponentialRampToValueAtTime(0.001, end + rel);
+  v.o.stop(end + rel + 0.02);
   v.end = end;
 }
 
-function release(v: Voice, t: number) {
-  v.g.gain.cancelScheduledValues(t);
-  v.g.gain.setTargetAtTime(0.0001, t, 0.03);
-  v.o.stop(t + 0.3);
+// A live gate-off: fade out over rel from wherever the voice is now.
+function release(v: Voice, t: number, rel: number) {
+  const g = v.g.gain;
+  g.cancelScheduledValues(t);
+  g.setValueAtTime(Math.max(0.001, level(v, t)), t);
+  g.exponentialRampToValueAtTime(0.001, t + rel);
+  v.o.stop(t + rel + 0.02);
   v.end = t;
 }
 
@@ -2490,15 +2751,19 @@ export class Noise extends Mod {
       { id: 'lvl', label: 'LVL', min: 0, max: 1, def: 0.3, fmt: pct },
     ], 13);
     this.port('out', 'OUT', 'audio', 'out', 37, 32);
-    this.advanced('ADVANCED', 97, 70);
+    this.advanced('ADVANCED', 100, 70);
     // A CV of 1 raises TON by four octaves; one on LVL adds half the range.
     this.cvParam('tone', 12, 51, this.f.detune, 4800);
     const lvl = this.cvParam('lvl', 27, 51, null, 0.5);
     for (const g of [this.out, ...this.outs.slice(0, 5)]) lvl.connect(g.gain);
+    // Advanced, in groups like a Doepfer A-118: the filtered noise (FLT) with TON and LVL
+    // on the left; the four fixed colours in a block; DUST over its DNS knob; and the
+    // sample and hold, TRG into RND, along the bottom.
     this.advOnly(() => {
-      ['WHT', 'PNK', 'BRN', 'BLU', 'DST'].forEach((l, i) =>
-        this.port(NOISE_OUTS[i], l, 'audio', 'out', 52 + (i % 3) * 15, i < 3 ? 13 : 32));
-      this.knob({ id: 'dens', label: 'DNS', x: 82, y: 32, min: 0, max: 1, def: 0.4, fmt: (v) => Math.round(dustHz(v)) + '/S' });
+      ['WHT', 'PNK', 'BRN', 'BLU'].forEach((l, i) =>
+        this.port(NOISE_OUTS[i], l, 'audio', 'out', 52 + (i % 2) * 15, i < 2 ? 13 : 32));
+      this.port(NOISE_OUTS[4], 'DST', 'audio', 'out', 85, 13);
+      this.knob({ id: 'dens', label: 'DNS', x: 84, y: 32, min: 0, max: 1, def: 0.4, fmt: (v) => Math.round(dustHz(v)) + '/S' });
       this.port('trg', 'TRG', 'trig', 'in', 52, 51);
       this.port('rnd', 'RND', 'cv', 'out', 67, 51);
     });
@@ -2513,6 +2778,9 @@ export class Noise extends Mod {
     });
   }
 
+  // Among the colour jacks, OUT is named for what it is: the filtered one.
+  protected layout(adv: boolean) { this.portById('out').label = adv ? 'FLT' : 'OUT'; }
+
   onParam(id: string) {
     const t = ac.currentTime;
     if (id === 'tone') this.f.frequency.setTargetAtTime(cutHz(this.p.tone), t, 0.02);
@@ -2524,8 +2792,17 @@ export class Noise extends Mod {
     if (port === 'trg' && !ev.off) this.node?.port.postMessage({ hold: ev.t });
   }
 
+  // A little screen with a still trace of noise; in the + layout, lines between the groups.
   drawBody(g: Gfx) {
-    for (let i = 0; i < 40; i++) g.px(5 + ((i * 37) % 26), 34 + ((i * 11) % 13), C.slate);
+    if (this.isAdv) for (const x of [48, 80]) g.rect(x, 12, 1, this.h - 15, C.ink);
+    g.rect(4, 32, 28, 15, C.black);
+    let r = 7, y0 = 39;
+    for (let x = 6; x < 30; x++) {
+      r = (r * 1103515245 + 12345) & 0x7fffffff;
+      const y = 39 + ((r >> 8) % 13) - 6;
+      g.line(x - 1, y0, x, y, C.sky);
+      y0 = y;
+    }
   }
 
   audioOut(port: string) { return port === 'out' ? this.out : this.outs[NOISE_OUTS.indexOf(port)] ?? null; }
@@ -2697,8 +2974,6 @@ export class Lfo extends Mod {
   audioOut(port: string) { return this.outs[LFO_OUTS.indexOf(port)] ?? null; }
   destroy() { this.node?.disconnect(); }
 }
-
-const envSec = (v: number) => 0.002 * 1000 ** v;
 
 export class Envelope extends Mod {
   src = ac.createConstantSource();
@@ -3983,6 +4258,7 @@ export const KINDS: Kind[] = [
   { type: 'beats', label: 'TRIG SEQ', cat: 'seq', make: (e) => new Beats(e) },
   { type: 'melody', label: 'MELODY', cat: 'seq', make: (e) => new Melody(e) },
   { type: 'keys', label: 'KEYS', cat: 'seq', make: (e) => new Keys(e) },
+  { type: 'pads', label: 'PADS', cat: 'seq', make: (e) => new Pads(e) },
   { type: 'divider', label: 'DIVIDER', cat: 'seq', make: (e) => new Divider(e) },
   { type: 'euclid', label: 'EUCLID', cat: 'seq', make: (e) => new Euclid(e) },
   { type: 'chance', label: 'CHANCE', cat: 'seq', make: (e) => new Chance(e) },

@@ -10,6 +10,8 @@ export class Engine {
   cables: Cable[] = [];
   running = false;
   dirty = false;
+  // Set by the first gate any module sends, e.g. a key played on KEYS without PLAY.
+  sounded = false;
   master: GainNode;
   private nextId = 0;
   private queue: { t: number; fn: () => void }[] = [];
@@ -64,6 +66,7 @@ export class Engine {
   emit(m: Mod, port: string, ev: Ev) {
     // Guards against feedback loops like a sequencer clocking itself.
     if (this.depth > 16) return;
+    if (!ev.off) this.sounded = true;
     this.depth++;
     try {
       for (const c of this.cables) {

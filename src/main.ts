@@ -2,7 +2,7 @@ import { ac } from './audio';
 import { Engine, type Cable } from './engine';
 import { C, Gfx, textWidth } from './gfx';
 import { CAT, TYPEC, compatible, type Cat, type Drag, type Knob, type Mod, type Port } from './mod';
-import { KINDS, Keys, type Kind } from './modules';
+import { KINDS, type Kind } from './modules';
 import { PATCHES, migrate, type PatchData } from './patches';
 import { cablePoints, drawButton, drawCable, drawFlow, drawModule, plug } from './render';
 import { BAR_HELP, CABLE_HELP, HELP, MODULE_HOW, jackHelp, knobHelp } from './help';
@@ -33,6 +33,28 @@ let toast = { text: '', until: 0 };
 const selected = new Set<Mod>();
 let selCable: Cable | null = null;
 let wires = 0; // 0 shown, 1 dimmed, 2 hidden
+
+// Help mode's pointer: a pixel arrow with a yellow question mark, its hotspot on the
+// arrow's tip (system "help" cursors often point from their middle).
+const HELP_CURSOR = (() => {
+  const arrow = [
+    'K.......', 'KK......', 'KWK.....', 'KWWK....', 'KWWWK...', 'KWWWWK..', 'KWWWWWK.',
+    'KWWWWWWK', 'KWWWKKKK', 'KWKWK...', 'KK.KWK..', '....KWK.', '.....KK.',
+  ];
+  const mark = ['##.', '..#', '.#.', '...', '.#.'], mx0 = 9, my0 = 6;
+  const W = 13, H = 13, px: string[][] = Array.from({ length: H }, (_, y) => [...(arrow[y] ?? '').padEnd(W, '.')]);
+  const isMark = (x: number, y: number) => mark[y - my0]?.[x - mx0] === '#';
+  // The mark gets a black outline so it reads on any background.
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (isMark(x, y)) px[y][x] = 'Y';
+    else if (px[y][x] === '.' && [-1, 0, 1].some((dy) => [-1, 0, 1].some((dx) => isMark(x + dx, y + dy)))) px[y][x] = 'K';
+  }
+  const col: Record<string, string> = { K: C.black, W: C.white, Y: C.yellow };
+  const rects = px.flatMap((r, y) => r.map((c, x) => col[c]
+    ? `<rect x="${x * 2}" y="${y * 2}" width="2" height="2" fill="${col[c]}"/>` : ''));
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W * 2}" height="${H * 2}" shape-rendering="crispEdges">${rects.join('')}</svg>`;
+  return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 0 0, help`;
+})();
 let clipboard: PatchData | null = null;
 let namePrompt: { text: string; done: (name: string) => void } | null = null;
 // The knob waiting for a MIDI control to be moved (Alt+click a knob to map it).
@@ -208,6 +230,19 @@ function modAt(wx: number, wy: number) {
   return undefined;
 }
 
+// A jack catches the pointer over itself and its label, a little wider than drawn;
+// where two zones meet, the nearer jack wins.
+function portAt(m: Mod, lx: number, ly: number) {
+  let best: Port | null = null, bd = Infinity;
+  for (const p of m.ports) {
+    const dx = Math.abs(lx - (p.x + 4)), dy = Math.abs(ly - (p.y + 4));
+    if (dx > 7 || ly < p.y - 3 || ly > p.y + (p.label ? 16 : 11)) continue;
+    const d = Math.max(dx, dy);
+    if (d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+
 function hitTest(): Hit {
   const item = menuItemAt(ux, uy);
   if (item) return { k: 'menu', item };
@@ -221,7 +256,7 @@ function hitTest(): Hit {
     const lx = wx - m.x, ly = wy - m.y;
     if (lx >= m.w - 9 && lx < m.w - 2 && ly >= 1 && ly < 9) return { k: 'close', m };
     if (m.advName && lx >= m.w - 18 && lx < m.w - 9 && ly >= 1 && ly < 9) return { k: 'adv', m };
-    const p = m.ports.find((p) => Math.abs(lx - (p.x + 4)) <= 5 && Math.abs(ly - (p.y + 4)) <= 5);
+    const p = portAt(m, lx, ly);
     if (p) return { k: 'port', m, p };
     const kn = m.knobs.find((k) => lx >= k.x - 1 && lx < k.x + 12 && ly >= k.y - 1 && ly < k.y + 12);
     if (kn) return { k: 'knob', m, kn };
@@ -434,6 +469,7 @@ canvas.addEventListener('pointerdown', (e) => {
         if (!selected.delete(h.m)) selected.add(h.m);
         return;
       }
+      if (e.altKey && h.m.pressAlt(h.lx, h.ly)) return;
       if (!selected.has(h.m)) { selected.clear(); selected.add(h.m); }
       toFront(h.m);
       const d = h.m.press(h.lx, h.ly);
@@ -529,8 +565,6 @@ canvas.addEventListener('wheel', (e) => {
   camY = wy - my;
 }, { passive: false });
 
-const keysMods = () => eng.mods.filter((m): m is Keys => m instanceof Keys);
-
 addEventListener('keydown', (e) => {
   if (namePrompt) { promptKey(e); return; }
   const key = e.key.toLowerCase();
@@ -553,7 +587,7 @@ addEventListener('keydown', (e) => {
   }
   if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.repeat) {
     let used = false;
-    for (const k of keysMods()) used = k.key(e.code, true) || used;
+    for (const m of eng.mods) used = m.key(e.code, true) || used;
     if (used) {
       void ac.resume();
       e.preventDefault();
@@ -699,12 +733,12 @@ function pasteData(data: PatchData, atMouse: boolean) {
 }
 
 addEventListener('keyup', (e) => {
-  for (const k of keysMods()) k.key(e.code, false);
+  for (const m of eng.mods) m.key(e.code, false);
 });
 
 // Don't leave notes hanging when the window loses focus mid-press.
 addEventListener('blur', () => {
-  for (const k of keysMods()) k.allOff();
+  for (const m of eng.mods) m.allOff();
 });
 
 addEventListener('resize', resize);
@@ -1140,6 +1174,8 @@ function frame() {
     ui.rect(x, barH + 6, w, 9, C.yellow);
     ui.text(toast.text, x + 5, barH + 8, C.ink);
   }
+  // The hint goes once anything has played: PLAY, or a note on KEYS, PADS or MIDI.
+  everPlayed ||= eng.sounded;
   if (!everPlayed && blink && !openMenu && !popup) ui.textC('PRESS SPACE TO PLAY', Math.floor(UW / 2), UH - 16, C.yellow);
   ui.text(helpMode ? 'HELP MODE - HOVER ANYTHING - ?, ESC OR RIGHT-CLICK TO LEAVE' : TIPS[Math.floor(t / 7000) % TIPS.length], 3, UH - 7, helpMode ? C.yellow : C.slate);
   // Hovering a module in a menu describes it, next to the menu.
@@ -1157,7 +1193,7 @@ function frame() {
   if (namePrompt) drawPrompt(namePrompt.text, blink);
 
   canvas.style.cursor =
-    helpMode && mode.k === 'none' ? 'help'
+    helpMode && mode.k === 'none' ? HELP_CURSOR
     : mode.k === 'move' || mode.k === 'pan' ? 'grabbing'
     : mode.k === 'knob' || h.k === 'knob' ? 'ns-resize'
     : mode.k === 'cable' || h.k === 'port' ? 'crosshair'

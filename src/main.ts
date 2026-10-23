@@ -220,23 +220,31 @@ subHooks.open = (m) => enter(m);
 const MENU_ROW = 10;
 const openBtn = () => bar.find((b) => b.label === openMenu && b.menu);
 
-// The open dropdown: a toolbar menu, or the module picker.
+// The open dropdown: a toolbar menu, or the module picker. Items that would run off the
+// bottom of the screen (a phone on its side) continue in further columns, `cw` wide each.
 function activeMenu() {
-  if (popup) {
-    const items = popup.items, w = Math.max(...items.map((m) => textWidth(m.label) + 12)), h = items.length * MENU_ROW + 2;
-    return { x: Math.max(0, Math.min(popup.x, UW - w - 2)), y: Math.max(barH, Math.min(popup.y, UH - h - 2)), w, h, items };
-  }
-  const b = openBtn();
-  if (!b) return null;
-  const w = Math.max(b.w, ...b.menu!.map((m) => textWidth(m.label) + 12));
-  return { x: b.x, y: b.y + 10, w, h: b.menu!.length * MENU_ROW + 2, items: b.menu! };
+  const b = popup ? null : openBtn();
+  if (!popup && !b) return null;
+  const items = popup ? popup.items : b!.menu!;
+  const cw = Math.max(popup ? 0 : b!.w, ...items.map((m) => textWidth(m.label) + 12));
+  const top = popup ? barH : b!.y + 10;
+  const rows = Math.max(1, Math.min(items.length, Math.floor((UH - top - 2) / MENU_ROW)));
+  const w = Math.ceil(items.length / rows) * cw, h = rows * MENU_ROW + 2;
+  const x = Math.max(0, Math.min(popup ? popup.x : b!.x, UW - w - 2));
+  const y = popup ? Math.max(barH, Math.min(popup.y, UH - h - 2)) : top;
+  return { x, y, w, h, cw, rows, items };
+}
+
+// Where item i of the open dropdown is drawn.
+function menuItemPos(r: NonNullable<ReturnType<typeof activeMenu>>, i: number) {
+  return { x: r.x + Math.floor(i / r.rows) * r.cw, y: r.y + 1 + (i % r.rows) * MENU_ROW };
 }
 
 function menuItemAt(x: number, y: number) {
   const r = activeMenu();
   if (!r) return null;
   if (x < r.x || x >= r.x + r.w || y < r.y + 1 || y >= r.y + r.h - 1) return null;
-  return r.items[Math.floor((y - r.y - 1) / MENU_ROW)] ?? null;
+  return r.items[Math.floor((x - r.x) / r.cw) * r.rows + Math.floor((y - r.y - 1) / MENU_ROW)] ?? null;
 }
 
 function drawBar() {
@@ -263,17 +271,17 @@ function drawBar() {
     ui.rect(r.x, r.y, r.w, r.h, C.black);
     ui.rect(r.x + 1, r.y + 1, r.w - 2, r.h - 2, C.dark);
     r.items.forEach((m, i) => {
-      const y = r.y + 1 + i * MENU_ROW;
+      const { x, y } = menuItemPos(r, i);
       if (m.header) {
-        ui.rect(r.x + 1, y, r.w - 2, MENU_ROW, C.ink);
+        ui.rect(x + 1, y, r.cw - 2, MENU_ROW, C.ink);
         // A header without a title is a dividing line.
-        if (m.label) ui.text(m.label, r.x + 4, y + 3, C.slate);
-        else ui.rect(r.x + 4, y + Math.floor(MENU_ROW / 2), r.w - 8, 1, C.slate);
+        if (m.label) ui.text(m.label, x + 4, y + 3, C.slate);
+        else ui.rect(x + 4, y + Math.floor(MENU_ROW / 2), r.cw - 8, 1, C.slate);
         return;
       }
-      if (m === hi) ui.rect(r.x + 1, y, r.w - 2, MENU_ROW, m.col);
-      else ui.rect(r.x + 1, y, 2, MENU_ROW, m.col);
-      ui.text(m.label, r.x + 6, y + 3, m === hi ? m.text : C.white);
+      if (m === hi) ui.rect(x + 1, y, r.cw - 2, MENU_ROW, m.col);
+      else ui.rect(x + 1, y, 2, MENU_ROW, m.col);
+      ui.text(m.label, x + 6, y + 3, m === hi ? m.text : C.white);
     });
   }
 }
@@ -420,6 +428,9 @@ function dropTarget(from: { m: Mod; p: Port }, wx: number, wy: number) {
 type Mode =
   | { k: 'none' }
   | { k: 'pan'; sx: number; sy: number; cx: number; cy: number }
+  // Two fingers: pinch to zoom, move together to pan, around the field point (wx, wy)
+  // that was under their midpoint, at starting distance d0 and scale s0.
+  | { k: 'pinch'; d0: number; s0: number; wx: number; wy: number }
   | {
     k: 'move'; m: Mod; dx: number; dy: number; sx: number; sy: number; spawned: boolean; moved: boolean;
     group: { m: Mod; ox: number; oy: number }[]; // other selected modules, relative to m
@@ -431,6 +442,35 @@ type Mode =
 
 let mode: Mode = { k: 'none' };
 let lastKnob = { kn: null as Knob | null, t: 0 };
+// Fingers on the screen, by pointer id, in CSS pixels (a mouse is never in here).
+const touches = new Map<number, { x: number; y: number }>();
+
+// Zoom to `next`, keeping the field point under the CSS pixel (cx, cy) where it is.
+function zoomAt(next: number, cx: number, cy: number) {
+  const wx = Math.floor(cx / scale) + camX, wy = Math.floor(cy / scale) + camY;
+  scale = next;
+  resize();
+  updatePointer();
+  camX = wx - Math.floor(cx / scale);
+  camY = wy - Math.floor(cy / scale);
+}
+
+// A second finger ends whatever the first was doing and starts a pinch.
+function startPinch() {
+  const [a, b] = [...touches.values()];
+  if (mode.k === 'drag') mode.d.up?.();
+  const mx0 = (a.x + b.x) / 2, my0 = (a.y + b.y) / 2;
+  mode = { k: 'pinch', d0: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)), s0: scale, wx: mx0 / scale + camX, wy: my0 / scale + camY };
+}
+
+function movePinch(m: Mode & { k: 'pinch' }) {
+  const [a, b] = [...touches.values()];
+  const d = Math.hypot(a.x - b.x, a.y - b.y), mx1 = (a.x + b.x) / 2, my1 = (a.y + b.y) / 2;
+  const next = Math.min(6, Math.max(1, Math.round((m.s0 * d) / m.d0)));
+  if (next !== scale) { scale = next; resize(); updatePointer(); }
+  camX = Math.round(m.wx - mx1 / scale);
+  camY = Math.round(m.wy - my1 / scale);
+}
 
 function toFront(m: Mod) {
   eng.mods = eng.mods.filter((x) => x !== m);
@@ -468,6 +508,11 @@ canvas.addEventListener('pointerdown', (e) => {
   setPointer(e);
   canvas.setPointerCapture(e.pointerId);
   void ac.resume();
+  if (e.pointerType === 'touch') {
+    touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (touches.size === 2) { startPinch(); return; }
+    if (touches.size > 2) return;
+  }
   if (e.button === 1) { mode = { k: 'pan', sx: mx, sy: my, cx: camX, cy: camY }; return; }
   if (namePrompt) { namePrompt = null; return; }
   // In help mode a right-click just leaves it.
@@ -566,6 +611,8 @@ canvas.addEventListener('pointerdown', (e) => {
 });
 
 canvas.addEventListener('pointermove', (e) => {
+  if (touches.has(e.pointerId)) touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (mode.k === 'pinch') { if (touches.size >= 2) movePinch(mode); return; }
   setPointer(e);
   const wx = mx + camX, wy = my + camY;
   switch (mode.k) {
@@ -614,8 +661,25 @@ function endPointer() {
   checkpoint();
 }
 
-canvas.addEventListener('pointerup', (e) => { setPointer(e); endPointer(); });
-canvas.addEventListener('pointercancel', endPointer);
+function pointerEnd(e: PointerEvent) {
+  touches.delete(e.pointerId);
+  if (mode.k === 'pinch') {
+    const rest = [...touches.values()];
+    if (rest.length >= 2) startPinch(); // a third finger left: carry on with the two that stay
+    else if (rest.length) {
+      // Pinch becomes a one-finger pan with the finger that stays.
+      const r = rest[0];
+      mode = { k: 'pan', sx: Math.floor(r.x / scale), sy: Math.floor(r.y / scale), cx: camX, cy: camY };
+    } else mode = { k: 'none' };
+    return;
+  }
+  // The remaining finger of a finished pinch is already panning; another lifting is noise.
+  if (e.pointerType === 'touch' && touches.size && mode.k !== 'none') return;
+  if (e.type === 'pointerup') setPointer(e);
+  endPointer();
+}
+canvas.addEventListener('pointerup', pointerEnd);
+canvas.addEventListener('pointercancel', pointerEnd);
 
 let wheelAcc = 0, wheelTimer = 0;
 canvas.addEventListener('wheel', (e) => {
@@ -636,13 +700,7 @@ canvas.addEventListener('wheel', (e) => {
   const next = Math.min(6, Math.max(1, scale - Math.sign(wheelAcc)));
   wheelAcc = 0;
   if (next === scale) return;
-  // Keep the field point under the cursor fixed.
-  const wx = mx + camX, wy = my + camY;
-  scale = next;
-  resize();
-  updatePointer();
-  camX = wx - mx;
-  camY = wy - my;
+  zoomAt(next, clientX, clientY);
 }, { passive: false });
 
 addEventListener('keydown', (e) => {
@@ -838,6 +896,7 @@ addEventListener('keyup', (e) => {
 // Don't leave notes hanging when the window loses focus mid-press.
 addEventListener('blur', () => {
   for (const m of eng.mods) m.allOff();
+  touches.clear();
 });
 
 addEventListener('resize', resize);
@@ -1005,13 +1064,15 @@ function cycleWires() {
   showToast(['WIRES SHOWN', 'WIRES DIMMED', 'WIRES HIDDEN'][wires]);
 }
 
-// Zoom out (down to 2x) until the whole patch fits below the toolbar, then centre it.
+// Zoom out (down to 2x, or 1x on a phone) until the whole patch fits below the toolbar,
+// then centre it.
 function fitView() {
   const mods = shown();
   if (!mods.length) { camX = 0; camY = -barWorld(); return; }
   const x0 = Math.min(...mods.map((m) => m.x)), x1 = Math.max(...mods.map((m) => m.x + m.w));
   const y0 = Math.min(...mods.map((m) => m.y - (m.label ? LABEL_H : 0))), y1 = Math.max(...mods.map((m) => m.y + m.h));
-  for (scale = uiScale; scale > 2; scale--) {
+  const min = innerWidth < 1000 ? 1 : 2;
+  for (scale = uiScale; scale > min; scale--) {
     resize();
     if (x1 - x0 + 12 <= W && y1 - y0 + 20 <= H - barWorld()) break;
   }
@@ -1346,7 +1407,7 @@ function frame() {
   if (am && item) {
     const kind = item.spawn ? KINDS.find((k) => k.type === item.spawn) : null;
     if (kind && HELP[kind.type]) {
-      const iy = am.y + 1 + am.items.indexOf(item) * MENU_ROW;
+      const iy = menuItemPos(am, am.items.indexOf(item)).y;
       drawHelp({ title: kind.label, col: CAT[kind.cat].bar, text: HELP[kind.type].text }, am.x + am.w + 4, iy, am.x - 4);
     }
   } else if (helpMode && mode.k === 'none') {

@@ -2,7 +2,8 @@ import { ac } from './audio';
 import { Engine, type Cable } from './engine';
 import { C, Gfx, textWidth } from './gfx';
 import { CAT, TYPEC, compatible, type Cat, type Drag, type Knob, type Mod, type Port } from './mod';
-import { KINDS, type Kind } from './modules';
+import { LABEL_H } from './render';
+import { KINDS, Submodule, buildLevel, freshKeys, levelData, subHooks, type Kind } from './modules';
 import { PATCHES, migrate, type PatchData } from './patches';
 import { cablePoints, drawButton, drawCable, drawFlow, drawModule, plug } from './render';
 import { BAR_HELP, CABLE_HELP, HELP, MODULE_HOW, jackHelp, knobHelp } from './help';
@@ -56,7 +57,18 @@ const HELP_CURSOR = (() => {
   return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 0 0, help`;
 })();
 let clipboard: PatchData | null = null;
-let namePrompt: { text: string; done: (name: string) => void } | null = null;
+// The SUBMODULE being edited (null: the top level). Only its modules and cables are
+// drawn and can be touched; everything keeps playing, inside or not.
+let view: Submodule | null = null;
+const shown = () => eng.mods.filter((m) => m.parent === view);
+const shownCables = () => eng.cables.filter((c) => c.a.parent === view);
+// Each level remembers where its camera was.
+const cams = new Map<string, { x: number; y: number; s: number }>();
+const camKey = (v: Submodule | null) => v?.subKey ?? '';
+// A one-line text prompt: saving a patch, or a module's label (where empty is allowed).
+let namePrompt: { text: string; title: string; ok: string; empty?: boolean; done: (name: string) => void } | null = null;
+// LABEL tool: clicking a module names it (or edits or removes its name).
+let labelMode = false;
 // The knob waiting for a MIDI control to be moved (Alt+click a knob to map it).
 let learn: { m: Mod; kn: Knob } | null = null;
 // Help mode (the HELP button or ?): hovering anything explains it.
@@ -96,6 +108,7 @@ function updatePointer() {
 interface MenuItem {
   label: string; col: string; text: string;
   act?: () => void;
+  shift?: () => void; // shift+click action
   spawn?: string;
   header?: boolean; // a non-clickable section title
   del?: () => void; // right-click action
@@ -105,6 +118,7 @@ interface Btn {
   col: string; text: string; hi: string;
   act?: () => void;
   menu?: MenuItem[];
+  br?: boolean; // starts a new row
 }
 let bar: Btn[] = [];
 let barH = 13;
@@ -128,27 +142,80 @@ function layoutBar() {
     { label: 'PATCHES', col: C.silver, text: C.ink, hi: C.white, menu: patchesMenu() },
     ...cats.map((cat) => ({
       label: CAT[cat].name, col: CAT[cat].bar, text: C.white, hi: CAT[cat].cap,
-      menu: KINDS.filter((k) => k.cat === cat).map((k) => ({ label: k.label, col: CAT[cat].bar, text: C.white, spawn: k.type })),
+      menu: cat === 'sub' ? subMenu() : KINDS.filter((k) => k.cat === cat).map((k) => ({ label: k.label, col: CAT[cat].bar, text: C.white, spawn: k.type })),
     })),
-    { label: 'UNDO', col: C.silver, text: C.ink, hi: C.white, act: undo },
-    { label: 'REDO', col: C.silver, text: C.ink, hi: C.white, act: redo },
-    { label: 'WIRES', col: [C.silver, C.slate, C.dark][wires], text: wires === 2 ? C.silver : C.ink, hi: C.white, act: cycleWires },
-    { label: 'SHARE', col: C.silver, text: C.ink, hi: C.white, act: () => void share() },
-    { label: 'CLEAR', col: C.silver, text: C.ink, hi: C.white, act: () => eng.clear() },
+    // Lit while the LABEL tool is on, so it is clear why clicks name modules.
+    { label: 'EDIT', col: labelMode ? C.yellow : C.silver, text: C.ink, hi: C.white, menu: editMenu() },
     { label: '?', col: helpMode ? C.yellow : C.silver, text: C.ink, hi: C.white, act: toggleHelp },
+    ...crumbs(),
   ];
   bar = [];
   let x = 2, y = 2;
   for (const it of items) {
     const w = textWidth(it.label) + (it.menu ? 14 : 8);
-    if (x + w > UW - 2 && x > 2) { x = 2; y += 11; }
+    if ((x + w > UW - 2 || it.br) && x > 2) { x = 2; y += 11; }
     bar.push({ ...it, x, y, w });
     x += w + 2;
     // Small gaps separate transport, patches, modules and the rest.
-    if (it.act === togglePlay || it.label === 'PATCHES' || it.label === CAT[cats[cats.length - 1]].name || it.label === 'CLEAR') x += 6;
+    if (it.act === togglePlay || it.label === 'PATCHES' || it.label === CAT[cats[cats.length - 1]].name) x += 6;
   }
   barH = y + 12;
 }
+
+// Inside a SUBMODULE, a second row: BACK, then the way down from the top (click one to go there).
+function crumbs(): Omit<Btn, 'x' | 'y' | 'w'>[] {
+  if (!view) return [];
+  const chain: (Submodule | null)[] = [null];
+  for (let v: Submodule | null = view; v; v = v.parent instanceof Submodule ? v.parent : null) chain.splice(1, 0, v);
+  return [
+    { label: 'BACK', col: C.sky, text: C.ink, hi: C.white, act: () => enter(view!.parent instanceof Submodule ? view!.parent : null), br: true },
+    ...chain.map((v) => ({
+      label: v ? v.label || 'SUBMODULE' : 'PATCH', col: v === view ? C.yellow : C.slate, text: v === view ? C.ink : C.white, hi: C.white,
+      act: () => enter(v),
+    })),
+  ];
+}
+
+// A new SUBMODULE anywhere; inside one, also the IN, OUT and KNOB that make its panel.
+// NEW, saving what is being edited as a submodule of your own, and inside a SUBMODULE
+// the IN, OUT and KNOB that make its panel. Under a line: your saved submodules (click
+// adds one, right-click deletes it).
+function subMenu(): MenuItem[] {
+  const item = (type: string, label: string): MenuItem => ({ label, col: CAT.sub.bar, text: C.white, spawn: type });
+  return [
+    item('sub', 'NEW SUBMODULE'),
+    { label: view ? 'SAVE THIS SUBMODULE...' : 'SAVE PATCH AS SUBMODULE...', col: CAT.sub.bar, text: C.white, act: askSubName },
+    ...(view ? [
+      { label: 'FOR THIS SUBMODULE', col: C.ink, text: C.slate, header: true },
+      item('subin', 'IN - A JACK INTO IT'),
+      item('subout', 'OUT - A JACK OUT OF IT'),
+      item('subknob', 'KNOB - A KNOB ON IT'),
+    ] : []),
+    ...(subLib.length ? [{ label: '', col: C.ink, text: C.slate, header: true }] : []),
+    ...subLib.map((e): MenuItem => ({
+      label: e.name, col: C.sky, text: C.ink,
+      act: () => addAsSub(e.data, e.name),
+      del: () => {
+        writeSubs(subLib.filter((x) => x !== e));
+        showToast(`DELETED SUBMODULE ${e.name}`);
+      },
+    })),
+  ];
+}
+
+// Go into a SUBMODULE (or up to the top level, null), keeping each level's camera.
+function enter(v: Submodule | null) {
+  if (v === view) return;
+  cams.set(camKey(view), { x: camX, y: camY, s: scale });
+  view = v;
+  selected.clear();
+  selCable = null;
+  openMenu = null;
+  const cam = cams.get(camKey(v));
+  if (cam) { scale = cam.s; resize(); camX = cam.x; camY = cam.y; }
+  else fitView();
+}
+subHooks.open = (m) => enter(m);
 
 const MENU_ROW = 10;
 const openBtn = () => bar.find((b) => b.label === openMenu && b.menu);
@@ -199,7 +266,9 @@ function drawBar() {
       const y = r.y + 1 + i * MENU_ROW;
       if (m.header) {
         ui.rect(r.x + 1, y, r.w - 2, MENU_ROW, C.ink);
-        ui.text(m.label, r.x + 4, y + 3, C.slate);
+        // A header without a title is a dividing line.
+        if (m.label) ui.text(m.label, r.x + 4, y + 3, C.slate);
+        else ui.rect(r.x + 4, y + Math.floor(MENU_ROW / 2), r.w - 8, 1, C.slate);
         return;
       }
       if (m === hi) ui.rect(r.x + 1, y, r.w - 2, MENU_ROW, m.col);
@@ -222,10 +291,12 @@ type Hit =
   | { k: 'body'; m: Mod; lx: number; ly: number }
   | { k: 'none' };
 
+// A module covers its panel and, when labelled, the label bar above it.
 function modAt(wx: number, wy: number) {
-  for (let i = eng.mods.length - 1; i >= 0; i--) {
-    const m = eng.mods[i];
-    if (wx >= m.x && wx < m.x + m.w && wy >= m.y && wy < m.y + m.h) return m;
+  const mods = shown();
+  for (let i = mods.length - 1; i >= 0; i--) {
+    const m = mods[i];
+    if (wx >= m.x && wx < m.x + m.w && wy >= m.y - (m.label ? LABEL_H : 0) && wy < m.y + m.h) return m;
   }
   return undefined;
 }
@@ -313,8 +384,9 @@ function pruneMeters() {
 }
 
 function cableAt(wx: number, wy: number, r: number) {
-  for (let i = eng.cables.length - 1; i >= 0; i--) {
-    const c = eng.cables[i];
+  const cables = shownCables();
+  for (let i = cables.length - 1; i >= 0; i--) {
+    const c = cables[i];
     for (const [x, y] of cablePoints(...cableEnds(c))) {
       if (Math.abs(wx - x - 0.5) <= r && Math.abs(wy - y - 0.5) <= r) return c;
     }
@@ -332,7 +404,7 @@ function canPlug(a: Port, b: Port) {
 // Nearest port that the dragged cable end could plug into.
 function dropTarget(from: { m: Mod; p: Port }, wx: number, wy: number) {
   let best: { m: Mod; p: Port } | null = null, bd = 9;
-  for (const m of eng.mods) {
+  for (const m of shown()) {
     for (const p of m.ports) {
       if (!canPlug(from.p, p)) continue;
       const [x, y] = jackPos(m, p);
@@ -375,6 +447,7 @@ function placeInView(m: Mod) {
 // New modules hang off the cursor; a plain click drops them in the middle of the view.
 function spawn(type: string) {
   const m = KINDS.find((k) => k.type === type)!.make(eng);
+  m.parent = view;
   m.x = mx + camX - 12;
   m.y = my + camY - 4;
   eng.add(m);
@@ -400,6 +473,10 @@ canvas.addEventListener('pointerdown', (e) => {
   // In help mode a right-click just leaves it.
   if (helpMode && e.button === 2) { helpMode = false; return; }
   const h = hitTest();
+  if (labelMode && h.k !== 'bar' && h.k !== 'menu') {
+    if (e.button === 2) { labelMode = false; return; }
+    if ('m' in h && h.m) { editLabel(h.m); return; }
+  }
 
   if (h.k === 'menu' && (h.item.header || (e.button === 2 && h.item.del))) {
     if (e.button === 2) h.item.del!();
@@ -411,6 +488,7 @@ canvas.addEventListener('pointerdown', (e) => {
     popup = null;
     if (h.k === 'menu') {
       if (h.item.spawn) spawn(h.item.spawn);
+      else if (e.shiftKey && h.item.shift) h.item.shift();
       else h.item.act?.();
     } else if (h.k === 'bar' && h.b.menu && h.b.label !== was) {
       openMenu = h.b.label;
@@ -464,15 +542,17 @@ canvas.addEventListener('pointerdown', (e) => {
       return;
     }
     case 'body': {
+      // The label bar (above the panel) only moves and selects the module.
+      const panel = h.ly >= 0;
       if (e.shiftKey) {
-        if (h.m.pressShift(h.lx, h.ly)) return;
+        if (panel && h.m.pressShift(h.lx, h.ly)) return;
         if (!selected.delete(h.m)) selected.add(h.m);
         return;
       }
-      if (e.altKey && h.m.pressAlt(h.lx, h.ly)) return;
+      if (panel && e.altKey && h.m.pressAlt(h.lx, h.ly)) return;
       if (!selected.has(h.m)) { selected.clear(); selected.add(h.m); }
       toFront(h.m);
-      const d = h.m.press(h.lx, h.ly);
+      const d = panel ? h.m.press(h.lx, h.ly) : null;
       if (d) { mode = { k: 'drag', m: h.m, d }; return; }
       const group = [...selected].filter((s) => s !== h.m).map((s) => ({ m: s, ox: s.x - h.m.x, oy: s.y - h.m.y }));
       mode = { k: 'move', m: h.m, dx: h.lx, dy: h.ly, sx: mx, sy: my, spawned: false, moved: false, group };
@@ -528,7 +608,7 @@ function endPointer() {
   if (mode.k === 'box') {
     const [x0, x1] = [Math.min(mode.x0, mx + camX), Math.max(mode.x0, mx + camX)];
     const [y0, y1] = [Math.min(mode.y0, my + camY), Math.max(mode.y0, my + camY)];
-    for (const m of eng.mods) if (m.x < x1 && m.x + m.w > x0 && m.y < y1 && m.y + m.h > y0) selected.add(m);
+    for (const m of shown()) if (m.x < x1 && m.x + m.w > x0 && m.y < y1 && m.y + m.h > y0) selected.add(m);
   }
   mode = { k: 'none' };
   checkpoint();
@@ -575,7 +655,7 @@ addEventListener('keydown', (e) => {
       c: () => { clipboard = copyData(); },
       v: () => { if (clipboard) pasteData(clipboard, true); },
       d: () => { const d = copyData(); if (d) pasteData(d, false); },
-      a: () => { for (const m of eng.mods) selected.add(m); },
+      a: () => { for (const m of shown()) selected.add(m); },
       s: askName,
     };
     if (act[key]) {
@@ -601,7 +681,22 @@ addEventListener('keydown', (e) => {
     togglePlay();
   }
   if (e.key === '?' || e.code === 'F1') { e.preventDefault(); toggleHelp(); return; }
-  if (e.code === 'Escape') { openMenu = null; popup = null; learn = null; helpMode = false; selected.clear(); selCable = null; }
+  // F3 shows, dims or hides the cables.
+  if (e.code === 'F3') { e.preventDefault(); cycleWires(); return; }
+  // F2, the usual rename key: label the module under the pointer, or toggle the LABEL tool.
+  if (e.code === 'F2') {
+    e.preventDefault();
+    const h = hitTest();
+    if ('m' in h && h.m) editLabel(h.m);
+    else toggleLabel();
+    return;
+  }
+  if (e.code === 'Escape') {
+    // With nothing else to cancel, Esc leaves the SUBMODULE.
+    const busy = openMenu || popup || learn || helpMode || labelMode || selected.size || selCable;
+    openMenu = null; popup = null; learn = null; helpMode = false; labelMode = false; selected.clear(); selCable = null;
+    if (!busy && view) enter(view.parent instanceof Submodule ? view.parent : null);
+  }
   if (e.code === 'Delete' || e.code === 'Backspace') {
     const h = hitTest();
     if (selCable) eng.disconnect(selCable);
@@ -619,7 +714,7 @@ function promptKey(e: KeyboardEvent) {
   if (e.key === 'Escape') namePrompt = null;
   else if (e.key === 'Enter') {
     namePrompt = null;
-    if (p.text.trim()) p.done(p.text.trim());
+    if (p.text.trim() || p.empty) p.done(p.text.trim());
   } else if (e.key === 'Backspace') p.text = p.text.slice(0, -1);
   else if (e.key.length === 1 && /[a-z0-9 #!?.,:+\-_]/i.test(e.key) && p.text.length < 18) p.text += e.key.toUpperCase();
 }
@@ -678,7 +773,8 @@ function portsOf(kind: Kind) {
 // Every module with a jack the cable fits, preferring jacks of the same signal type
 // (so an audio cable offers effects and mixers, not every CV input).
 function openPicker(from: { m: Mod; p: Port }, wx: number, wy: number) {
-  const fits = KINDS.flatMap((kind) => {
+  // IN, OUT and KNOB only make sense inside a SUBMODULE.
+  const fits = KINDS.filter((k) => view || !k.type.startsWith('sub') || k.type === 'sub').flatMap((kind) => {
     const ok = portsOf(kind).filter((p) => canPlug(from.p, p));
     const p = ok.find((p) => p.type === from.p.type) ?? ok[0];
     return p ? [{ kind, p }] : [];
@@ -699,6 +795,7 @@ function openPicker(from: { m: Mod; p: Port }, wx: number, wy: number) {
 // Place the new module so the chosen jack sits where the cable was dropped.
 function spawnConnected(kind: Kind, port: Port, from: { m: Mod; p: Port }, wx: number, wy: number) {
   const m = kind.make(eng);
+  m.parent = view;
   m.x = Math.round(wx - port.x - 4);
   m.y = Math.round(wy - port.y - 4);
   eng.add(m);
@@ -716,7 +813,7 @@ function copyData(): PatchData | null {
   const mods = selected.size ? [...selected] : h.k === 'body' || h.k === 'knob' || h.k === 'port' ? [h.m] : [];
   if (!mods.length) return null;
   const ids = new Set(mods.map((m) => m.id));
-  const all = serialize();
+  const all = levelData(eng, view);
   return {
     mods: all.mods.filter((m) => ids.has(m.id)),
     cables: all.cables.filter((c) => ids.has(c.a) && ids.has(c.b)),
@@ -727,7 +824,9 @@ function copyData(): PatchData | null {
 function pasteData(data: PatchData, atMouse: boolean) {
   const x0 = Math.min(...data.mods.map((m) => m.x)), y0 = Math.min(...data.mods.map((m) => m.y));
   const dx = atMouse ? mx + camX - x0 : 16, dy = atMouse ? my + camY - y0 : 16;
-  const added = addPatch(JSON.parse(JSON.stringify(data)), dx, dy);
+  const copy = JSON.parse(JSON.stringify(data)) as PatchData;
+  freshKeys(copy);
+  const added = addPatch(copy, dx, dy, view);
   selected.clear();
   for (const m of added) selected.add(m);
 }
@@ -745,45 +844,40 @@ addEventListener('resize', resize);
 
 // ---------------------------------------------------------------- patches
 
-function serialize(): PatchData {
-  return {
-    mods: eng.mods.map((m) => ({
-      id: m.id, type: m.type, x: m.x, y: m.y, p: m.p, s: m.save(),
-      ...(Object.keys(m.cc).length ? { cc: { ...m.cc } } : {}),
-    })),
-    cables: eng.cables.map((c) => ({ a: c.a.id, ap: c.ap, b: c.b.id, bp: c.bp })),
-  };
-}
+// The whole patch: the top level, with every SUBMODULE's insides in its state.
+function serialize(): PatchData { return levelData(eng, null); }
 
+// Load a patch in place of the current one, at its top level.
 function loadPatch(data: PatchData) {
   eng.clear();
   selected.clear();
   selCable = null;
-  addPatch(data, 0, 0);
+  view = null;
+  cams.clear();
+  addPatch(data, 0, 0, null);
 }
 
-// Adds a patch's modules and cables to the field, shifted by dx/dy.
-function addPatch(old: PatchData, dx: number, dy: number) {
+// Adds a patch's modules and cables to a level (the top, or a SUBMODULE), shifted by dx/dy.
+function addPatch(old: PatchData, dx: number, dy: number, parent: Submodule | null) {
   const { data, dropped } = migrate(old);
   if (dropped) showToast('KEYS AND MELODY SHARED A VOICE - UNPLUGGED ONE, PATCH IT TO ITS OWN');
-  const byId = new Map<number, Mod>();
-  for (const d of data.mods) {
-    const kind = KINDS.find((k) => k.type === d.type);
-    if (!kind) continue;
-    const m = kind.make(eng);
-    m.x = d.x + dx;
-    m.y = d.y + dy;
-    for (const [k, v] of Object.entries(d.p ?? {})) if (k in m.p && typeof v === 'number') m.set(k, v);
-    if (d.s !== undefined) m.load(d.s);
-    for (const [k, v] of Object.entries(d.cc ?? {})) if (k in m.p && typeof v === 'number') m.cc[k] = v;
-    eng.add(m);
-    byId.set(d.id, m);
-  }
-  for (const c of data.cables) {
-    const a = byId.get(c.a), b = byId.get(c.b);
-    if (a && b) eng.connect(a, c.ap, b, c.bp);
-  }
-  return [...byId.values()];
+  return buildLevel(eng, data, parent, dx, dy);
+}
+
+// A whole patch as one SUBMODULE in the level being edited, named after it.
+function addAsSub(data: PatchData, name: string) {
+  const sub = new Submodule(eng);
+  sub.parent = view;
+  sub.label = name.slice(0, 18);
+  placeInView(sub);
+  eng.add(sub);
+  const copy = JSON.parse(JSON.stringify(data)) as PatchData;
+  freshKeys(copy);
+  addPatch(copy, 0, 0, sub);
+  selected.clear();
+  selected.add(sub);
+  checkpoint();
+  showToast(`${sub.label} IS A SUBMODULE NOW - OPEN IT, ADD IN, OUT AND KNOB`);
 }
 
 // ---------------------------------------------------------------- library & files
@@ -808,9 +902,40 @@ function writeLibrary(next: LibEntry[]) {
   }
 }
 
+// Your own submodules, for the SUBMODULE menu: saved like patches, in their own list.
+const SUB_KEY = 'pixel-modular.submodules.v1';
+let subLib: LibEntry[] = (() => {
+  try { return JSON.parse(localStorage.getItem(SUB_KEY) ?? '[]') as LibEntry[]; } catch { return []; }
+})();
+
+function writeSubs(next: LibEntry[]) {
+  try {
+    localStorage.setItem(SUB_KEY, JSON.stringify(next));
+    subLib = next;
+    return true;
+  } catch {
+    showToast('COULD NOT SAVE - STORAGE FULL OR BLOCKED');
+    return false;
+  }
+}
+
+// Save what is being edited (the whole patch, or the SUBMODULE you are in) to the menu.
+function askSubName() {
+  namePrompt = {
+    text: view?.label ?? '', title: 'SAVE AS SUBMODULE:', ok: 'ENTER SAVE - ESC CANCEL',
+    done: (name) => {
+      const data = levelData(eng, view);
+      if (!data.mods.length) { showToast('NOTHING TO SAVE HERE YET'); return; }
+      if (writeSubs([...subLib.filter((e) => e.name !== name), { name, data }])) {
+        showToast(`${name} IS IN THE SUBMODULE MENU - RIGHT-CLICK IT THERE TO DELETE`);
+      }
+    },
+  };
+}
+
 function askName() {
   namePrompt = {
-    text: '',
+    text: '', title: 'SAVE PATCH AS:', ok: 'ENTER SAVE - ESC CANCEL',
     done: (name) => {
       if (writeLibrary([{ name, data: serialize() }, ...library.filter((e) => e.name !== name)])) {
         showToast(`SAVED AS ${name} - RIGHT CLICK IT IN PATCHES TO DELETE`);
@@ -819,16 +944,28 @@ function askName() {
   };
 }
 
+// Editing tools that don't need a button of their own.
+function editMenu(): MenuItem[] {
+  const item = (label: string, act: () => void): MenuItem => ({ label, col: C.silver, text: C.ink, act });
+  return [
+    item('UNDO (CTRL+Z)', undo),
+    item('REDO (CTRL+SHIFT+Z)', redo),
+    item(labelMode ? 'LABEL: ON - CLICK MODULES' : 'LABEL MODULES (F2)', toggleLabel),
+    item(`WIRES: ${['SHOWN', 'DIMMED', 'HIDDEN'][wires]} (F3)`, cycleWires),
+  ];
+}
+
 function patchesMenu(): MenuItem[] {
   const item = (label: string, act: () => void, col: string = C.yellow): MenuItem => ({ label, col, text: C.ink, act });
   const header = (label: string): MenuItem => ({ label, col: C.ink, text: C.slate, header: true });
   const load = (data: PatchData) => () => { loadPatch(data); fitView(); };
   return [
     header('EXAMPLES'),
-    ...PATCHES.map((p) => item(p.name, () => load(p.build())())),
+    ...PATCHES.map((p) => ({ ...item(p.name, () => load(p.build())()), shift: () => addAsSub(p.build(), p.name) })),
     ...(library.length ? [header('MY PATCHES')] : []),
     ...library.map((e) => ({
       ...item(e.name, load(e.data), C.lime),
+      shift: () => addAsSub(e.data, e.name),
       del: () => {
         writeLibrary(library.filter((x) => x !== e));
         showToast(`DELETED ${e.name}`);
@@ -836,12 +973,16 @@ function patchesMenu(): MenuItem[] {
     })),
     header('FILE'),
     item('SAVE AS... (CTRL+S)', askName, C.silver),
+    item('SHARE LINK', () => void share(), C.silver),
     item('EXPORT .JSON', () => download(new Blob([JSON.stringify(serialize())], { type: 'application/json' }), `patch-${stamp()}.json`), C.silver),
-    item('IMPORT .JSON', () => fileInput.click(), C.silver),
+    item('IMPORT .JSON', () => { importAsSub = false; fileInput.click(); }, C.silver),
+    item('IMPORT AS SUBMODULE', () => { importAsSub = true; fileInput.click(); }, C.silver),
   ];
 }
 
 const fileInput = Object.assign(document.createElement('input'), { type: 'file', accept: '.json,application/json' });
+// IMPORT AS SUBMODULE: the file becomes one box instead of replacing the patch.
+let importAsSub = false;
 fileInput.addEventListener('change', async () => {
   const file = fileInput.files?.[0];
   fileInput.value = '';
@@ -849,6 +990,7 @@ fileInput.addEventListener('change', async () => {
   try {
     const data = JSON.parse(await file.text()) as PatchData;
     if (!Array.isArray(data.mods) || !Array.isArray(data.cables)) throw new Error('not a patch');
+    if (importAsSub) { addAsSub(data, file.name.replace(/\.json$/i, '').toUpperCase()); return; }
     loadPatch(data);
     fitView();
     checkpoint();
@@ -865,9 +1007,10 @@ function cycleWires() {
 
 // Zoom out (down to 2x) until the whole patch fits below the toolbar, then centre it.
 function fitView() {
-  if (!eng.mods.length) { camX = 0; camY = -barWorld(); return; }
-  const x0 = Math.min(...eng.mods.map((m) => m.x)), x1 = Math.max(...eng.mods.map((m) => m.x + m.w));
-  const y0 = Math.min(...eng.mods.map((m) => m.y)), y1 = Math.max(...eng.mods.map((m) => m.y + m.h));
+  const mods = shown();
+  if (!mods.length) { camX = 0; camY = -barWorld(); return; }
+  const x0 = Math.min(...mods.map((m) => m.x)), x1 = Math.max(...mods.map((m) => m.x + m.w));
+  const y0 = Math.min(...mods.map((m) => m.y - (m.label ? LABEL_H : 0))), y1 = Math.max(...mods.map((m) => m.y + m.h));
   for (scale = uiScale; scale > 2; scale--) {
     resize();
     if (x1 - x0 + 12 <= W && y1 - y0 + 20 <= H - barWorld()) break;
@@ -910,7 +1053,10 @@ function checkpoint() {
 }
 
 function restoreSnap(s: string) {
+  const key = view?.subKey, cam = { x: camX, y: camY };
   loadPatch(JSON.parse(s));
+  const back = key ? eng.mods.find((m): m is Submodule => m instanceof Submodule && m.subKey === key) : undefined;
+  if (back) { view = back; camX = cam.x; camY = cam.y; }
   current = snap();
   currentKey = changeKey(current);
 }
@@ -1013,6 +1159,7 @@ const TIPS = [
   'ALT+CLICK A KNOB, THEN MOVE A MIDI CONTROL TO MAP IT - ALT+CLICK AGAIN TO UNMAP',
   'THE + IN A MODULE TITLE OPENS ITS ADVANCED LAYOUT - MIXER GOES BIG',
   'PRESS ? (OR THE ? BUTTON) AND HOVER ANYTHING TO SEE WHAT IT DOES',
+  'SUBMODULE: A PATCH IN A BOX - DOUBLE-CLICK TO OPEN, ESC TO COME BACK OUT',
 ];
 
 // ---------------------------------------------------------------- help panel
@@ -1076,15 +1223,31 @@ function drawHelp(card: HelpCard, x: number, y: number, left = x) {
   }
 }
 
-function drawPrompt(text: string, blink: boolean) {
-  const w = 120, h = 34, x = Math.floor((UW - w) / 2), y = Math.floor((UH - h) / 2);
+function drawPrompt(p: NonNullable<typeof namePrompt>, blink: boolean) {
+  const w = Math.max(120, textWidth(p.ok) + 10), h = 34, x = Math.floor((UW - w) / 2), y = Math.floor((UH - h) / 2);
   ui.rect(x + 2, y + 2, w, h, C.black);
   ui.rect(x, y, w, h, C.black);
   ui.rect(x + 1, y + 1, w - 2, h - 2, C.dark);
-  ui.text('SAVE PATCH AS:', x + 5, y + 5, C.white);
+  ui.text(p.title, x + 5, y + 5, C.white);
   ui.rect(x + 4, y + 12, w - 8, 9, C.black);
-  ui.text(text + (blink ? '_' : ''), x + 6, y + 14, C.yellow);
-  ui.text('ENTER SAVE - ESC CANCEL', x + 5, y + 25, C.slate);
+  ui.text(p.text + (blink ? '_' : ''), x + 6, y + 14, C.yellow);
+  ui.text(p.ok, x + 5, y + 25, C.slate);
+}
+
+// ---------------------------------------------------------------- labels
+
+function toggleLabel() {
+  labelMode = !labelMode;
+  helpMode = false;
+  if (labelMode) showToast('LABEL - CLICK A MODULE TO NAME IT - ESC OR RIGHT-CLICK TO LEAVE');
+}
+
+// Name a module, or edit its name; an empty name removes the label.
+function editLabel(m: Mod) {
+  namePrompt = {
+    text: m.label, title: `LABEL FOR ${m.title}:`, ok: 'ENTER SETS - EMPTY REMOVES - ESC CANCELS', empty: true,
+    done: (text) => { m.label = text; m.parent?.childrenChanged(); eng.dirty = true; checkpoint(); },
+  };
 }
 
 function frame() {
@@ -1098,7 +1261,7 @@ function frame() {
 
   drawField();
 
-  for (const m of eng.mods) {
+  for (const m of shown()) {
     g.ox = m.x - camX;
     g.oy = m.y - camY;
     drawModule(g, m, h.k === 'close' && h.m === m, h.k === 'adv' && h.m === m);
@@ -1108,7 +1271,7 @@ function frame() {
   g.oy = -camY;
 
   meterFrame++;
-  for (const c of eng.cables) {
+  for (const c of shownCables()) {
     const [x0, y0, x1, y1] = cableEnds(c);
     const col = TYPEC[c.type];
     const lit = t - c.lit < 70 || (h.k === 'cable' && h.c === c);
@@ -1141,7 +1304,7 @@ function frame() {
     const from = mode;
     // Blink every jack that would accept this cable.
     if (blink) {
-      for (const m of eng.mods) for (const p of m.ports) {
+      for (const m of shown()) for (const p of m.ports) {
         if (canPlug(from.p, p)) g.frame(m.x + p.x - 1, m.y + p.y - 1, 11, 11, C.white);
       }
     }
@@ -1190,10 +1353,11 @@ function frame() {
     const card = helpFor(h);
     if (card) drawHelp(card, ux + 10, uy + 10, ux - 6);
   }
-  if (namePrompt) drawPrompt(namePrompt.text, blink);
+  if (namePrompt) drawPrompt(namePrompt, blink);
 
   canvas.style.cursor =
     helpMode && mode.k === 'none' ? HELP_CURSOR
+    : labelMode && mode.k === 'none' && 'm' in h ? 'text'
     : mode.k === 'move' || mode.k === 'pan' ? 'grabbing'
     : mode.k === 'knob' || h.k === 'knob' ? 'ns-resize'
     : mode.k === 'cable' || h.k === 'port' ? 'crosshair'

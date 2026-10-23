@@ -1,11 +1,11 @@
-// Sweetie-16 palette plus a near-black for outlines, and a darker orange (rust) and
-// green (moss) for title bars, so white text reads on them.
+// Sweetie-16 palette plus a near-black for outlines, and a darker green (moss) for
+// title bars, so white text reads on it.
 export const C = {
   ink: '#1a1c2c', plum: '#5d275d', red: '#b13e53', orange: '#ef7d57',
   yellow: '#ffcd75', lime: '#a7f070', green: '#38b764', teal: '#257179',
   navy: '#29366f', blue: '#3b5dc9', sky: '#41a6f6', cyan: '#73eff7',
   white: '#f4f4f4', silver: '#94b0c2', slate: '#566c86', dark: '#333c57',
-  black: '#0c0d18', rust: '#b5522a', moss: '#257d43',
+  black: '#0c0d18', moss: '#257d43',
 };
 
 // 3x5 bitmap font.

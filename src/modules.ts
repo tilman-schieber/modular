@@ -5,6 +5,7 @@ import { midi } from './midi';
 import { download, Recorder, stamp } from './rec';
 import { CvTap, Mod, PITCH_REF, velGain, type Cat, type Drag, type Ev, type KnobDef, type SigType } from './mod';
 import { drawButton } from './render';
+import type { PatchData } from './patches';
 
 const now = () => performance.now();
 // A CV of 1 moves a filter cutoff by three octaves.
@@ -2569,7 +2570,7 @@ export class Maths extends Mod {
   private high: Record<string, number> = {};
 
   constructor(e: Engine) {
-    super(e, 'maths', 'MATHS', 'pro', 160, 110);
+    super(e, 'maths', 'MATHS', 'mod', 160, 110);
     for (const [j, c] of ['1', '4'].entries()) {
       const left = j === 0, x = left ? [4, 19, 34] : [115, 130, 145];
       this.knob({ id: 'rise' + c, label: 'RIS', x: x[0] - 1, y: 13, min: 0, max: 1, def: 0.4, fmt: secFmt });
@@ -4250,6 +4251,238 @@ export class Crush extends Mod {
 
 // ---------------------------------------------------------------- registry
 
+// ---------------------------------------------------------------- SUBMODULE
+
+// One level of a patch, as saved: the modules whose parent is `parent` (null: the top
+// level) and the cables between them. A SUBMODULE inside saves its own level in its state.
+export function levelData(e: Engine, parent: Mod | null): PatchData {
+  const mods = e.mods.filter((m) => m.parent === parent), ids = new Set(mods);
+  return {
+    mods: mods.map((m) => ({
+      id: m.id, type: m.type, x: m.x, y: m.y, p: { ...m.p }, s: m.save(),
+      ...(Object.keys(m.cc).length ? { cc: { ...m.cc } } : {}),
+      ...(m.label ? { l: m.label } : {}),
+    })),
+    cables: e.cables.filter((c) => ids.has(c.a) && ids.has(c.b)).map((c) => ({ a: c.a.id, ap: c.ap, b: c.b.id, bp: c.bp })),
+  };
+}
+
+// Build a saved level into `parent`, shifted by dx/dy; returns the new modules.
+export function buildLevel(e: Engine, data: PatchData, parent: Mod | null, dx = 0, dy = 0) {
+  const byId = new Map<number, Mod>();
+  for (const d of data.mods) {
+    const kind = KINDS.find((k) => k.type === d.type);
+    if (!kind) continue;
+    const m = kind.make(e);
+    m.parent = parent;
+    m.x = d.x + dx;
+    m.y = d.y + dy;
+    for (const [k, v] of Object.entries(d.p ?? {})) if (k in m.p && typeof v === 'number') m.set(k, v);
+    if (d.s !== undefined) m.load(d.s);
+    for (const [k, v] of Object.entries(d.cc ?? {})) if (k in m.p && typeof v === 'number') m.cc[k] = v;
+    if (typeof d.l === 'string') m.label = d.l;
+    e.add(m);
+    byId.set(d.id, m);
+  }
+  for (const c of data.cables) {
+    const a = byId.get(c.a), b = byId.get(c.b);
+    if (a && b) e.connect(a, c.ap, b, c.bp);
+  }
+  return [...byId.values()];
+}
+
+// Each SUBMODULE has a key, saved with it, so undo can return to the one being edited.
+const newKey = () => Math.random().toString(36).slice(2, 10);
+
+// Copies get keys of their own, all the way down.
+export function freshKeys(data: PatchData) {
+  for (const m of data.mods) {
+    const s = m.s as SubState | undefined;
+    if (m.type === 'sub' && s?.d) { s.key = newKey(); freshKeys(s.d); }
+  }
+}
+
+interface SubState { key: string; d: PatchData }
+
+// The editor sets this, so a SUBMODULE's OPEN button can take you inside it.
+export const subHooks = { open: (_m: Submodule) => {} };
+
+const IO_TYPES: SigType[] = ['audio', 'cv', 'trig'];
+const IO_NAMES = ['AUD', 'CV', 'GAT'];
+
+// A box with a patch inside. It starts empty; OPEN (or a double-click) goes inside, where
+// IN, OUT and KNOB modules become its jacks and knobs: knobs along the top, inputs down
+// the left, outputs down the right, in the order they sit inside (top to bottom, then
+// left to right). Their labels name them on the box.
+export class Submodule extends Mod {
+  subKey = newKey();
+  private lastPress = 0;
+  private syncing = false;
+
+  constructor(e: Engine) {
+    super(e, 'sub', 'SUBMODULE', 'sub', 64, 44);
+  }
+
+  private children(): Mod[] { return this.eng.mods.filter((m) => m.parent === (this as Mod)); }
+  private io<T extends Mod>(cls: abstract new (e: Engine) => T): T[] {
+    return this.children().filter((m): m is T => m instanceof cls)
+      .sort((a, b) => a.y - b.y || a.x - b.x);
+  }
+
+  childrenChanged() {
+    // Each IN, OUT and KNOB keeps a slot number, so the box's jack ids stay the same.
+    for (const cls of [SubIn, SubOut, SubKnob]) {
+      const list: Mod[] = this.children().filter((m) => m instanceof cls), used = new Set<number>();
+      for (const m of list) {
+        if (!m.p.slot || used.has(m.p.slot)) m.p.slot = Math.max(0, ...list.map((x) => x.p.slot || 0), ...used) + 1;
+        used.add(m.p.slot);
+      }
+    }
+    const ins = this.io(SubIn), outs = this.io(SubOut), knobs = this.io(SubKnob);
+    const perRow = 4 + Math.max(0, Math.min(2, knobs.length - 4));
+    this.w = 4 + perRow * 15;
+    const kRows = Math.ceil(knobs.length / perRow), y0 = 13 + kRows * 20;
+    const rows = Math.max(ins.length, outs.length);
+    this.h = Math.max(44, y0 + rows * 19 + 14);
+    const name = (m: Mod, def: string) => (m.label || def).slice(0, 4);
+    this.syncing = true;
+    this.clearPanel();
+    knobs.forEach((k, i) => {
+      const id = 'k' + k.p.slot;
+      this.knob({ id, label: name(k, 'K' + k.p.slot).slice(0, 3), x: 4 + (i % perRow) * 15, y: 13 + Math.floor(i / perRow) * 20, min: 0, max: 1, def: 0.5, fmt: (v) => k.fmt(v) });
+      this.p[id] = k.p.val;
+    });
+    // Inset from the edges so four-letter names fit under the jacks.
+    ins.forEach((m, i) => this.port('i' + m.p.slot, name(m, 'IN' + m.p.slot), IO_TYPES[m.p.type], 'in', 7, y0 + i * 19));
+    outs.forEach((m, i) => this.port('o' + m.p.slot, name(m, 'OUT' + m.p.slot), IO_TYPES[m.p.type], 'out', this.w - 16, y0 + i * 19));
+    this.syncing = false;
+    this.fixCables();
+    this.eng.dirty = true;
+  }
+
+  // A knob on the box moves its KNOB inside, and the other way round.
+  onParam(id: string, v: number) {
+    if (this.syncing || !id.startsWith('k')) return;
+    const k = this.io(SubKnob).find((m) => 'k' + m.p.slot === id);
+    k?.set('val', v);
+  }
+
+  knobMoved(slot: number, v: number) { if (('k' + slot) in this.p) this.p['k' + slot] = v; }
+
+  private inFor(port: string): SubIn | undefined { return this.io(SubIn).find((m) => port === 'i' + m.p.slot); }
+  private outFor(port: string): SubOut | undefined { return this.io(SubOut).find((m) => port === 'o' + m.p.slot); }
+
+  audioIn(port: string): AudioNode | null { return this.inFor(port)?.node ?? null; }
+  audioOut(port: string): AudioNode | null { return this.outFor(port)?.node ?? null; }
+  onEvent(port: string, ev: Ev) { this.inFor(port)?.emit('out', ev); }
+
+  save(): SubState { return { key: this.subKey, d: levelData(this.eng, this) }; }
+
+  load(s: unknown) {
+    const st = s as Partial<SubState> | null;
+    if (st?.key) this.subKey = st.key;
+    if (st?.d) buildLevel(this.eng, st.d, this);
+    this.childrenChanged();
+  }
+
+  press(lx: number, ly: number): Drag | null {
+    const t = now(), dbl = t - this.lastPress < 300;
+    this.lastPress = t;
+    if (inBtn(lx, ly, this.openX, this.h - 12, 25) || dbl) { subHooks.open(this); return noDrag; }
+    return null;
+  }
+
+  private get openX() { return Math.floor((this.w - 25) / 2); }
+
+  drawBody(g: Gfx) {
+    const n: number = this.children().length;
+    if (!this.ports.length && !this.knobs.length) {
+      g.textC(n ? `${n} INSIDE` : 'EMPTY', Math.floor(this.w / 2), 18, C.slate);
+      g.textC('NO I/O YET', Math.floor(this.w / 2), 25, C.slate);
+    }
+    drawButton(g, this.openX, this.h - 12, 25, 'OPEN', C.sky);
+  }
+
+  destroy() {}
+}
+
+// IN, inside a SUBMODULE: a jack on the box (audio, CV or gate) whose signal comes out here.
+export class SubIn extends Mod {
+  node = ac.createGain();
+
+  constructor(e: Engine) {
+    super(e, 'subin', 'IN', 'sub', 50, 52);
+    this.p.slot = 0;
+    this.knob({ id: 'type', label: 'TYP', x: 6, y: 13, min: 0, max: 2, def: 0, names: IO_NAMES });
+    this.port('out', 'OUT', 'audio', 'out', 34, 32);
+  }
+
+  onParam(id: string) {
+    if (id !== 'type') return;
+    const p = this.ports.find((x) => x.id === 'out');
+    if (p) p.type = IO_TYPES[this.p.type];
+    this.fixCables();
+    this.parent?.childrenChanged();
+  }
+
+  audioOut() { return this.node; }
+  drawBody(g: Gfx) { g.text('FROM', 4, 34, C.slate); g.text('BOX', 4, 41, C.slate); }
+  destroy() { this.node.disconnect(); }
+}
+
+// OUT, inside a SUBMODULE: what is patched here comes out of a jack on the box.
+export class SubOut extends Mod {
+  node = ac.createGain();
+
+  constructor(e: Engine) {
+    super(e, 'subout', 'OUT', 'sub', 50, 52);
+    this.p.slot = 0;
+    this.knob({ id: 'type', label: 'TYP', x: 6, y: 13, min: 0, max: 2, def: 0, names: IO_NAMES });
+    this.port('in', 'IN', 'audio', 'in', 5, 32);
+  }
+
+  onParam(id: string) {
+    if (id !== 'type') return;
+    const p = this.ports.find((x) => x.id === 'in');
+    if (p) p.type = IO_TYPES[this.p.type];
+    this.fixCables();
+    this.parent?.childrenChanged();
+  }
+
+  audioIn() { return this.node; }
+  onEvent(_port: string, ev: Ev) { this.parent?.emit('o' + this.p.slot, ev); }
+  drawBody(g: Gfx) { g.text('TO', 30, 34, C.slate); g.text('BOX', 30, 41, C.slate); }
+  destroy() { this.node.disconnect(); }
+}
+
+// KNOB, inside a SUBMODULE: a knob on the box; its value comes out here as CV
+// (0 to 1, or -1 to 1 with POL at +-).
+export class SubKnob extends Mod {
+  src = cvSource();
+
+  constructor(e: Engine) {
+    super(e, 'subknob', 'KNOB', 'sub', 50, 52);
+    this.p.slot = 0;
+    this.knobRow([
+      { id: 'val', label: 'VAL', min: 0, max: 1, def: 0.5, fmt: (v) => this.fmt(v) },
+      { id: 'pol', label: 'POL', min: 0, max: 1, def: 0, step: 1, names: ['+', '+-'] },
+    ], 13);
+    this.port('out', 'OUT', 'cv', 'out', 34, 32);
+  }
+
+  private cv(v: number) { return this.p.pol ? v * 2 - 1 : v; }
+  fmt(v: number) { const c = this.cv(v); return (c > 0 && this.p.pol ? '+' : '') + c.toFixed(2); }
+
+  onParam(id: string) {
+    if (id !== 'val' && id !== 'pol') return;
+    this.src.offset.setTargetAtTime(this.cv(this.p.val ?? 0.5), ac.currentTime, 0.01);
+    if (id === 'val' && this.parent instanceof Submodule) this.parent.knobMoved(this.p.slot, this.p.val);
+  }
+
+  audioOut() { return this.src; }
+  destroy() { this.src.stop(); }
+}
+
 export interface Kind { type: string; label: string; cat: Cat; make: (e: Engine) => Mod }
 
 export const KINDS: Kind[] = [
@@ -4294,5 +4527,9 @@ export const KINDS: Kind[] = [
   { type: 'scope', label: 'SCOPE', cat: 'util', make: (e) => new Scope(e) },
   { type: 'recorder', label: 'RECORDER', cat: 'util', make: (e) => new RecorderMod(e) },
   { type: 'speaker', label: 'SPEAKER', cat: 'util', make: (e) => new Speaker(e) },
-  { type: 'maths', label: 'MATHS', cat: 'pro', make: (e) => new Maths(e) },
+  { type: 'maths', label: 'MATHS', cat: 'mod', make: (e) => new Maths(e) },
+  { type: 'sub', label: 'SUBMODULE', cat: 'sub', make: (e) => new Submodule(e) },
+  { type: 'subin', label: 'IN', cat: 'sub', make: (e) => new SubIn(e) },
+  { type: 'subout', label: 'OUT', cat: 'sub', make: (e) => new SubOut(e) },
+  { type: 'subknob', label: 'KNOB', cat: 'sub', make: (e) => new SubKnob(e) },
 ];

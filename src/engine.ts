@@ -84,13 +84,18 @@ export class Engine {
     this.mods.push(m);
     if (this.running) m.reset(ac.currentTime + 0.05);
     this.dirty = true;
+    m.parent?.childrenChanged();
   }
 
+  // Removing a SUBMODULE removes everything inside it too.
   remove(m: Mod) {
+    if (!this.mods.includes(m)) return;
+    for (const child of this.mods.filter((x) => x.parent === m)) this.remove(child);
     for (const c of this.cables.filter((c) => c.a === m || c.b === m)) this.disconnect(c);
     this.mods = this.mods.filter((x) => x !== m);
     m.destroy();
     this.dirty = true;
+    m.parent?.childrenChanged();
   }
 
   clear() {

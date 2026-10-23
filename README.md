@@ -26,9 +26,16 @@ with cables, press space.
   waves at once plus random, clock sync, reset and unipolar; NOISE: white, pink, brown and
   blue outs, dust and a sample and hold; OSC: pulse width and PWM, FM depth, hard sync and
   a sub octave; PADS: presses quantized to a clock, CV outs and MIDI mapping)
-- An ADVANCED menu with models of real hardware modules: MATHS (after Make Noise MATHS),
+- MATHS (in MODULATE, after Make Noise MATHS):
   two function generators for envelopes, LFOs and slew, plus attenuverters and SUM, INV and OR buses
   (example patch: MATHS BOUNCE)
+- SUBMODULES: a box with a patch inside. OPEN it (or double-click) to patch inside it; IN, OUT
+  and KNOB modules there become the box's jacks and knobs. SHIFT+click a patch in PATCHES, or
+  IMPORT AS SUBMODULE, to turn a whole patch into one box (example: SUBMODULE VOICE). SAVE in the
+  SUBMODULE menu keeps a patch or submodule as your own, listed in that menu (right-click deletes)
+- EDIT > LABEL MODULES (or F2 over a module) names modules: click a module and type; the name sits in a bar above
+  the module (click again to edit it, or clear it to remove it). The example patches are labelled
+- EDIT > WIRES (or F3) shows, dims or hides the cables, to reach the knobs under them
 - Press ? (or the ? button) and hover anything for help; ?, Esc or a right-click leaves help mode
 - Play live from the computer keyboard or a MIDI keyboard (velocity, mod wheel, pitch bend, aftertouch, sustain)
 - MIDI clock in and out, and MIDI learn: Alt+click a knob, then move a control

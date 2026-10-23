@@ -39,11 +39,42 @@ export function drawKnob(g: Gfx, m: Mod, k: Knob) {
 
 const GRAY = 'grayscale(1) brightness(0.6)';
 
+// A labelled module's name bar sits on top of its title bar, in a light tint of the
+// title bar's colour (so a plum SEQUENCE title gets a pale plum label).
+export const LABEL_H = 10;
+
+const tints = new Map<string, string>();
+function tint(hex: string) {
+  let t = tints.get(hex);
+  if (!t) {
+    t = '#' + [1, 3, 5].map((i) => {
+      const v = parseInt(hex.slice(i, i + 2), 16);
+      return Math.round(v + (0xf4 - v) * 0.55).toString(16).padStart(2, '0');
+    }).join('');
+    tints.set(hex, t);
+  }
+  return t;
+}
+
+export function fitLabel(text: string, w: number) {
+  let t = text;
+  while (t && textWidth(t) > w - 7) t = t.slice(0, -1);
+  return t;
+}
+
 export function drawModule(g: Gfx, m: Mod, closeHover: boolean, advHover = false) {
   const { w, h } = m;
   // A bypassed effect is drawn grayed out.
   if (m.bypassed) g.ctx.filter = GRAY;
   const bar = CAT[m.cat].bar;
+  if (m.label) {
+    const y = -LABEL_H;
+    g.rect(2, y + 2, w, LABEL_H, C.black); // drop shadow
+    g.rect(0, y, w, LABEL_H + 1, C.black);
+    g.rect(1, y + 1, w - 2, LABEL_H - 1, tint(bar));
+    g.rect(1, y + 1, w - 2, 1, C.white);
+    g.text(fitLabel(m.label, w), 4, y + 3, C.ink);
+  }
   g.rect(2, 2, w, h, C.black); // drop shadow
   g.rect(0, 0, w, h, C.black);
   g.rect(1, 1, w - 2, h - 2, C.dark);

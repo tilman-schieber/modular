@@ -3,7 +3,7 @@ import { C, type Gfx } from './gfx';
 import type { Engine } from './engine';
 
 export type SigType = 'trig' | 'audio' | 'cv';
-export type Cat = 'util' | 'drum' | 'seq' | 'synth' | 'mod' | 'fx' | 'pro';
+export type Cat = 'util' | 'drum' | 'seq' | 'synth' | 'mod' | 'fx' | 'sub';
 
 // Category colours: `bar` is used for title bars and the matching toolbar menu.
 export const CAT: Record<Cat, { name: string; bar: string; cap: string }> = {
@@ -13,8 +13,8 @@ export const CAT: Record<Cat, { name: string; bar: string; cap: string }> = {
   mod: { name: 'MODULATE', bar: C.moss, cap: C.lime },
   fx: { name: 'EFFECTS', bar: C.teal, cap: C.cyan },
   util: { name: 'OUTPUT', bar: C.slate, cap: C.silver },
-  // Models of real hardware modules: deeper, with more jacks.
-  pro: { name: 'ADVANCED', bar: C.rust, cap: C.yellow },
+  // A patch inside a box, and the IN, OUT and KNOB modules that give the box its panel.
+  sub: { name: 'SUBMODULE', bar: C.navy, cap: C.sky },
 };
 
 export const TYPEC: Record<SigType, string> = { trig: C.yellow, audio: C.red, cv: C.green };
@@ -98,6 +98,10 @@ export abstract class Mod {
   private knobTaps: Record<string, CvTap> = {};
   // MIDI CC number mapped to each knob, by knob id.
   cc: Record<string, number> = {};
+  // The user's name for this module (LABEL tool): a second title bar above the first.
+  label = '';
+  // The SUBMODULE this module sits in, or null at the top level of the patch.
+  parent: Mod | null = null;
   // Effects can be bypassed (shift+click): IN goes straight to OUT. The `byp` param.
   private byp: { in: GainNode; out: GainNode; dry: GainNode; wet: GainNode } | null = null;
 
@@ -233,6 +237,30 @@ export abstract class Mod {
 
   // Move jacks and knobs that sit elsewhere in the advanced layout.
   protected layout(_adv: boolean) {}
+
+  // For modules whose jacks and knobs change while patched (SUBMODULE, its IN and OUT):
+  // drop them all, to add them again with port() and knob().
+  protected clearPanel() {
+    this.allPorts = [];
+    this.allKnobs = [];
+    this.refresh();
+  }
+
+  // Unplug cables whose jack is gone or no longer takes their signal.
+  protected fixCables() {
+    for (const c of [...this.eng.cables]) {
+      if (c.a === this) {
+        const p = this.ports.find((p) => p.id === c.ap && p.dir === 'out');
+        if (!p || p.type !== c.type) this.eng.disconnect(c);
+      } else if (c.b === this) {
+        const p = this.ports.find((p) => p.id === c.bp && p.dir === 'in');
+        if (!p || !compatible(c.type, p.type)) this.eng.disconnect(c);
+      }
+    }
+  }
+
+  // A SUBMODULE hears when the modules inside it change (added, removed, relabelled).
+  childrenChanged() {}
 
   // Lay out knobs in a centered row with a fixed pitch.
   knobRow(defs: KnobDef[], y: number, pitch = 15) {
